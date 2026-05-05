@@ -151,9 +151,11 @@ export async function getFbaByTransferName(transferNumber: string): Promise<any 
 }
 
 /**
- * Submit FBA inbound shipment via clean-logistics' own endpoint
- * (which runs the 13-step workflow locally and proxies Amazon calls
- * through the amazon-sp-api Supabase edge function).
+ * Submit FBA inbound shipment in-process (runs the 13-step workflow here,
+ * with Amazon SP-API calls proxied through the amazon-sp-api Supabase edge function).
+ *
+ * No internal HTTP hop — runs `runFbaInboundWorkflow` directly so we avoid
+ * Vercel deployment-protection interstitials on internal fetches.
  */
 export async function createFbaInboundShipment(
   shipFromWarehouseId: string,
@@ -166,52 +168,66 @@ export async function createFbaInboundShipment(
     casePack?: number;
   }
 ): Promise<any> {
-  const baseUrl = process.env.SELF_URL
-    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://shiphero-shipstation-bridge.vercel.app');
-  const url = `${baseUrl}/api/fba/direct-submit`;
+  const { runFbaInboundWorkflow } = await import('./fba-inbound');
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      shipFromWarehouseId,
-      marketplaceId: MARKETPLACE_ID,
-      items,
-      box: boxDimensions,
+  // Default ship-from address = Clean Nutra Las Vegas warehouse
+  const sourceAddress = {
+    name: process.env.SHIP_FROM_NAME || 'Clean Nutra',
+    addressLine1: process.env.SHIP_FROM_ADDRESS1 || '6425 S Jones Blvd',
+    city: process.env.SHIP_FROM_CITY || 'Las Vegas',
+    stateOrProvinceCode: process.env.SHIP_FROM_STATE || 'NV',
+    postalCode: process.env.SHIP_FROM_ZIP || '89118',
+    countryCode: 'US',
+    phoneNumber: process.env.SHIP_FROM_PHONE || '7027108850',
+    companyName: 'Clean Nutra',
+    email: 'shipping@cleannutra.com',
+  };
+
+  return await runFbaInboundWorkflow({
+    marketplaceId: MARKETPLACE_ID,
+    sourceAddress,
+    items: items.map((i) => ({
+      sellerSku: i.sellerSku,
+      quantity: i.quantity,
+      ...(i.expiration ? { expiration: i.expiration } : {}),
+    })),
+    box: {
+      length: boxDimensions.length,
+      width: boxDimensions.width,
+      height: boxDimensions.height,
       weightLbs,
-      ...(options?.boxQuantity ? { boxQuantity: options.boxQuantity } : {}),
-      ...(options?.casePack ? { casePack: options.casePack } : {}),
-    }),
+    },
+    ...(options?.boxQuantity ? { boxQuantity: options.boxQuantity } : {}),
+    ...(options?.casePack ? { casePack: options.casePack } : {}),
   });
-
-  const json: any = await response.json();
-  if (!response.ok) {
-    throw new Error(`FBA create failed (${response.status}): ${JSON.stringify(json)}`);
-  }
-  return json;
 }
 
 /**
- * Fetch FBA labels via clean-logistics' own endpoint (proxied through edge function).
+ * Fetch FBA labels in-process via the Amazon SP-API proxy.
+ * No internal HTTP hop — avoids Vercel deployment-protection issues.
  */
 export async function fetchFbaLabels(
   shipmentId: string
 ): Promise<{ downloadUrl: string | null }> {
-  const baseUrl = process.env.SELF_URL
-    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://shiphero-shipstation-bridge.vercel.app');
-  const url = `${baseUrl}/api/fba/get-labels?shipmentId=${shipmentId}`;
+  const { callAmazonSpApi } = await import('./amazon-sp-api-client');
 
-  const response = await fetch(url);
-  const json: any = await response.json();
+  try {
+    const searchParams = new URLSearchParams();
+    searchParams.set('PageType', 'PackageLabel_Thermal');
+    searchParams.set('LabelType', 'UNIQUE');
+    searchParams.set('NumberOfPackages', '1');
 
-  if (!response.ok || !json.success) {
-    console.error('[fba] Label fetch failed:', json);
+    const res = await callAmazonSpApi<any>({
+      method: 'GET',
+      path: `/fba/inbound/v0/shipments/${shipmentId}/labels?${searchParams.toString()}`,
+    });
+
+    const downloadUrl = res.data?.payload?.DownloadURL || null;
+    return { downloadUrl };
+  } catch (e: any) {
+    console.error('[fba] Label fetch failed:', e?.message || e);
     return { downloadUrl: null };
   }
-
-  return { downloadUrl: json.downloadUrl || null };
 }
 
 /**
