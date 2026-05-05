@@ -1,17 +1,16 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { SellingPartnerApiAuth } from '@sp-api-sdk/auth';
-import axios from 'axios';
+import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
 export const config = { maxDuration: 60 };
 
 /**
- * Fetch FBA shipping labels.
+ * Fetch FBA shipping labels via the amazon-sp-api Supabase edge function proxy.
  * GET /api/fba/get-labels?shipmentId=FBA19CBZ0CPX&boxIds=FBA19CBZ0CPXU000001&pageType=PackageLabel_Thermal
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const shipmentId = (req.query.shipmentId || req.body?.shipmentId) as string;
   const pageType = (req.query.pageType || req.body?.pageType || 'PackageLabel_Thermal') as string;
-  const boxIdsParam = req.query.boxIds 
+  const boxIdsParam = req.query.boxIds
     ? (Array.isArray(req.query.boxIds) ? req.query.boxIds : (req.query.boxIds as string).split(','))
     : req.body?.boxIds || [];
 
@@ -20,35 +19,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const auth = new SellingPartnerApiAuth({
-      clientId: process.env.AMAZON_CLIENT_ID!,
-      clientSecret: process.env.AMAZON_CLIENT_SECRET!,
-      refreshToken: process.env.AMAZON_REFRESH_TOKEN!,
-    });
+    // v0 FBA Inbound getLabels API — proxied through amazon-sp-api edge function
+    const query: Record<string, string> = {
+      PageType: pageType,
+      LabelType: 'UNIQUE',
+      NumberOfPackages: String(boxIdsParam.length || 1),
+    };
 
-    const token = await auth.getAccessToken();
-
-    // v0 FBA Inbound getLabels API
-    const url = `https://sellingpartnerapi-na.amazon.com/fba/inbound/v0/shipments/${shipmentId}/labels`;
-    
-    // Build query params
-    const params = new URLSearchParams();
-    params.set('PageType', pageType);
-    params.set('LabelType', 'UNIQUE');
-    params.set('NumberOfPackages', String(boxIdsParam.length || 1));
-    
-    // PackageLabelsToPrint needs to be repeated for each box ID
+    // PackageLabelsToPrint can be multi-valued; our proxy query-builder doesn't support arrays
+    // so we encode repeated params as a comma-joined string in a single field.
+    // Amazon v0 accepts repeated params via URL — we include them as repeated query params by
+    // relying on the edge function's URL builder (which calls .append for each entry).
+    // To support repeated params, pass them as an array of [key, value] pairs via URLSearchParams.
+    const searchParams = new URLSearchParams();
+    searchParams.set('PageType', pageType);
+    searchParams.set('LabelType', 'UNIQUE');
+    searchParams.set('NumberOfPackages', String(boxIdsParam.length || 1));
     for (const boxId of boxIdsParam) {
-      params.append('PackageLabelsToPrint', boxId);
+      searchParams.append('PackageLabelsToPrint', String(boxId));
     }
 
-    console.log(`[get-labels] Fetching labels: ${url}?${params.toString()}`);
+    const pathWithQuery = `/fba/inbound/v0/shipments/${shipmentId}/labels?${searchParams.toString()}`;
+    console.log(`[get-labels] Fetching labels via proxy: ${pathWithQuery}`);
 
-    const response = await axios.get(`${url}?${params.toString()}`, {
-      headers: {
-        'x-amz-access-token': token,
-        'Content-Type': 'application/json',
-      },
+    const response = await callAmazonSpApi<any>({
+      method: 'GET',
+      path: pathWithQuery,
     });
 
     const downloadUrl = response.data?.payload?.DownloadURL;
@@ -61,7 +57,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       raw: response.data,
     });
   } catch (err: any) {
-    const errData = err.response?.data || err.message;
+    const errData = err.details || err.message;
     console.error('[get-labels] Error:', JSON.stringify(errData));
     return res.status(500).json({
       success: false,

@@ -1,21 +1,20 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { SellingPartnerApiAuth } from '@sp-api-sdk/auth';
-import { FulfillmentInboundApiClient } from '@sp-api-sdk/fulfillment-inbound-api-2024-03-20';
-import axios from 'axios';
+import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
 export const config = { maxDuration: 60 };
 
 /**
  * Download FNSKU barcode labels from Amazon for product units.
- * 
+ *
  * POST /api/fba/fnsku-labels
  * {
  *   "msku": "CN-CAP-METHYLATEDB-60BG",
  *   "quantity": 2000,
  *   "labelType": "THERMAL_PRINTING"  // or "STANDARD_FORMAT" for letter paper
  * }
- * 
+ *
  * Returns a download URL for the FNSKU label PDF.
+ * Proxied through the amazon-sp-api Supabase edge function — no direct Amazon calls.
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
@@ -25,19 +24,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!msku) return res.status(400).json({ error: 'Missing msku' });
 
   try {
-    const auth = new SellingPartnerApiAuth({
-      clientId: process.env.AMAZON_CLIENT_ID!,
-      clientSecret: process.env.AMAZON_CLIENT_SECRET!,
-      refreshToken: process.env.AMAZON_REFRESH_TOKEN!,
-    });
-
-    const client = new FulfillmentInboundApiClient({ auth, region: 'na' });
-
     console.log(`[fnsku-labels] Requesting FNSKU labels for ${msku}, qty=${quantity}, type=${labelType}`);
 
     const bodyParams: any = {
       marketplaceId: 'ATVPDKIKX0DER',
-      labelType: labelType as any,
+      labelType,
       mskuQuantities: [{ msku, quantity: Number(quantity) }],
     };
 
@@ -48,7 +39,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       bodyParams.pageType = req.body?.pageType || undefined;
     }
 
-    const result = await client.createMarketplaceItemLabels({
+    // createMarketplaceItemLabels → POST /inbound/fba/2024-03-20/items/labels
+    const result = await callAmazonSpApi<any>({
+      method: 'POST',
+      path: '/inbound/fba/2024-03-20/items/labels',
       body: bodyParams,
     });
 
@@ -70,7 +64,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       downloads,
     });
   } catch (err: any) {
-    const errData = err.response?.data || err.message;
+    const errData = err.details ?? err.response?.data ?? err.message;
     console.error('[fnsku-labels] Error:', JSON.stringify(errData));
     return res.status(500).json({
       success: false,

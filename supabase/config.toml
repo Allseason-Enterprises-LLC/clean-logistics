@@ -1,0 +1,4 @@
+project_id = "gvrwkjmmgohtovtcyjiu"
+
+[functions.amazon-sp-api]
+verify_jwt = false

@@ -1,9 +1,12 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { SellingPartnerApiAuth } from '@sp-api-sdk/auth';
-import { FulfillmentInboundApiClient } from '@sp-api-sdk/fulfillment-inbound-api-2024-03-20';
+import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
 export const config = { maxDuration: 60 };
 
+/**
+ * Diagnostic / admin endpoint: list → set → verify prep details for an MSKU.
+ * Proxied through the amazon-sp-api Supabase edge function — no direct Amazon calls.
+ */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
@@ -11,53 +14,68 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const marketplaceId = 'ATVPDKIKX0DER';
 
   try {
-    const auth = new SellingPartnerApiAuth({
-      clientId: process.env.AMAZON_CLIENT_ID!,
-      clientSecret: process.env.AMAZON_CLIENT_SECRET!,
-      refreshToken: process.env.AMAZON_REFRESH_TOKEN!,
-    });
-    const client = new FulfillmentInboundApiClient({ auth, region: 'na' });
-
     // Step 1: List current prep details
     let listResult: any = null;
     try {
-      const listRes = await client.listPrepDetails({
-        marketplaceId,
-        mskus: [msku],
+      const listRes = await callAmazonSpApi<any>({
+        method: 'GET',
+        path: '/inbound/fba/2024-03-20/items/prepDetails',
+        query: {
+          marketplaceId,
+          mskus: msku,
+        },
       });
       listResult = listRes.data;
     } catch (listErr: any) {
-      listResult = { error: listErr.message, status: listErr.response?.status, body: listErr.response?.data };
+      listResult = {
+        error: listErr.message,
+        status: listErr.status ?? listErr.response?.status,
+        body: listErr.details ?? listErr.response?.data,
+      };
     }
 
     // Step 2: Set prep to NONE
     let setResult: any = null;
     try {
-      const setRes = await client.setPrepDetails({
+      const setRes = await callAmazonSpApi<any>({
+        method: 'POST',
+        path: '/inbound/fba/2024-03-20/items/prepDetails',
         body: {
           marketplaceId,
           mskuPrepDetails: [{
             msku,
-            prepCategory: 'NONE' as any,
-            prepTypes: ['ITEM_NO_PREP' as any],
+            prepCategory: 'NONE',
+            prepTypes: ['ITEM_NO_PREP'],
           }],
         },
       });
       setResult = setRes.data;
     } catch (setErr: any) {
-      setResult = { error: setErr.message, status: setErr.response?.status, body: setErr.response?.data };
+      setResult = {
+        error: setErr.message,
+        status: setErr.status ?? setErr.response?.status,
+        body: setErr.details ?? setErr.response?.data,
+      };
     }
 
     // Step 3: List again to verify
     let verifyResult: any = null;
     try {
-      const verifyRes = await client.listPrepDetails({
-        marketplaceId,
-        mskus: [msku],
+      const verifyRes = await callAmazonSpApi<any>({
+        method: 'GET',
+        path: '/inbound/fba/2024-03-20/items/prepDetails',
+        query: {
+          marketplaceId,
+          mskus: msku,
+        },
       });
       verifyResult = verifyRes.data;
     } catch (verifyErr: any) {
-      verifyResult = { error: verifyErr.message, status: verifyErr.response?.status, body: verifyErr.response?.data };
+      verifyResult = {
+        error: verifyErr.message,
+        status: verifyErr.status ?? verifyErr.response?.status,
+        body: verifyErr.details ?? verifyErr.response?.data,
+      };
     }
 
     return res.json({

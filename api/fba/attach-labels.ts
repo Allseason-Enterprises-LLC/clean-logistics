@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { SellingPartnerApiAuth } from '@sp-api-sdk/auth';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 

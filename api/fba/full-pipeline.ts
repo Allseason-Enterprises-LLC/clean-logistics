@@ -23,7 +23,7 @@ import {
 } from '../../lib/shiphero-wholesale';
 import { runFbaInboundWorkflow } from '../../lib/fba-inbound';
 import { supabase } from '../../lib/supabase';
-import { SellingPartnerApiAuth } from '@sp-api-sdk/auth';
+import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 import axios from 'axios';
 
 export const config = { maxDuration: 300 }; // 5 minute timeout
@@ -297,14 +297,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (shipmentConfirmationId && boxIds.length > 0) {
       try {
-        const auth = new SellingPartnerApiAuth({
-          clientId: credentials.clientId,
-          clientSecret: credentials.clientSecret,
-          refreshToken: credentials.refreshToken,
-        });
-
-        const accessToken = await auth.getAccessToken();
-
         // Build query string for v0 getLabels API
         const queryParams = new URLSearchParams();
         queryParams.set('ShipmentId', shipmentConfirmationId);
@@ -312,14 +304,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         queryParams.set('LabelType', 'UNIQUE');
         queryParams.set('PackageLabelsToPrint', boxIds.join(','));
 
-        const labelUrl = `https://sellingpartnerapi-na.amazon.com/fba/inbound/v0/shipments/${shipmentConfirmationId}/labels?${queryParams.toString()}`;
-        console.log('[full-pipeline] Calling v0 getLabels API:', labelUrl);
+        const labelPath = `/fba/inbound/v0/shipments/${shipmentConfirmationId}/labels?${queryParams.toString()}`;
+        console.log('[full-pipeline] Calling v0 getLabels via proxy:', labelPath);
 
-        const labelResponse = await axios.get(labelUrl, {
-          headers: {
-            'x-amz-access-token': accessToken,
-            'Content-Type': 'application/json',
-          },
+        const labelResponse = await callAmazonSpApi<any>({
+          method: 'GET',
+          path: labelPath,
         });
 
         const payload = labelResponse.data?.payload;
@@ -328,7 +318,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         console.log('[full-pipeline] Step 4 COMPLETE: Got labels URL:', labelDownloadUrl ? 'YES' : 'NO');
       } catch (labelErr: any) {
-        console.error('[full-pipeline] Label fetch failed (non-fatal):', labelErr?.response?.data || labelErr?.message);
+        console.error('[full-pipeline] Label fetch failed (non-fatal):', labelErr?.details ?? labelErr?.response?.data ?? labelErr?.message);
         // Continue - labels can be fetched later via /api/fba/labels endpoint
       }
     } else {

@@ -151,7 +151,9 @@ export async function getFbaByTransferName(transferNumber: string): Promise<any 
 }
 
 /**
- * Call BrandMind's existing FBA create endpoint
+ * Submit FBA inbound shipment via clean-logistics' own endpoint
+ * (which runs the 13-step workflow locally and proxies Amazon calls
+ * through the amazon-sp-api Supabase edge function).
  */
 export async function createFbaInboundShipment(
   shipFromWarehouseId: string,
@@ -164,10 +166,9 @@ export async function createFbaInboundShipment(
     casePack?: number;
   }
 ): Promise<any> {
-  const url = `${BRANDMIND_API_URL}/api/shipments/fba/create`;
-
-  // Use Clean Nutra Las Vegas address by default
-  const shipFromAddressId = options?.shipFromAddressId || '9213d02a-6992-4310-8514-e60ca03d5782';
+  const baseUrl = process.env.SELF_URL
+    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://shiphero-shipstation-bridge.vercel.app');
+  const url = `${baseUrl}/api/fba/direct-submit`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -175,15 +176,17 @@ export async function createFbaInboundShipment(
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      shipFromAddressId,
+      shipFromWarehouseId,
       marketplaceId: MARKETPLACE_ID,
       items,
       box: boxDimensions,
       weightLbs,
+      ...(options?.boxQuantity ? { boxQuantity: options.boxQuantity } : {}),
+      ...(options?.casePack ? { casePack: options.casePack } : {}),
     }),
   });
 
-  const json = await response.json();
+  const json: any = await response.json();
   if (!response.ok) {
     throw new Error(`FBA create failed (${response.status}): ${JSON.stringify(json)}`);
   }
@@ -191,21 +194,23 @@ export async function createFbaInboundShipment(
 }
 
 /**
- * Fetch FBA labels from BrandMind API
+ * Fetch FBA labels via clean-logistics' own endpoint (proxied through edge function).
  */
 export async function fetchFbaLabels(
   shipmentId: string
 ): Promise<{ downloadUrl: string | null }> {
-  const url = `${BRANDMIND_API_URL}/api/shipments/fba/labels?shipmentId=${shipmentId}`;
-  
+  const baseUrl = process.env.SELF_URL
+    || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://shiphero-shipstation-bridge.vercel.app');
+  const url = `${baseUrl}/api/fba/get-labels?shipmentId=${shipmentId}`;
+
   const response = await fetch(url);
   const json: any = await response.json();
-  
+
   if (!response.ok || !json.success) {
     console.error('[fba] Label fetch failed:', json);
     return { downloadUrl: null };
   }
-  
+
   return { downloadUrl: json.downloadUrl || null };
 }
 
