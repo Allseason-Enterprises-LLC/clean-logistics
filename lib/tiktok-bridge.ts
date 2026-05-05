@@ -248,12 +248,27 @@ async function importOrder(
   }));
 
   const address = detail.recipient_address || detail.shipping_address || {};
-  // TikTok 202309 address fields:
-  //   full_name, phone_number, region (ISO country), state, city, zip_code,
-  //   address_line1..address_line4
-  // Prior mapping used wrong field names (postal_code, phone, name) — fixed here.
+
+  // TikTok 202309 US orders return geography in district_info[] rather than
+  // flat city/state strings. Parse the array first, fall back to flat fields.
+  //
+  // district_info levels:
+  //   L0 = Country, L1 = State, L2 = County, L3 = City
+  //
+  // Some orders return flat fields (city, state) — keep those as fallback.
+  function extractFromDistrictInfo(di: any[], level: string): string {
+    if (!Array.isArray(di)) return '';
+    const entry = di.find((x: any) => x.address_level === level);
+    return entry?.iso_code || entry?.address_name || '';
+  }
+  const di = address.district_info || [];
+  const cityFromDi  = extractFromDistrictInfo(di, 'L3');
+  const stateFromDi = extractFromDistrictInfo(di, 'L1'); // iso_code = 'FL', 'CA', etc.
+
   const fullName = address.full_name || address.name || '';
-  const [firstName, ...lastRest] = fullName.split(' ');
+  // TikTok sometimes provides first_name/last_name separately
+  const resolvedFirstName = address.first_name || fullName.split(' ')[0] || 'TikTok';
+  const resolvedLastName  = address.last_name  || fullName.split(' ').slice(1).join(' ') || 'Customer';
 
   const shipheroOrder = await createShipHeroOrder({
     orderNumber: `TT-${detail.order_id || detail.id}`,
@@ -262,14 +277,14 @@ async function importOrder(
     warehouseId: CLEAN_NUTRA_LV_WAREHOUSE,
     lineItems: shipheroLineItems,
     shippingAddress: {
-      firstName: firstName || 'TikTok',
-      lastName: lastRest.join(' ') || 'Customer',
+      firstName: resolvedFirstName,
+      lastName: resolvedLastName,
       address1: address.address_line1 || address.address_detail || '',
       address2: address.address_line2 || address.address_line3 || '',
-      city: address.city || '',
-      state: address.state || address.province || '',
-      zip: address.zip_code || address.postal_code || address.zipcode || '',
-      country: address.region || address.region_code || address.country_code || 'US',
+      city:  cityFromDi  || address.city  || '',
+      state: stateFromDi || address.state || address.province || '',
+      zip:   address.postal_code || address.zip_code || address.zipcode || '',
+      country: address.region_code || address.region || address.country_code || 'US',
       phone: address.phone_number || address.phone || '',
       email: detail.buyer_email || address.email || '',
     },
