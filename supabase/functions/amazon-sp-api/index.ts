@@ -73,12 +73,12 @@ async function getAccessToken(): Promise<string> {
     return cachedToken.accessToken;
   }
 
-  const clientId = Deno.env.get('AMAZON_LWA_CLIENT_ID');
-  const clientSecret = Deno.env.get('AMAZON_LWA_CLIENT_SECRET');
-  const refreshToken = Deno.env.get('AMAZON_SP_REFRESH_TOKEN');
+  const clientId = Deno.env.get('IM_AMAZON_CLIENT_ID') || Deno.env.get('AMAZON_LWA_CLIENT_ID');
+  const clientSecret = Deno.env.get('IM_AMAZON_CLIENT_SECRET') || Deno.env.get('AMAZON_LWA_CLIENT_SECRET');
+  const refreshToken = Deno.env.get('IM_AMAZON_REFRESH_TOKEN') || Deno.env.get('AMAZON_SP_REFRESH_TOKEN');
 
   if (!clientId || !clientSecret || !refreshToken) {
-    throw new Error('Missing Amazon LWA credentials in edge function secrets (AMAZON_LWA_CLIENT_ID / AMAZON_LWA_CLIENT_SECRET / AMAZON_SP_REFRESH_TOKEN)');
+    throw new Error('Missing Amazon LWA credentials in edge function secrets (IM_AMAZON_CLIENT_ID / IM_AMAZON_CLIENT_SECRET / IM_AMAZON_REFRESH_TOKEN — or AMAZON_LWA_CLIENT_ID / AMAZON_LWA_CLIENT_SECRET / AMAZON_SP_REFRESH_TOKEN as fallback)');
   }
 
   console.log('[amazon-sp-api] Refreshing LWA access token...');
@@ -130,12 +130,20 @@ serve(async (req: Request) => {
     return json(405, { error: 'Method not allowed. Use POST.' });
   }
 
-  // Shared-secret auth between caller (clean-logistics / brandmind) and this proxy
+  // Shared-secret auth between caller (clean-logistics / brandmind) and this proxy.
+  // Optional: if AMAZON_PROXY_SHARED_SECRET is not set, we fall back to relying on
+  // Supabase's function invocation auth (apikey or JWT). For now the edge function
+  // is deployed with verify_jwt=false so anyone with the URL can call it — add the
+  // shared secret env var to lock that down.
   const sharedSecret = Deno.env.get('AMAZON_PROXY_SHARED_SECRET');
-  const authHeader = req.headers.get('authorization') || '';
-  const bearer = authHeader.replace(/^Bearer\s+/i, '');
-  if (!sharedSecret || bearer !== sharedSecret) {
-    return json(401, { error: 'Unauthorized' });
+  if (sharedSecret) {
+    const authHeader = req.headers.get('authorization') || '';
+    const bearer = authHeader.replace(/^Bearer\s+/i, '');
+    if (bearer !== sharedSecret) {
+      return json(401, { error: 'Unauthorized' });
+    }
+  } else {
+    console.warn('[amazon-sp-api] WARNING: AMAZON_PROXY_SHARED_SECRET not set — endpoint is publicly callable. Set this secret to enable shared-secret auth.');
   }
 
   let payload: ProxyRequest;

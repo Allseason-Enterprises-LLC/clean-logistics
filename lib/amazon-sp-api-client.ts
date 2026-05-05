@@ -54,12 +54,11 @@ function resolveEdgeFunctionUrl(): string {
   return `${supabaseUrl.replace(/\/+$/, '')}/functions/v1/amazon-sp-api`;
 }
 
-function resolveSharedSecret(): string {
+function resolveSharedSecret(): string | undefined {
+  // Optional: if unset, the edge function will skip shared-secret auth
+  // (and rely on Supabase's verify_jwt / apikey model instead).
   const secret = process.env.AMAZON_PROXY_SHARED_SECRET;
-  if (!secret) {
-    throw new Error('AMAZON_PROXY_SHARED_SECRET env var is required for Amazon SP-API proxy calls');
-  }
-  return secret;
+  return secret && secret.length > 0 ? secret : undefined;
 }
 
 /**
@@ -70,12 +69,16 @@ export async function callAmazonSpApi<T = any>(req: SpApiRequest): Promise<SpApi
   const url = resolveEdgeFunctionUrl();
   const secret = resolveSharedSecret();
 
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (secret) {
+    headers['Authorization'] = `Bearer ${secret}`;
+  }
+
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${secret}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       method: req.method,
       path: req.path,
