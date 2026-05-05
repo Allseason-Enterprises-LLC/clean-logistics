@@ -155,6 +155,11 @@ async function gql(query: string, variables?: Record<string, any>): Promise<any>
 
 /**
  * Fetch order details from ShipHero including line items
+ *
+ * Note: ShipHero's Order type does NOT have a top-level `warehouse_id` field.
+ * The current warehouse is on `allocations[].warehouse_id`. Once we call
+ * order_change_warehouse the old allocation is invalidated and a new one
+ * is created at the target warehouse.
  */
 export async function getOrderDetails(orderId: string): Promise<{
   id: string;
@@ -170,7 +175,9 @@ export async function getOrderDetails(orderId: string): Promise<{
           id
           order_number
           shop_name
-          warehouse_id
+          allocations {
+            warehouse_id
+          }
           line_items(first: 100) {
             edges {
               node {
@@ -192,26 +199,29 @@ export async function getOrderDetails(orderId: string): Promise<{
     orderNumber: order.order_number,
     shopName: order.shop_name,
     skus: order.line_items.edges.map((e: any) => e.node.sku),
-    warehouseId: order.warehouse_id,
+    warehouseId: order.allocations?.[0]?.warehouse_id,
   };
 }
 
 /**
- * Change the warehouse assignment for an order in ShipHero
+ * Change the warehouse assignment for an order in ShipHero.
+ *
+ * Mutation input type is `ChangeOrderWarehouseInput` (not `OrderChangeWarehouseInput`).
+ * Required fields: order_id, warehouse_id. customer_account_id is optional on
+ * single-account tokens.
  */
 export async function changeOrderWarehouse(
   orderId: string,
   newWarehouseId: string
 ): Promise<any> {
   const mutation = `
-    mutation($data: OrderChangeWarehouseInput!) {
+    mutation($data: ChangeOrderWarehouseInput!) {
       order_change_warehouse(data: $data) {
         request_id
         complexity
         order {
           id
           order_number
-          warehouse_id
         }
       }
     }
