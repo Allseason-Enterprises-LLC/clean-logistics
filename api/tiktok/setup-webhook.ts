@@ -24,16 +24,27 @@ async function getShipHeroToken(): Promise<string> {
     return process.env.SHIPHERO_ACCESS_TOKEN;
   }
 
+  // Must use Clean Nutra account's ShipHero token (not Clear Ship 3PL's).
+  // The webhook is registered under Clean Nutra's account so order_create
+  // events fire for Clean Nutra shops (TikTok, Shopify, etc.).
   const { data, error } = await supabase
     .from('warehouses')
-    .select('api_credentials')
-    .eq('id', process.env.SHIPHERO_WAREHOUSE_ID!)
-    .eq('provider', 'shiphero')
-    .single();
+    .select('id, name, api_credentials')
+    .eq('provider', 'shiphero');
 
-  if (error) throw new Error(`Failed to get ShipHero token: ${error.message}`);
-  const creds = data?.api_credentials as any;
-  if (!creds?.accessToken) throw new Error('No ShipHero access token');
+  if (error) throw new Error(`Failed to query ShipHero warehouses: ${error.message}`);
+
+  const CLEAN_NUTRA_LV_UUID = '22e17170-af72-4bf8-b77c-d73c86b06765';
+  const row =
+    (data || []).find((w: any) => w.id === CLEAN_NUTRA_LV_UUID) ||
+    (data || []).find((w: any) => {
+      const name = (w.name || '').toLowerCase();
+      return name.includes('clean nutra') || name.includes('las vegas') || name.includes('lv');
+    });
+
+  if (!row) throw new Error('Could not find Clean Nutra ShipHero warehouse row');
+  const creds = row.api_credentials as any;
+  if (!creds?.accessToken) throw new Error(`No accessToken on warehouses row ${row.id}`);
   return creds.accessToken;
 }
 
@@ -110,17 +121,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       `, {
         data: {
-          name: 'TikTok Order Routing',
+          // "Order Allocated" is ShipHero's canonical event name for when an order
+          // is assigned to a warehouse — the perfect trigger for routing because
+          // the warehouse_id is populated by then.
+          name: 'Order Allocated',
           url: WEBHOOK_URL,
-          source: 'order_create',
-          shop_name: '*',  // All shops - we filter inside route-order
+          shop_name: '*',  // All shops - route-order endpoint filters for TikTok
         },
       });
 
       return res.status(200).json({
         success: true,
         webhook: data.webhook_create.webhook,
-        note: 'Webhook created. It will fire on every new order. The route-order endpoint filters for TikTok orders only.',
+        note: 'Webhook "Order Allocated" created. It fires when any new order is allocated to a warehouse. The route-order endpoint filters for TikTok shops only.',
       });
     }
 

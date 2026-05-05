@@ -90,24 +90,44 @@ export function matchSkuToWarehouse(
 }
 
 /**
- * Get ShipHero access token from Supabase
+ * Get ShipHero access token from Supabase — the CLEAN NUTRA account specifically.
+ *
+ * ⚠️ There are TWO ShipHero warehouse rows in Supabase:
+ *   - Clean Nutra (Las Vegas)  id=22e17170-...    ← we want THIS one for routing decisions
+ *   - Clear Ship (3PL, Utah)    id=5ded469d-...   ← different account, would return wrong warehouses
+ *
+ * The TikTok-routing flow must use the Clean Nutra account token because routing
+ * changes the order's warehouse to Clean Nutra's Las Vegas warehouse (legacy 135872),
+ * which only exists on the Clean Nutra ShipHero account.
+ *
+ * Resolution order:
+ *   1. SHIPHERO_ACCESS_TOKEN env var (Clean Nutra token if set explicitly)
+ *   2. Supabase warehouses row matching "Clean Nutra" / "Las Vegas" / provider=shiphero
  */
 async function getShipHeroToken(): Promise<string> {
-  // Try env var first
   if (process.env.SHIPHERO_ACCESS_TOKEN) {
     return process.env.SHIPHERO_ACCESS_TOKEN;
   }
 
   const { data, error } = await supabase
     .from('warehouses')
-    .select('api_credentials')
-    .eq('id', process.env.SHIPHERO_WAREHOUSE_ID!)
-    .eq('provider', 'shiphero')
-    .single();
+    .select('id, name, api_credentials')
+    .eq('provider', 'shiphero');
 
-  if (error) throw new Error(`Failed to get ShipHero token: ${error.message}`);
-  const creds = data?.api_credentials as any;
-  if (!creds?.accessToken) throw new Error('No ShipHero access token');
+  if (error) throw new Error(`Failed to query ShipHero warehouses: ${error.message}`);
+
+  // Prefer the Clean Nutra (Las Vegas) row by exact UUID; fall back to name match
+  const CLEAN_NUTRA_LV_UUID = '22e17170-af72-4bf8-b77c-d73c86b06765';
+  const row =
+    (data || []).find((w: any) => w.id === CLEAN_NUTRA_LV_UUID) ||
+    (data || []).find((w: any) => {
+      const name = (w.name || '').toLowerCase();
+      return name.includes('clean nutra') || name.includes('las vegas') || name.includes('lv');
+    });
+
+  if (!row) throw new Error('Could not find Clean Nutra ShipHero warehouse row in Supabase');
+  const creds = row.api_credentials as any;
+  if (!creds?.accessToken) throw new Error(`No accessToken on warehouses row ${row.id}`);
   return creds.accessToken;
 }
 
