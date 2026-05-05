@@ -2,3 +2,5 @@ node_modules/
 .vercel
 .env*.local
 supabase/.temp/
+.env.production
+.env

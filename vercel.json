@@ -5,6 +5,10 @@
     {
       "path": "/api/sync/auto",
       "schedule": "*/15 * * * *"
+    },
+    {
+      "path": "/api/tiktok/sync-orders",
+      "schedule": "*/5 * * * *"
     }
   ]
 }
