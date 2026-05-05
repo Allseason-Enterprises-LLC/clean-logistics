@@ -10,38 +10,48 @@ const MARKETPLACE_ID = 'ATVPDKIKX0DER'; // US
  */
 export async function lookupSkuMapping(cin7Sku: string): Promise<SkuMaster | null> {
   // First try sku_master (has cin7_sku → amazon_seller_sku)
-  const { data: skuData } = await supabase
+  // Note: sku_master can have multiple rows per cin7_sku (FBA + FBM + master-file imports),
+  // so we fetch all matches and prefer FBA (non-FBM) SKUs. .maybeSingle() errors on >1 rows.
+  const { data: skuRows } = await supabase
     .from('sku_master')
     .select('cin7_sku, amazon_seller_sku, amazon_asin, notes')
-    .eq('cin7_sku', cin7Sku)
-    .maybeSingle();
+    .eq('cin7_sku', cin7Sku);
 
-  if (skuData?.amazon_seller_sku) {
+  // Prefer rows that are NOT FBM (merchant-fulfilled) — we want FBA SKUs for FBA inbound
+  const preferred = (skuRows || []).find(r =>
+    r.amazon_seller_sku && !r.amazon_seller_sku.toUpperCase().includes('-FBM-')
+  ) || (skuRows || []).find(r => r.amazon_seller_sku);
+
+  if (preferred?.amazon_seller_sku) {
     // Look up FNSKU from amazon_products table
-    const { data: amzData } = await supabase
+    const { data: amzRows } = await supabase
       .from('amazon_products')
       .select('seller_sku, fnsku, asin')
-      .eq('seller_sku', skuData.amazon_seller_sku)
+      .eq('seller_sku', preferred.amazon_seller_sku)
       .eq('marketplace_id', MARKETPLACE_ID)
-      .maybeSingle();
+      .limit(1);
+
+    const amzData = amzRows?.[0];
 
     return {
       cin7_sku: cin7Sku,
-      product_name: skuData.notes?.split('cin7Name:')[1]?.split('|')[0]?.trim() || cin7Sku,
-      amz_sku: skuData.amazon_seller_sku,
-      amz_asin: amzData?.asin || skuData.amazon_asin || null,
+      product_name: preferred.notes?.split('cin7Name:')[1]?.split('|')[0]?.trim() || cin7Sku,
+      amz_sku: preferred.amazon_seller_sku,
+      amz_asin: amzData?.asin || preferred.amazon_asin || null,
       amz_fnsku: amzData?.fnsku || null,
     };
   }
 
   // Fallback: search amazon_products directly by seller_sku patterns
   // Some CIN7 SKUs might map directly
-  const { data: directMatch } = await supabase
+  const { data: directRows } = await supabase
     .from('amazon_products')
     .select('seller_sku, fnsku, asin')
     .eq('marketplace_id', MARKETPLACE_ID)
     .eq('seller_sku', cin7Sku)
-    .maybeSingle();
+    .limit(1);
+
+  const directMatch = directRows?.[0];
 
   if (directMatch) {
     return {
