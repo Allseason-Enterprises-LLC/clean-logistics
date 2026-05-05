@@ -491,11 +491,15 @@ export async function runFbaInboundWorkflow(
       let nextToken: string | undefined;
 
       do {
+        const queryParams: Record<string, string> = { shipmentId: sid };
+        if (nextToken) queryParams.paginationToken = nextToken;
         const res = await callAmazonSpApi<any>({
           method: 'GET',
           region,
-          path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/shipments/${sid}/transportationOptions`,
-          query: nextToken ? { paginationToken: nextToken } : undefined,
+          // SDK path: /inboundPlans/{id}/transportationOptions with shipmentId as QUERY param, NOT path segment.
+          // (Wrong path returns 403 Unauthorized, not 404 — took a while to track down.)
+          path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/transportationOptions`,
+          query: queryParams,
         });
         console.log(`[fba-inbound] listTransportationOptions for ${sid}${nextToken ? ' (page)' : ''}:`, JSON.stringify(res.data));
 
