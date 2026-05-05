@@ -248,7 +248,11 @@ async function importOrder(
   }));
 
   const address = detail.recipient_address || detail.shipping_address || {};
-  const fullName = address.name || '';
+  // TikTok 202309 address fields:
+  //   full_name, phone_number, region (ISO country), state, city, zip_code,
+  //   address_line1..address_line4
+  // Prior mapping used wrong field names (postal_code, phone, name) — fixed here.
+  const fullName = address.full_name || address.name || '';
   const [firstName, ...lastRest] = fullName.split(' ');
 
   const shipheroOrder = await createShipHeroOrder({
@@ -262,12 +266,12 @@ async function importOrder(
       lastName: lastRest.join(' ') || 'Customer',
       address1: address.address_line1 || address.address_detail || '',
       address2: address.address_line2 || address.address_line3 || '',
-      city: address.city || address.region_code || '',
-      state: address.state || address.province || address.region || '',
-      zip: address.postal_code || address.zipcode || '',
-      country: address.region_code || address.country_code || 'US',
-      phone: address.phone || '',
-      email: detail.buyer_email || '',
+      city: address.city || '',
+      state: address.state || address.province || '',
+      zip: address.zip_code || address.postal_code || address.zipcode || '',
+      country: address.region || address.region_code || address.country_code || 'US',
+      phone: address.phone_number || address.phone || '',
+      email: detail.buyer_email || address.email || '',
     },
     shopName: 'TikTok Shop',
   });
