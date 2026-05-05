@@ -440,10 +440,35 @@ export async function runFbaInboundWorkflow(
   }
   const placeOpts = placeListData?.placementOptions ?? [];
   if (placeOpts.length === 0) throw new Error('listPlacementOptions: no options');
-  // Sort by fewest shipments (typically lowest total cost) then pick first
-  placeOpts.sort((a: any, b: any) => (a.shipmentIds?.length ?? 99) - (b.shipmentIds?.length ?? 99));
+
+  // Log every placement option for cost transparency
+  const placementSummary = placeOpts.map((p: any) => {
+    const fees = p.fees ?? [];
+    const totalFee = fees.reduce((sum: number, f: any) => sum + (f?.value?.amount ?? 0), 0);
+    const currency = fees[0]?.value?.code ?? 'USD';
+    return {
+      placementOptionId: p.placementOptionId,
+      shipments: p.shipmentIds?.length ?? 0,
+      totalFee,
+      currency,
+      discounts: p.discounts?.length ?? 0,
+    };
+  });
+  console.log('[fba-inbound] Placement options:', JSON.stringify(placementSummary));
+
+  // Pick the LOWEST total placement fee. Amazon charges a "Placement Services" fee
+  // for keeping the shipment in as few destinations as possible; the cheapest option
+  // is usually the "Amazon Optimized Shipment Splits" one with $0 fee (where Amazon
+  // decides the FC mix). Tie-break by fewest shipments so the warehouse has less work.
+  placeOpts.sort((a: any, b: any) => {
+    const feeA = (a.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
+    const feeB = (b.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
+    if (feeA !== feeB) return feeA - feeB;
+    return (a.shipmentIds?.length ?? 99) - (b.shipmentIds?.length ?? 99);
+  });
   const place = placeOpts[0];
-  console.log(`[fba-inbound] Selected placement: ${place.placementOptionId} with ${place.shipmentIds?.length} shipment(s) (out of ${placeOpts.length} options)`);
+  const placeFee = (place.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
+  console.log(`[fba-inbound] Selected placement: ${place.placementOptionId} with ${place.shipmentIds?.length} shipment(s), placement fee: $${placeFee} (out of ${placeOpts.length} options)`);
   const placementOptionId = place.placementOptionId;
   const shipmentIds: string[] = place.shipmentIds ?? [];
   if (!placementOptionId || shipmentIds.length === 0) throw new Error('Placement option missing placementOptionId or shipmentIds');
@@ -514,48 +539,48 @@ export async function runFbaInboundWorkflow(
 
       console.log(`[fba-inbound] Found ${allTransportOpts.length} total transportation options for ${sid}`);
 
-      // Priority 1: Amazon Partnered Carrier (small parcel) without delivery window requirement (ideal)
-      let preferred = allTransportOpts.find(
-        (o: any) =>
-          (o.shippingMode === 'GROUND_SMALL_PARCEL' || o.shippingMode === 'AIR_SMALL_PARCEL') &&
-          o.shippingSolution === 'AMAZON_PARTNERED_CARRIER' &&
-          !(o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW')
-      );
-
-      if (preferred) {
-        console.log(`[fba-inbound] Found ideal option: Amazon Partnered Carrier without delivery window requirement`);
+      // HARD FILTER: never use LTL / freight / pallet shipping
+      const LTL_MODES = new Set(['FREIGHT_LTL', 'FREIGHT_FTL_PALLET', 'FREIGHT_FTL_NONPALLET', 'PARTIAL_TRUCK_LOAD', 'FULL_TRUCK_LOAD']);
+      const nonLtlOpts = allTransportOpts.filter((o: any) => !LTL_MODES.has(o.shippingMode));
+      const ltlDropped = allTransportOpts.length - nonLtlOpts.length;
+      if (ltlDropped > 0) {
+        console.log(`[fba-inbound] Dropped ${ltlDropped} LTL/freight option(s); keeping ${nonLtlOpts.length} small-parcel option(s)`);
       }
 
-      // Priority 2: ANY option without delivery window requirement
-      if (!preferred) {
-        preferred = allTransportOpts.find(
-          (o: any) => !(o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW')
-        );
-        if (preferred) {
-          console.log(`[fba-inbound] Selected option without delivery window requirement (mode=${preferred.shippingMode}, solution=${preferred.shippingSolution})`);
-        }
-      }
+      // Log every non-LTL option with cost for cost-aware selection
+      const transportSummary = nonLtlOpts.map((o: any) => ({
+        id: o.transportationOptionId?.slice(0, 20) + '...',
+        mode: o.shippingMode,
+        solution: o.shippingSolution,
+        carrier: o.carrier?.name,
+        cost: o.quote?.cost?.amount,
+        currency: o.quote?.cost?.code,
+        needsDeliveryWindow: (o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW'),
+      }));
+      console.log(`[fba-inbound] Non-LTL transport options for ${sid}:`, JSON.stringify(transportSummary));
 
-      // Priority 3: Amazon Partnered Carrier with delivery window
-      if (!preferred) {
-        console.log(`[fba-inbound] All options require CONFIRMED_DELIVERY_WINDOW - will generate and confirm delivery windows`);
-        preferred = allTransportOpts.find(
-          (o: any) =>
-            (o.shippingMode === 'GROUND_SMALL_PARCEL' || o.shippingMode === 'AIR_SMALL_PARCEL') &&
-            o.shippingSolution === 'AMAZON_PARTNERED_CARRIER'
-        );
-      }
+      // Sort by priority and cost:
+      // Key 1: AMAZON_PARTNERED_CARRIER ranks above USE_YOUR_OWN_CARRIER (Amazon books shipping)
+      // Key 2: no-delivery-window ranks above needs-confirmed-window (saves a step)
+      // Key 3: lowest quoted cost
+      const rankSolution = (s: string) => (s === 'AMAZON_PARTNERED_CARRIER' ? 0 : 1);
+      const rankPreconds = (o: any) => ((o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW') ? 1 : 0);
+      const rankCost = (o: any) => (typeof o.quote?.cost?.amount === 'number' ? o.quote.cost.amount : Number.POSITIVE_INFINITY);
+      nonLtlOpts.sort((a: any, b: any) => {
+        const sA = rankSolution(a.shippingSolution);
+        const sB = rankSolution(b.shippingSolution);
+        if (sA !== sB) return sA - sB;
+        const pA = rankPreconds(a);
+        const pB = rankPreconds(b);
+        if (pA !== pB) return pA - pB;
+        return rankCost(a) - rankCost(b);
+      });
 
-      // Priority 4: Any small parcel option with delivery window
-      if (!preferred) {
-        preferred = allTransportOpts.find(
-          (o: any) => o.shippingMode === 'GROUND_SMALL_PARCEL' || o.shippingMode === 'AIR_SMALL_PARCEL'
-        );
-      }
+      let preferred = nonLtlOpts[0];
 
-      // Priority 5: Fallback to first option
-      if (!preferred) {
-        console.warn(`[fba-inbound] WARNING: Using fallback first option`);
+      // Fallback: if for some reason we filtered everything out, use the first raw option
+      if (!preferred && allTransportOpts.length > 0) {
+        console.warn(`[fba-inbound] WARNING: All options were LTL - falling back to first LTL option for ${sid}`);
         preferred = allTransportOpts[0];
       }
 
