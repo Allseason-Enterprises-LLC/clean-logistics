@@ -134,8 +134,15 @@ export async function syncTikTokOrders(lookbackMinutes = 15): Promise<SyncResult
     return result;
   }
 
-  // Fetch full details for fresh orders (line items, addresses, quantities)
-  const details = await getOrderDetail(creds, fresh.map((o) => o.id));
+  // Fetch full details for fresh orders (line items, addresses, quantities).
+  // TikTok limits /orders detail calls to 50 ids per request.
+  const details: any[] = [];
+  const freshIds = fresh.map((o) => o.id);
+  for (let i = 0; i < freshIds.length; i += 50) {
+    const chunk = freshIds.slice(i, i + 50);
+    const batch = await getOrderDetail(creds, chunk);
+    details.push(...batch);
+  }
   const detailById = new Map(details.map((d: any) => [d.id, d]));
 
   for (const summary of fresh) {

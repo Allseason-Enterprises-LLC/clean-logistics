@@ -116,7 +116,14 @@ async function refreshAccessToken(
   }
 
   const { access_token, refresh_token, access_token_expire_in } = json.data;
-  const expiresAt = new Date(Date.now() + access_token_expire_in * 1000);
+  // TikTok's `access_token_expire_in` field is a unix timestamp (seconds),
+  // NOT a duration. If the value is greater than ~1 year from now we treat
+  // it as an absolute timestamp; otherwise fall back to "seconds from now".
+  const nowSec = Math.floor(Date.now() / 1000);
+  const expiresAt =
+    access_token_expire_in > nowSec + 365 * 24 * 60 * 60
+      ? new Date(access_token_expire_in * 1000)
+      : new Date(Date.now() + access_token_expire_in * 1000);
 
   await supabase
     .from('platform_credentials')
