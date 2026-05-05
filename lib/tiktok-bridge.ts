@@ -35,6 +35,18 @@ const CLEAN_NUTRA_LV_WAREHOUSE = 'V2FyZWhvdXNlOjEzNTg3Mg==';
 const CLEAN_NUTRA_LV_UUID = '22e17170-af72-4bf8-b77c-d73c86b06765';
 const CLEAN_NUTRA_CUSTOMER_ACCOUNT = '95145';
 
+/**
+ * Build a ShipHero partner_line_item_id that fits the 45-char limit.
+ * Format: TT-{last12 of orderId}-{sku[..20]}-{idx}
+ * Must be deterministic + unique within an order.
+ */
+function buildShortLineItemId(orderId: string, sku: string, idx: number): string {
+  const shortOrder = String(orderId).slice(-12);
+  const shortSku = String(sku).replace(/[^A-Za-z0-9]/g, '').slice(0, 20);
+  const candidate = `TT-${shortOrder}-${shortSku}-${idx}`;
+  return candidate.slice(0, 45);
+}
+
 // ============================================================================
 // ShipHero GQL helpers (scoped to Clean Nutra token)
 // ============================================================================
@@ -226,7 +238,9 @@ async function importOrder(
 
   const shipheroLineItems = Array.from(qtyBySku.entries()).map(([sku, info], idx) => ({
     sku,
-    partner_line_item_id: `${detail.order_id || detail.id}-${sku}-${idx}`,
+    // partner_line_item_id must be <= 45 chars.
+    // Use a short deterministic id: last 12 of order id + last 8 of sku + idx.
+    partner_line_item_id: buildShortLineItemId(detail.order_id || detail.id, sku, idx),
     quantity: info.qty,
     price: info.price || '0.00',
     product_name: info.name,
