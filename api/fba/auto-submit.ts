@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getShipHeroProductData, getShipHeroToken } from '../../lib/shiphero-product-data';
-import { lookupSkuMapping, createFbaInboundShipment, fetchFbaLabels } from '../../lib/fba-orchestrator';
+import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
+import { postProcessFbaShipment } from '../../lib/fba-post-process';
 
 export const config = { maxDuration: 300 };
 
@@ -123,15 +124,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       );
 
-      // 5. Fetch labels
+      // 5. Post-process: fetch labels, upload to Supabase, attach to ShipHero, Telegram notify
       const shipmentIds = fbaResult.shipmentIds || fbaResult.amazon_shipment_ids || [];
       const confirmationIds = fbaResult.shipmentConfirmationIds || [];
-      let labelsUrl: string | null = null;
 
-      const labelId = confirmationIds[0] || shipmentIds[0];
-      if (labelId) {
-        const labelResult = await fetchFbaLabels(labelId);
-        labelsUrl = labelResult.downloadUrl;
+      let postProcess: any = null;
+      try {
+        postProcess = await postProcessFbaShipment({
+          cin7TransferNumber: cin7_transfer_number,
+          fbaResult: {
+            planId: fbaResult.planId || fbaResult.plan_id,
+            shipmentIds,
+            shipmentConfirmationIds: confirmationIds,
+          },
+          product: {
+            cin7Sku: item.sku,
+            amazonSku: skuMapping.amz_sku,
+            productName: productData.name,
+            fnsku: skuMapping.amz_fnsku ?? undefined,
+            asin: skuMapping.amz_asin ?? undefined,
+          },
+          quantity: {
+            totalUnits: totalQty,
+            boxes: numBoxes,
+            unitsPerBox,
+          },
+          box: {
+            length: casePack.boxLength,
+            width: casePack.boxWidth,
+            height: casePack.boxHeight,
+            weightLbs: casePack.boxWeightLbs,
+          },
+          expiration: productData.expirationDate ?? undefined,
+          lot: productData.lotNumber ?? undefined,
+        });
+        console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments, telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
+      } catch (postErr: any) {
+        console.error('[fba-auto] post-process failed (non-fatal):', postErr?.message);
       }
 
       results.push({
@@ -146,7 +175,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         expiration: productData.expirationDate,
         lot: productData.lotNumber,
         amazon_shipment_ids: shipmentIds,
-        labels_url: labelsUrl,
+        shipment_confirmation_ids: confirmationIds,
+        labels: postProcess?.labels ?? [],
+        total_shipping_cost: postProcess?.totalShippingCost,
+        placement_fee: postProcess?.placementFee,
+        shiphero_order_id: postProcess?.shipheroOrderId,
+        attachments_created: postProcess?.attachmentsCreated ?? 0,
+        telegram_sent: postProcess?.telegramSent ?? false,
+        post_process_errors: postProcess?.errors ?? [],
         prep: fbaResult.prepInstructions || fbaResult.prep_instructions,
       });
     }
