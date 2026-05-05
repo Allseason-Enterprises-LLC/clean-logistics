@@ -116,7 +116,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           width: casePack.boxWidth,
           height: casePack.boxHeight,
         },
-        casePack.boxWeightLbs
+        casePack.boxWeightLbs,
+        {
+          boxQuantity: numBoxes,
+          casePack: unitsPerBox,
+        }
       );
 
       // 5. Fetch labels
