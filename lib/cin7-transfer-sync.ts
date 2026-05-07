@@ -606,6 +606,35 @@ export async function syncCIN7LasVegasTransferOrders(
         if (isInboundToLasVegas(transfer, lasVegasAliases)) {
           // INBOUND: create a ShipHero Purchase Order so warehouse can receive against it
           const poNumber = `CIN7-${transfer.transferNumber}`;
+
+          // ⚠️ IDEMPOTENCY GUARD: ShipHero auto-assigns a new purchase_order_id
+          // every time purchase_order_create is called with the same po_number,
+          // so we MUST check the bridge table before firing. Without this check
+          // the 20-min cron stacks duplicate POs (98 entries / 2 transfers = ~49
+          // cycles observed 2026-05-07, each run overwrote the bridge row's
+          // shiphero_order_id with the latest dupe — hiding the problem from the
+          // upsert-by-conflict-key guard).
+          const { data: existingRow } = await supabase
+            .from('cin7_transfer_shiphero_orders')
+            .select('shiphero_order_id, shiphero_order_number, synced_at, request_payload, status')
+            .eq('cin7_transfer_id', transfer.id)
+            .eq('cin7_destination', transfer.destinationName || '')
+            .maybeSingle();
+
+          const existingIsSyncedPO =
+            existingRow &&
+            existingRow.status === 'synced' &&
+            existingRow.shiphero_order_id &&
+            (existingRow.request_payload as any)?.type === 'purchase_order';
+
+          if (existingIsSyncedPO) {
+            console.log(
+              `[CIN7 Transfer] Skipping PO create for ${poNumber} — already synced as ${existingRow.shiphero_order_number} (${existingRow.shiphero_order_id}) at ${existingRow.synced_at}`
+            );
+            skipped++;
+            continue;
+          }
+
           console.log(`[CIN7 Transfer] Creating ShipHero PO ${poNumber} (inbound to LV from ${transfer.sourceName || 'unknown'})`);
 
           const poResult = await createShipHeroPurchaseOrder(

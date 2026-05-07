@@ -9,10 +9,6 @@
     {
       "path": "/api/tiktok/sync-orders",
       "schedule": "*/5 * * * *"
-    },
-    {
-      "path": "/api/cron/sync-cin7-las-vegas-transfers",
-      "schedule": "*/20 * * * *"
     }
   ]
 }
