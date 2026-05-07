@@ -210,6 +210,23 @@ async function importOrder(
     return 'skipped_no_match';
   }
 
+  // Skip Fulfillment-by-TikTok (FBT) orders — TikTok ships those from their own
+  // warehouse. If we pull them into Clean Nutra LV we'd double-ship, and the
+  // recipient PII is masked by TikTok anyway ("72* ***** ***** *** *** **").
+  // Only FULFILLMENT_BY_SELLER orders are ours to ship.
+  const fulfillmentType = detail.fulfillment_type || detail.shipping_type;
+  const isFbt =
+    fulfillmentType === 'FULFILLMENT_BY_TIKTOK' ||
+    fulfillmentType === 'TIKTOK' ||
+    String(detail.delivery_option_name || '').toLowerCase().includes('fulfilled by tiktok');
+  if (isFbt) {
+    console.log(
+      `[tiktok-bridge] Skipping FBT order ${detail.id} (fulfillment_type=${detail.fulfillment_type}, shipping_type=${detail.shipping_type})`
+    );
+    await logSkipped(detail, skus, `Fulfilled by TikTok (fulfillment_type=${detail.fulfillment_type || detail.shipping_type}) — not ours to ship`);
+    return 'skipped_no_match';
+  }
+
   console.log(
     `[tiktok-bridge] Importing TikTok order ${detail.id} → ShipHero (matched "${match.matchedPattern}")`
   );
