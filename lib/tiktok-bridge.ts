@@ -593,6 +593,7 @@ export class TikTokPostbackNotAllowed extends Error {
 
 /** TikTok error codes we treat as "cannot be pushed, don't retry". */
 const TIKTOK_NON_RETRYABLE_CODES = new Set([
+  21001001, // Invalid params (typically: order already has a package/is IN_TRANSIT)
   21008025, // Seller cannot operate orders which are fulfilled by platform
   21008026, // Package already exists / declared
   21008013, // Order status invalid for this operation
