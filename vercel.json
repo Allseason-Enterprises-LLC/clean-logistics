@@ -13,6 +13,10 @@
     {
       "path": "/api/cron/sync-cin7-las-vegas-transfers",
       "schedule": "*/20 * * * *"
+    },
+    {
+      "path": "/api/cron/reconcile-tiktok-tracking",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

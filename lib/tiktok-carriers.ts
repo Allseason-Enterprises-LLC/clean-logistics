@@ -69,3 +69,44 @@ export function resolveProviderId(
   }
   return null;
 }
+
+/**
+ * Fallback TikTok shipping_provider_id map for the Clean Nutra shop.
+ *
+ * These IDs were extracted from already-shipped packages on the Clean Nutra
+ * TikTok shop (shop_id 7495291933339519508) — e.g. USPS appears as
+ * `7117858858072016686` on successful IN_TRANSIT packages.
+ *
+ * We keep this hardcoded because our TikTok app doesn't currently have the
+ * `logistics` API scope — `/logistics/202309/shipping_providers` returns
+ * `no schema found`. Without these IDs, `postTrackingToTikTok` throws and
+ * the webhook retries forever.
+ *
+ * If TikTok ever changes these, add a new entry and update the fallback.
+ */
+export const CLEAN_NUTRA_PROVIDER_IDS: Record<CanonicalCarrier, string | null> = {
+  // Only USPS is verified (extracted from IN_TRANSIT package 1156298521127194932).
+  // Add other carriers here as they're observed on successful packages in this shop.
+  usps: '7117858858072016686',
+  ups: null,
+  fedex: null,
+  dhl: null,
+  ontrac: null,
+  lasership: null,
+  amazon: null,
+  unknown: null,
+};
+
+/**
+ * Resolve a TikTok shipping_provider_id for a canonical carrier, preferring
+ * the live provider list but falling back to the hardcoded shop-specific map
+ * when the list isn't available (missing app scope).
+ */
+export function resolveProviderIdWithFallback(
+  canonical: CanonicalCarrier,
+  providers: Array<{ id: string; name: string }>
+): string | null {
+  const fromLive = resolveProviderId(canonical, providers);
+  if (fromLive) return fromLive;
+  return CLEAN_NUTRA_PROVIDER_IDS[canonical] || null;
+}
