@@ -28,7 +28,7 @@ import {
   type TikTokCredentials,
 } from './tiktok-api';
 import { getLasVegasSkuPatterns, matchSkuToWarehouse } from './tiktok-routing';
-import { normalizeCarrier, resolveProviderId } from './tiktok-carriers';
+import { normalizeCarrier, resolveProviderIdWithFallback } from './tiktok-carriers';
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
 const CLEAN_NUTRA_LV_WAREHOUSE = 'V2FyZWhvdXNlOjEzNTg3Mg==';
@@ -541,6 +541,24 @@ export async function handleShipHeroShipment(
     console.log(`[tiktok-bridge] Tracking posted to TikTok for ${row.tiktok_order_id}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+
+    // Non-retryable: TikTok refused for reasons we can't fix by retrying
+    // (order on hold, already fulfilled, etc). Mark skipped so we stop
+    // trying, but return 'ok' so ShipHero doesn't retry the webhook forever.
+    if (err instanceof TikTokPostbackNotAllowed) {
+      console.warn(
+        `[tiktok-bridge] TikTok refused tracking post-back for ${row.tiktok_order_id} (code=${err.code}): ${msg}`
+      );
+      await supabase
+        .from('tiktok_shiphero_orders')
+        .update({
+          status: 'skipped',
+          error_message: `TikTok refused (code=${err.code}): ${msg}`,
+        })
+        .eq('id', row.id);
+      return { status: 'skipped', reason: `TikTok code ${err.code}` };
+    }
+
     console.error(`[tiktok-bridge] TikTok tracking post-back failed for ${row.tiktok_order_id}:`, msg);
     await supabase
       .from('tiktok_shiphero_orders')
@@ -554,6 +572,44 @@ export async function handleShipHeroShipment(
   }
 
   return { status: 'ok' };
+}
+
+/**
+ * Thrown when TikTok refuses to accept a tracking push for reasons outside
+ * our control — order is on hold, already fulfilled through another channel,
+ * already has a package declared, etc. These are not retryable errors and
+ * should be recorded on the bridge row as `skipped` rather than `error`.
+ */
+export class TikTokPostbackNotAllowed extends Error {
+  readonly code: number;
+  readonly tiktokRequestId: string | undefined;
+  constructor(code: number, message: string, tiktokRequestId?: string) {
+    super(message);
+    this.name = 'TikTokPostbackNotAllowed';
+    this.code = code;
+    this.tiktokRequestId = tiktokRequestId;
+  }
+}
+
+/** TikTok error codes we treat as "cannot be pushed, don't retry". */
+const TIKTOK_NON_RETRYABLE_CODES = new Set([
+  21008025, // Seller cannot operate orders which are fulfilled by platform
+  21008026, // Package already exists / declared
+  21008013, // Order status invalid for this operation
+]);
+
+function isTikTokNonRetryable(err: unknown): err is Error {
+  if (!(err instanceof Error)) return false;
+  // tiktok-api wraps: `TikTok API POST /path failed: code=21008025 message=...`
+  const m = err.message.match(/code=(\d+)/);
+  if (!m) return false;
+  return TIKTOK_NON_RETRYABLE_CODES.has(Number(m[1]));
+}
+
+function tiktokErrorCode(err: unknown): number | null {
+  if (!(err instanceof Error)) return null;
+  const m = err.message.match(/code=(\d+)/);
+  return m ? Number(m[1]) : null;
 }
 
 async function postTrackingToTikTok(
@@ -571,20 +627,237 @@ async function postTrackingToTikTok(
     throw new Error('no tiktok_line_item_ids stored on bridge row — cannot declare package');
   }
 
-  // 1. Declare package
-  const pkg = await declarePackage(creds, row.tiktok_order_id, lineItemIds);
+  // 1. Declare package — if TikTok has already reserved this order for
+  //    platform fulfillment / buyer hold / etc, this returns 21008025.
+  //    That's a terminal state for us, not a retryable failure.
+  let pkg: { package_id: string };
+  try {
+    pkg = await declarePackage(creds, row.tiktok_order_id, lineItemIds);
+  } catch (err) {
+    if (isTikTokNonRetryable(err)) {
+      throw new TikTokPostbackNotAllowed(
+        tiktokErrorCode(err) ?? 0,
+        `declarePackage refused by TikTok: ${(err as Error).message}`
+      );
+    }
+    throw err;
+  }
 
-  // 2. Resolve carrier → TikTok provider id
+  // 2. Resolve carrier → TikTok provider id.
+  //    We try the live `/logistics/202309/shipping_providers` endpoint first,
+  //    then fall back to a shop-specific hardcoded map. The fallback is
+  //    required because our TikTok app currently lacks the `logistics` API
+  //    scope — that endpoint returns `no schema found`.
   const canonical = normalizeCarrier(carrier);
-  const providers = await getShippingProviders(creds);
-  const providerId = resolveProviderId(canonical, providers);
+  let providers: Array<{ id: string; name: string }> = [];
+  try {
+    providers = await getShippingProviders(creds);
+  } catch (err) {
+    console.warn(
+      `[tiktok-bridge] getShippingProviders failed (${(err as Error).message}); using hardcoded fallback map`
+    );
+  }
+  const providerId = resolveProviderIdWithFallback(canonical, providers);
 
   if (!providerId) {
     throw new Error(
-      `could not resolve TikTok provider id for carrier "${carrier}" (canonical=${canonical})`
+      `could not resolve TikTok provider id for carrier "${carrier}" (canonical=${canonical}); ` +
+      `add it to CLEAN_NUTRA_PROVIDER_IDS in lib/tiktok-carriers.ts`
     );
   }
 
   // 3. Ship the package
-  await shipPackage(creds, pkg.package_id, trackingNumber, providerId);
+  try {
+    await shipPackage(creds, pkg.package_id, trackingNumber, providerId);
+  } catch (err) {
+    if (isTikTokNonRetryable(err)) {
+      throw new TikTokPostbackNotAllowed(
+        tiktokErrorCode(err) ?? 0,
+        `shipPackage refused by TikTok: ${(err as Error).message}`
+      );
+    }
+    throw err;
+  }
+}
+
+// ============================================================================
+// Reconciliation: scan stuck bridge rows and push tracking from ShipHero
+// ============================================================================
+
+export interface ReconcileResult {
+  scanned: number;
+  pushed: number;
+  skipped_no_tracking: number;
+  skipped_tiktok_refused: number;
+  errors: Array<{ tiktokOrderId: string; message: string }>;
+}
+
+interface ShipHeroShipmentInfo {
+  trackingNumber: string;
+  carrier: string;
+}
+
+/**
+ * Query ShipHero for a given order's latest shipment tracking.
+ * Returns null if the order has no shipping labels yet (warehouse hasn't shipped).
+ */
+async function getShipHeroTracking(
+  shipheroOrderId: string
+): Promise<ShipHeroShipmentInfo | null> {
+  const query = `
+    query($id: String!) {
+      order(id: $id) {
+        data {
+          id
+          order_number
+          fulfillment_status
+          shipments {
+            id
+            completed
+            shipping_labels {
+              tracking_number
+              carrier
+              shipping_name
+              status
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const data = await shGql<any>(query, { id: shipheroOrderId });
+  const order = data?.order?.data;
+  if (!order) return null;
+
+  const shipments = order.shipments || [];
+  for (const shipment of shipments) {
+    const labels = shipment.shipping_labels || [];
+    for (const label of labels) {
+      if (label.tracking_number && label.status === 'valid') {
+        return {
+          trackingNumber: label.tracking_number,
+          carrier: label.carrier || label.shipping_name || '',
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Reconciliation entry point. Finds bridge rows stuck at `status='imported'`
+ * (webhook never fired or crashed), queries ShipHero for the latest tracking,
+ * and posts it to TikTok. Runs on a cron schedule for self-healing.
+ *
+ * Intentionally bounded — processes at most `batchSize` rows per tick to stay
+ * well under the Vercel function timeout. Rows remain `imported` across ticks
+ * until ShipHero has tracking OR TikTok refuses.
+ */
+export async function reconcileStuckBridgeRows(
+  batchSize = 25
+): Promise<ReconcileResult> {
+  const result: ReconcileResult = {
+    scanned: 0,
+    pushed: 0,
+    skipped_no_tracking: 0,
+    skipped_tiktok_refused: 0,
+    errors: [],
+  };
+
+  // Find orders imported but not yet shipped. Prioritize oldest so we
+  // don't leave anything forever-stuck behind a bursty backlog.
+  const { data: rows, error } = await supabase
+    .from('tiktok_shiphero_orders')
+    .select('*')
+    .eq('status', 'imported')
+    .order('created_at', { ascending: true })
+    .limit(batchSize);
+
+  if (error) throw new Error(`reconcile: supabase select failed: ${error.message}`);
+
+  const candidates = rows || [];
+  result.scanned = candidates.length;
+  if (candidates.length === 0) return result;
+
+  console.log(`[reconcile] ${candidates.length} stuck bridge rows to check`);
+
+  for (const row of candidates) {
+    try {
+      if (!row.shiphero_order_id) {
+        // Malformed row — nothing to reconcile against.
+        result.skipped_no_tracking++;
+        continue;
+      }
+
+      const tracking = await getShipHeroTracking(row.shiphero_order_id);
+      if (!tracking) {
+        // Warehouse hasn't shipped yet; leave row as `imported`
+        result.skipped_no_tracking++;
+        continue;
+      }
+
+      console.log(
+        `[reconcile] Pushing tracking for TT#${row.tiktok_order_id} ` +
+        `SH#${row.shiphero_order_number}: ${tracking.trackingNumber} (${tracking.carrier})`
+      );
+
+      // Mirror the webhook flow: mark shipped first so concurrent ticks
+      // don't double-process the same row.
+      await supabase
+        .from('tiktok_shiphero_orders')
+        .update({
+          carrier: tracking.carrier,
+          tracking_number: tracking.trackingNumber,
+          shipped_at: new Date().toISOString(),
+          status: 'shipped',
+        })
+        .eq('id', row.id);
+
+      try {
+        await postTrackingToTikTok(row, tracking.trackingNumber, tracking.carrier);
+        await supabase
+          .from('tiktok_shiphero_orders')
+          .update({
+            tracking_posted_at: new Date().toISOString(),
+            status: 'tracking_confirmed',
+          })
+          .eq('id', row.id);
+        result.pushed++;
+      } catch (err) {
+        if (err instanceof TikTokPostbackNotAllowed) {
+          console.warn(
+            `[reconcile] TikTok refused TT#${row.tiktok_order_id} (code=${err.code}): ${err.message}`
+          );
+          await supabase
+            .from('tiktok_shiphero_orders')
+            .update({
+              status: 'skipped',
+              error_message: `TikTok refused (code=${err.code}): ${err.message}`,
+            })
+            .eq('id', row.id);
+          result.skipped_tiktok_refused++;
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[reconcile] TT#${row.tiktok_order_id} failed:`, msg);
+      result.errors.push({ tiktokOrderId: row.tiktok_order_id, message: msg });
+      await supabase
+        .from('tiktok_shiphero_orders')
+        .update({
+          status: 'error',
+          error_message: `reconcile failed: ${msg}`,
+          retry_count: (row.retry_count || 0) + 1,
+        })
+        .eq('id', row.id);
+    }
+
+    // Gentle pacing — TikTok rate-limits and ShipHero has credit costs.
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  return result;
 }
