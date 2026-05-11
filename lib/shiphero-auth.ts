@@ -91,6 +91,10 @@ async function writeTokens(pair: ShipHeroTokenPair): Promise<void> {
  * Try refresh_token grant. ShipHero's /auth/refresh returns
  * "Service Unavailable" with HTTP 400 when the refresh token is invalid /
  * expired — that misleading wording is normal and means we should fall back.
+ *
+ * NOTE: ShipHero's refresh endpoint returns ONLY access_token (no refresh_token).
+ * The existing refresh_token stays valid. We pass it through so callers can
+ * persist both fields together.
  */
 async function tryRefreshGrant(
   refreshToken: string
@@ -109,10 +113,12 @@ async function tryRefreshGrant(
   }
   try {
     const json = JSON.parse(text);
-    if (json.access_token && json.refresh_token) {
+    if (json.access_token) {
+      // ShipHero's /auth/refresh does not rotate the refresh token —
+      // reuse the one we already have.
       return {
         accessToken: json.access_token,
-        refreshToken: json.refresh_token,
+        refreshToken: json.refresh_token || refreshToken,
       };
     }
   } catch {
