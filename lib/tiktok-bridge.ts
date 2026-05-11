@@ -412,6 +412,9 @@ async function createShipHeroOrder(
       partner_order_id: input.partnerOrderId,
       customer_account_id: input.customerAccountId,
       shop_name: input.shopName,
+      // Channel tag — drives ShipHero filtering, automation rules, and reports.
+      // Mirror this on every channel bridge: ["Walmart"], ["Amazon"], ["Shopify"], etc.
+      tags: ['TikTok'],
       fulfillment_status: 'pending',
       order_date: new Date().toISOString(),
       total_tax: '0.00',
