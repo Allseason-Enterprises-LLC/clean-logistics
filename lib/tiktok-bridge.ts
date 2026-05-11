@@ -78,6 +78,15 @@ async function shGql<T = any>(query: string, variables?: Record<string, any>): P
     body: JSON.stringify({ query, variables }),
   });
   const json: any = await resp.json();
+  // ShipHero returns {"message": "Token is expired"} (no .data, no .errors) when the
+  // access token has expired. Without this guard the caller crashes with
+  // "Cannot read properties of undefined (reading 'order_create')" because json.data is
+  // undefined. Surface a clear, actionable error instead.
+  if (json.message && !json.data) {
+    throw new Error(
+      `ShipHero API error: ${json.message} — the ShipHero access token in Supabase (warehouses row ${CLEAN_NUTRA_LV_UUID}) needs to be refreshed.`
+    );
+  }
   if (json.errors) {
     throw new Error(`ShipHero GQL error: ${JSON.stringify(json.errors)}`);
   }
