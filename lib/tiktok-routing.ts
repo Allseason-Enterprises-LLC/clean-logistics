@@ -167,6 +167,7 @@ export async function getOrderDetails(orderId: string): Promise<{
   shopName: string;
   skus: string[];
   warehouseId?: string;
+  tags: string[];
 }> {
   const query = `
     query($id: String!) {
@@ -175,6 +176,7 @@ export async function getOrderDetails(orderId: string): Promise<{
           id
           order_number
           shop_name
+          tags
           allocations {
             warehouse_id
           }
@@ -200,6 +202,7 @@ export async function getOrderDetails(orderId: string): Promise<{
     shopName: order.shop_name,
     skus: order.line_items.edges.map((e: any) => e.node.sku),
     warehouseId: order.allocations?.[0]?.warehouse_id,
+    tags: order.tags || [],
   };
 }
 
@@ -244,15 +247,24 @@ export async function routeTikTokOrder(orderId: string): Promise<RoutingDecision
   // 1. Get order details
   const order = await getOrderDetails(orderId);
 
-  // 2. Only route TikTok Shop orders
-  if (!order.shopName.toLowerCase().includes('tiktok')) {
+  // 2. Only route TikTok orders. The custom bridge sets shop_name='TikTok Shop',
+  // but the native ShipHero TikTok integration sets shop_name='Clean Nutra' and
+  // adds tags like 'tiktok_delivery_option_name-...' or 'fulfilled_by_tiktok'.
+  // We need to recognize both.
+  const shop = order.shopName.toLowerCase();
+  const tags = (order.tags || []).map((t) => t.toLowerCase());
+  const isTikTokOrder =
+    shop.includes('tiktok') ||
+    tags.some((t) => t.startsWith('tiktok_') || t === 'tiktok' || t === 'fulfilled_by_tiktok');
+
+  if (!isTikTokOrder) {
     return {
       orderId: order.id,
       orderNumber: order.orderNumber,
       skus: order.skus,
       targetWarehouse: 'clearship',
       targetWarehouseId: 'default',
-      reason: `Not a TikTok order (shop: ${order.shopName}), skipping`,
+      reason: `Not a TikTok order (shop: ${order.shopName}, tags: ${(order.tags || []).join(',')}), skipping`,
     };
   }
 
