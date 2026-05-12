@@ -21,6 +21,10 @@
     {
       "path": "/api/cron/hold-fbt-orders",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/tag-orders",
+      "schedule": "*/5 * * * *"
     }
   ]
 }
