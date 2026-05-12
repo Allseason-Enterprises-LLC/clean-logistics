@@ -241,6 +241,25 @@ export async function changeOrderWarehouse(
 }
 
 /**
+ * Put an order on operator_hold so the warehouse never picks it.
+ * Used for FBT (Fulfilled-by-TikTok) orders that TikTok ships from their
+ * own warehouse — picking them on our side would cause double-shipping.
+ */
+async function applyOperatorHold(orderId: string): Promise<void> {
+  const mutation = `
+    mutation($data: UpdateOrderHoldsInput!) {
+      order_update_holds(data: $data) {
+        request_id
+        order { id holds { operator_hold } }
+      }
+    }
+  `;
+  await gql(mutation, {
+    data: { order_id: orderId, operator_hold: true },
+  });
+}
+
+/**
  * Main routing function: determines and executes warehouse routing for a TikTok order
  */
 export async function routeTikTokOrder(orderId: string): Promise<RoutingDecision> {
@@ -282,13 +301,30 @@ export async function routeTikTokOrder(orderId: string): Promise<RoutingDecision
     }
   }
 
+  // 5b. Auto-hold FBT (Fulfilled-by-TikTok) orders so the warehouse never picks
+  // them. TikTok ships these from their own warehouse, so any pick on our side
+  // would be a duplicate ship. We use operator_hold (NOT cancel) because cancel
+  // could push back to TikTok and cancel the customer's actual order.
+  const isFbt = tags.some((t) => t === 'fulfilled_by_tiktok');
+  let fbtHeld = false;
+  if (isFbt) {
+    try {
+      await applyOperatorHold(orderId);
+      fbtHeld = true;
+    } catch (err) {
+      console.error(`[route-order] Failed to operator_hold FBT order ${order.orderNumber}:`, err);
+    }
+  }
+
   const decision: RoutingDecision = {
     orderId: order.id,
     orderNumber: order.orderNumber,
     skus: order.skus,
     targetWarehouse: match.warehouse,
     targetWarehouseId: match.warehouse === 'las_vegas' ? WAREHOUSES.LAS_VEGAS : 'default',
-    reason: match.matchedPattern
+    reason: fbtHeld
+      ? `FBT order auto-held (operator_hold). ${match.matchedPattern ? `SKU matched "${match.matchedPattern}"` : 'No LV SKU match'}.`
+      : match.matchedPattern
       ? `SKU matched pattern "${match.matchedPattern}" → Las Vegas`
       : 'No Las Vegas SKU match → left at default warehouse',
     matchedPattern: match.matchedPattern,
