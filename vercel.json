@@ -25,6 +25,15 @@
     {
       "path": "/api/cron/tag-orders",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/sync-cc-shiphero",
+      "schedule": "17 6,12,18,23 * * *"
     }
-  ]
+  ],
+  "functions": {
+    "api/cron/sync-cc-shiphero.ts": {
+      "maxDuration": 300
+    }
+  }
 }
