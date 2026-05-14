@@ -24,6 +24,7 @@ import {
   getOrderDetail,
   declarePackage,
   shipPackage,
+  updateShippingInfo,
   getShippingProviders,
   type TikTokCredentials,
 } from './tiktok-api';
@@ -606,7 +607,9 @@ export class TikTokPostbackNotAllowed extends Error {
 /** TikTok error codes we treat as "cannot be pushed, don't retry". */
 const TIKTOK_NON_RETRYABLE_CODES = new Set([
   21001001, // Invalid params (typically: order already has a package/is IN_TRANSIT)
-  21008025, // Seller cannot operate orders which are fulfilled by platform
+  // 21008025 was here but is now handled by falling back to
+  // shipping_info/update (which works on partner-warehouse / held orders).
+  // See postTrackingToTikTok().
   21008026, // Package already exists / declared
   21008013, // Order status invalid for this operation
 ]);
@@ -636,27 +639,7 @@ async function postTrackingToTikTok(
   const skusJson: Array<{ tiktok_line_item_ids?: string[] }> = row.skus || [];
   const lineItemIds = skusJson.flatMap((s) => s.tiktok_line_item_ids || []);
 
-  if (lineItemIds.length === 0) {
-    throw new Error('no tiktok_line_item_ids stored on bridge row — cannot declare package');
-  }
-
-  // 1. Declare package — if TikTok has already reserved this order for
-  //    platform fulfillment / buyer hold / etc, this returns 21008025.
-  //    That's a terminal state for us, not a retryable failure.
-  let pkg: { package_id: string };
-  try {
-    pkg = await declarePackage(creds, row.tiktok_order_id, lineItemIds);
-  } catch (err) {
-    if (isTikTokNonRetryable(err)) {
-      throw new TikTokPostbackNotAllowed(
-        tiktokErrorCode(err) ?? 0,
-        `declarePackage refused by TikTok: ${(err as Error).message}`
-      );
-    }
-    throw err;
-  }
-
-  // 2. Resolve carrier → TikTok provider id.
+  // Resolve carrier → TikTok provider id (needed by both paths).
   //    We try the live `/logistics/202309/shipping_providers` endpoint first,
   //    then fall back to a shop-specific hardcoded map. The fallback is
   //    required because our TikTok app currently lacks the `logistics` API
@@ -679,18 +662,63 @@ async function postTrackingToTikTok(
     );
   }
 
-  // 3. Ship the package
-  try {
-    await shipPackage(creds, pkg.package_id, trackingNumber, providerId);
-  } catch (err) {
-    if (isTikTokNonRetryable(err)) {
-      throw new TikTokPostbackNotAllowed(
-        tiktokErrorCode(err) ?? 0,
-        `shipPackage refused by TikTok: ${(err as Error).message}`
-      );
+  // 1. Try the package flow first (declarePackage → shipPackage). This is the
+  //    canonical path and TikTok's `packages` model lets us split shipments
+  //    across multiple boxes later if we ever need to.
+  //
+  //    If declarePackage returns 21008025 ("Seller cannot operate orders
+  //    which are fulfilled by platform" — happens when TikTok routed the
+  //    order to a partner warehouse like ClearShip), fall back to the
+  //    `shipping_info/update` bypass endpoint, which TikTok accepts even on
+  //    held / partner-warehouse orders. See
+  //    `references/tiktok-shiphero-bridge.md` § `shipping_info/update`.
+  if (lineItemIds.length > 0) {
+    let pkg: { package_id: string };
+    try {
+      pkg = await declarePackage(creds, row.tiktok_order_id, lineItemIds);
+    } catch (err) {
+      const code = tiktokErrorCode(err);
+      if (code === 21008025) {
+        console.log(
+          `[tiktok-bridge] declarePackage 21008025 for TT#${row.tiktok_order_id}; ` +
+          `falling back to shipping_info/update bypass`
+        );
+        await updateShippingInfo(creds, row.tiktok_order_id, trackingNumber, providerId);
+        return;
+      }
+      if (isTikTokNonRetryable(err)) {
+        throw new TikTokPostbackNotAllowed(
+          code ?? 0,
+          `declarePackage refused by TikTok: ${(err as Error).message}`
+        );
+      }
+      throw err;
     }
-    throw err;
+
+    // 2. Ship the package
+    try {
+      await shipPackage(creds, pkg.package_id, trackingNumber, providerId);
+      return;
+    } catch (err) {
+      if (isTikTokNonRetryable(err)) {
+        throw new TikTokPostbackNotAllowed(
+          tiktokErrorCode(err) ?? 0,
+          `shipPackage refused by TikTok: ${(err as Error).message}`
+        );
+      }
+      throw err;
+    }
   }
+
+  // No stored line item IDs — use the bypass endpoint directly. This handles
+  // orders imported via legacy/backfill paths that didn't capture
+  // tiktok_line_item_ids, including older `TT-` bridge rows from the
+  // pre-native-cutover era.
+  console.log(
+    `[tiktok-bridge] No tiktok_line_item_ids on bridge row TT#${row.tiktok_order_id}; ` +
+    `using shipping_info/update directly`
+  );
+  await updateShippingInfo(creds, row.tiktok_order_id, trackingNumber, providerId);
 }
 
 // ============================================================================

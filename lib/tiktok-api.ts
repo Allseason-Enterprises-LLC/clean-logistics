@@ -342,6 +342,39 @@ export async function shipPackage(
 }
 
 /**
+ * Bypass endpoint: post tracking directly to an order without going through
+ * the declarePackage → shipPackage flow.
+ *
+ * This works on orders where `declarePackage` returns `21008025` "Seller cannot
+ * operate orders which are fulfilled by platform" — i.e. orders TikTok has
+ * routed to a partner warehouse (e.g. ClearShip), or held orders, or anything
+ * where `packages=[]` and the seller is locked out of the normal package flow.
+ *
+ * TikTok auto-creates the package server-side when this is called. Confirmed
+ * 2026-05-13 on two ClearShip-routed held orders that moved AWAITING_SHIPMENT
+ * → AWAITING_COLLECTION immediately. See
+ * `references/tiktok-shiphero-bridge.md` § `shipping_info/update`.
+ */
+export async function updateShippingInfo(
+  creds: TikTokCredentials,
+  orderId: string,
+  trackingNumber: string,
+  tiktokCarrierId: string
+): Promise<void> {
+  await tiktokCall<any>(
+    'POST',
+    `/fulfillment/202309/orders/${orderId}/shipping_info/update`,
+    creds,
+    {
+      body: {
+        tracking_number: trackingNumber,
+        shipping_provider_id: tiktokCarrierId,
+      },
+    }
+  );
+}
+
+/**
  * Fetch TikTok's current list of shipping providers for this shop.
  * Each has an `id` we must use in ship() calls — the string names change.
  * Cache this on first call; providers rarely change.
