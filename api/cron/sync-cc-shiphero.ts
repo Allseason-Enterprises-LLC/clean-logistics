@@ -125,7 +125,7 @@ async function pushOrders(log: string[]) {
     try {
       const checkResult = await shGraphQL(`{ orders(order_number: "${esc(orderId)}", customer_account_id: "${CUSTOMER_ACCOUNT_ID}") { data(first: 3) { edges { node { shop_name } } } } }`);
       const existingShops = checkResult.data?.orders?.data?.edges?.map((e: any) => e.node.shop_name) || [];
-      if (existingShops.includes('CheckoutChamp') || existingShops.includes('Checkout Champ')) {
+      if (existingShops.includes('CheckoutChamp') || existingShops.includes('Checkout Champ') || existingShops.includes('CC-Bridge')) {
         alreadyExists++;
         continue;
       }
@@ -211,7 +211,7 @@ async function pushOrders(log: string[]) {
 async function syncTracking(log: string[]) {
   log.push('[TRACK] Querying ShipHero for shipped orders...');
 
-  const SHOP_NAMES = ['CheckoutChamp', 'Checkout Champ'];
+  const SHOP_NAMES = ['CheckoutChamp', 'Checkout Champ', 'CC-Bridge'];
   let allOrders: any[] = [];
 
   for (const shopName of SHOP_NAMES) {
