@@ -94,6 +94,30 @@ async function shGql<T = any>(query: string, variables?: Record<string, any>): P
   return json.data as T;
 }
 
+// In-memory SKU→barcode cache to avoid redundant product lookups per cron run.
+const _skuBarcodeCache = new Map<string, string | null>();
+
+/**
+ * Look up the real UPC/barcode for a SKU from ShipHero's product catalog.
+ * Returns null if the product is not found or has no barcode set.
+ * Results are cached for the lifetime of the process (per cron invocation).
+ */
+async function getProductBarcode(sku: string): Promise<string | null> {
+  if (_skuBarcodeCache.has(sku)) return _skuBarcodeCache.get(sku)!;
+  try {
+    const data = await shGql<any>(
+      `query($sku: String!) { product(sku: $sku) { data { barcode } } }`,
+      { sku }
+    );
+    const barcode = data?.product?.data?.barcode || null;
+    _skuBarcodeCache.set(sku, barcode);
+    return barcode;
+  } catch {
+    _skuBarcodeCache.set(sku, null);
+    return null;
+  }
+}
+
 // ============================================================================
 // Sync: TikTok → ShipHero
 // ============================================================================
@@ -263,16 +287,25 @@ async function importOrder(
     }
   }
 
-  const shipheroLineItems = Array.from(qtyBySku.entries()).map(([sku, info], idx) => ({
-    sku,
-    // partner_line_item_id must be <= 45 chars.
-    // Use a short deterministic id: last 12 of order id + last 8 of sku + idx.
-    partner_line_item_id: buildShortLineItemId(detail.order_id || detail.id, sku, idx),
-    quantity: info.qty,
-    price: info.price || '0.00',
-    product_name: info.name,
-    warehouse_id: CLEAN_NUTRA_LV_WAREHOUSE,
-  }));
+  const shipheroLineItems = await Promise.all(
+    Array.from(qtyBySku.entries()).map(async ([sku, info], idx) => {
+      // Look up the real product barcode from the ShipHero catalog.
+      // The packing station scanner needs a numeric UPC — if we omit this
+      // ShipHero falls back to the SKU string, which the scanner can't read.
+      const barcode = await getProductBarcode(sku);
+      return {
+        sku,
+        // partner_line_item_id must be <= 45 chars.
+        // Use a short deterministic id: last 12 of order id + last 8 of sku + idx.
+        partner_line_item_id: buildShortLineItemId(detail.order_id || detail.id, sku, idx),
+        quantity: info.qty,
+        price: info.price || '0.00',
+        product_name: info.name,
+        warehouse_id: CLEAN_NUTRA_LV_WAREHOUSE,
+        ...(barcode ? { barcode } : {}),
+      };
+    })
+  );
 
   const address = detail.recipient_address || detail.shipping_address || {};
 
@@ -315,7 +348,7 @@ async function importOrder(
       phone: address.phone_number || address.phone || '',
       email: detail.buyer_email || address.email || '',
     },
-    shopName: 'TikTok Shop',
+    shopName: 'Clean Nutra',
   });
 
   // Store the import record, remembering which line ids belong to which sku
