@@ -692,6 +692,7 @@ export async function syncCIN7LasVegasTransferOrders(
             credentials: shipHeroWarehouse.credentials,
             warehouseName: shipHeroWarehouse.name,
             input: buildShipHeroTransferOrderInput(transfer),
+            cin7DestinationName: transfer.destinationName || undefined,
           });
 
           if (result.created || result.existingOrderId) {

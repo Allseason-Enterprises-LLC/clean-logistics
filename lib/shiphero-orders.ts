@@ -8,6 +8,16 @@ interface CreateShipHeroOrderParams {
   warehouseName: string;
   input: ShipHeroTransferOrderInput;
   supabase?: SupabaseClient;
+  /**
+   * The CIN7 destination location name (e.g. "Amazon FBA Warehouse",
+   * "Clean Nutra ASE Warehouse - Vegas"). This is the actual CIN7 ToLocation
+   * value, NOT the ShipHero shipping address company.
+   *
+   * Required for accurate routing reports and historical lookups. When omitted,
+   * the bridge row will fall back to the ShipHero shipping company name for
+   * backwards compatibility (legacy behavior — emits a console warning).
+   */
+  cin7DestinationName?: string;
 }
 
 function getSupabaseClient(explicit?: SupabaseClient): SupabaseClient {
@@ -297,6 +307,7 @@ export async function createShipHeroOrderFromCIN7Transfer({
   warehouseName,
   input,
   supabase,
+  cin7DestinationName,
 }: CreateShipHeroOrderParams): Promise<ShipHeroOrderCreateResult & { status?: string; requestPayload?: any; responsePayload?: any; shipheroOrderId?: string | null; shipheroOrderNumber?: string | null; }> {
   if (!credentials?.accessToken) {
     throw new Error(`ShipHero access token missing for warehouse ${warehouseName}`);
@@ -320,7 +331,19 @@ export async function createShipHeroOrderFromCIN7Transfer({
 
   const cin7TransferId = input.externalOrderId.replace(/^cin7-transfer:/, '');
   const cin7TransferNumber = input.reference || input.orderNumber;
-  const cin7Destination = input.shippingAddress.company || warehouseName;
+  // Prefer the real CIN7 ToLocation (e.g. "Amazon FBA Warehouse"). Fall back to
+  // the ShipHero shipping company / warehouse name only when the caller didn't
+  // pass one — older callers relied on that legacy behavior, but it produces
+  // misleading reports because every ASE-origin transfer ends up labeled
+  // "Allseason Enterprises LLC" regardless of where it actually went.
+  const cin7Destination =
+    cin7DestinationName || input.shippingAddress.company || warehouseName;
+  if (!cin7DestinationName) {
+    console.warn(
+      `[shiphero-orders] createShipHeroOrderFromCIN7Transfer called without cin7DestinationName for transfer ${cin7TransferNumber}; ` +
+        `falling back to "${cin7Destination}". Update the caller to pass transfer.destinationName for accurate routing labels.`
+    );
+  }
   const cin7Source = input.notes?.match(/Source: (.+)/)?.[1] || null;
 
   try {
