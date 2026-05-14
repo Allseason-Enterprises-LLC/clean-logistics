@@ -44,6 +44,11 @@ function esc(s: string): string {
   return (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
+function fixAddress(s: string): string {
+  if (!s) return s;
+  return s.replace(/^(\d+)([a-zA-Z])/, '$1 $2').replace(/\s{2,}/g, ' ').trim();
+}
+
 function extractOrders(data: any): any[] {
   if (!data) return [];
   if (Array.isArray(data)) return data;
@@ -134,7 +139,7 @@ async function pushOrders(log: string[]) {
 
     const shipFirst = order.shipFirstName || order.firstName || '';
     const shipLast = order.shipLastName || order.lastName || '';
-    const addr1 = order.shipAddress1 || order.shippingAddress1 || '';
+    const addr1 = fixAddress(order.shipAddress1 || order.shippingAddress1 || '');
     const city = order.shipCity || order.shippingCity || '';
     const state = order.shipState || order.shippingState || '';
     const zip = order.shipPostalCode || order.shippingZip || order.postalCode || '';
@@ -162,7 +167,7 @@ async function pushOrders(log: string[]) {
           first_name: "${esc(shipFirst)}"
           last_name: "${esc(shipLast)}"
           address1: "${esc(addr1)}"
-          address2: "${esc(order.shipAddress2 || order.shippingAddress2 || '')}"
+          address2: "${esc(fixAddress(order.shipAddress2 || order.shippingAddress2 || ''))}"
           city: "${esc(city)}"
           state: "${esc(state)}"
           zip: "${esc(zip)}"
