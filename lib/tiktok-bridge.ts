@@ -4,8 +4,10 @@
  * The core orchestration layer. Two entry points:
  *
  *   1. syncTikTokOrders()        — called by cron, pulls AWAITING_SHIPMENT orders
- *                                   from TikTok, filters by Clean Nutra SKU allowlist,
- *                                   creates matching orders in Clean Nutra ShipHero.
+ *                                   from TikTok and creates matching orders in
+ *                                   Clean Nutra ShipHero. ALL TikTok seller-fulfilled
+ *                                   orders are imported; ClearShip routing was
+ *                                   removed on 2026-05-14.
  *
  *   2. handleShipHeroShipment()   — called by webhook when ShipHero ships a tracked
  *                                   order, posts tracking back to TikTok.
@@ -28,7 +30,7 @@ import {
   getShippingProviders,
   type TikTokCredentials,
 } from './tiktok-api';
-import { getLasVegasSkuPatterns, matchSkuToWarehouse } from './tiktok-routing';
+import { getLasVegasSkuPatterns } from './tiktok-routing';
 import { normalizeCarrier, resolveProviderIdWithFallback } from './tiktok-carriers';
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
@@ -238,11 +240,9 @@ async function importOrder(
     return 'skipped_no_match';
   }
 
-  const match = matchSkuToWarehouse(skus, patterns);
-  if (match.warehouse !== 'las_vegas') {
-    await logSkipped(detail, skus, 'no Clean Nutra SKU match');
-    return 'skipped_no_match';
-  }
+  // ClearShip is decommissioned (2026-05-14). ALL TikTok orders ship from
+  // Clean Nutra Las Vegas now. We no longer filter by SKU allowlist —
+  // every FULFILLMENT_BY_SELLER order is ours to import + ship.
 
   // Skip Fulfillment-by-TikTok (FBT) orders — TikTok ships those from their own
   // warehouse. If we pull them into Clean Nutra LV we'd double-ship, and the
@@ -262,7 +262,7 @@ async function importOrder(
   }
 
   console.log(
-    `[tiktok-bridge] Importing TikTok order ${detail.id} → ShipHero (matched "${match.matchedPattern}")`
+    `[tiktok-bridge] Importing TikTok order ${detail.id} → ShipHero (Clean Nutra LV)`
   );
 
   // Aggregate quantities per seller_sku (TikTok sends one line per unit for multi-qty)
@@ -368,7 +368,7 @@ async function importOrder(
       shiphero_order_id: shipheroOrder.id,
       shiphero_order_number: shipheroOrder.order_number,
       skus: skusJson,
-      matched_patterns: match.matchedPattern ? [match.matchedPattern] : [],
+      matched_patterns: [],
       status: 'imported',
     },
     { onConflict: 'tiktok_order_id' }
@@ -490,8 +490,14 @@ async function createShipHeroOrder(
       },
       line_items: input.lineItems,
       required_ship_date: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-      skip_address_validation: true,
-      ignore_address_validation_errors: true,
+      // Address validation enabled — TikTok returns abbreviated city names
+      // (e.g. "Powder Spgs" instead of "Powder Springs") that USPS will reject
+      // at label-generation time. Letting ShipHero standardize the city via its
+      // validator avoids the "carrier responded with an error" failure that
+      // blocked 666 orders on 2026-05-14. We also surface validation errors so
+      // bad addresses fail loudly at import instead of silently shipping to nowhere.
+      skip_address_validation: false,
+      ignore_address_validation_errors: false,
     },
   });
 

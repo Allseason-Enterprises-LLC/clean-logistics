@@ -1,11 +1,18 @@
 /**
- * TikTok Order Routing - Routes incoming TikTok Shop orders to the correct warehouse
- * 
- * Logic:
- * - Orders with SKUs matching the Las Vegas list → Clean Nutra Las Vegas warehouse
- * - All other orders → ClearShip warehouse
- * 
- * The SKU routing table is stored in Supabase for easy updates without code changes.
+ * TikTok Order Routing — All TikTok orders ship from Clean Nutra Las Vegas.
+ *
+ * Historical context: this module used to route subsets of TikTok orders to
+ * a 3PL named "ClearShip" based on a SKU allowlist. ClearShip was decommissioned
+ * on 2026-05-14, so every TikTok order is now sent to Clean Nutra Las Vegas.
+ *
+ * What this module still does:
+ *   - Forces incoming TikTok orders onto warehouse Clean Nutra LV.
+ *   - Auto-applies operator_hold to FBT (Fulfilled-by-TikTok) orders so the
+ *     warehouse never picks them. FBT must NEVER be canceled — that pushes
+ *     a refund through to the buyer.
+ *
+ * The Las Vegas SKU pattern helpers + Supabase table are kept for telemetry
+ * (matched_pattern logging) but no longer gate routing.
  */
 
 import { supabase } from './supabase';
@@ -28,7 +35,7 @@ export interface RoutingDecision {
   orderId: string;
   orderNumber: string;
   skus: string[];
-  targetWarehouse: 'las_vegas' | 'clearship';
+  targetWarehouse: 'las_vegas';
   targetWarehouseId: string;
   reason: string;
   matchedPattern?: string;
@@ -72,12 +79,14 @@ export async function getLasVegasSkuPatterns(): Promise<string[]> {
 }
 
 /**
- * Determine which warehouse an order should be routed to based on its SKUs
+ * Find which (if any) Las Vegas SKU pattern matched an order's SKUs. This is
+ * now purely informational — all TikTok orders go to Clean Nutra LV regardless
+ * of match. Returns the first matched pattern for telemetry, or undefined.
  */
 export function matchSkuToWarehouse(
   skus: string[],
   lasVegasPatterns: string[]
-): { warehouse: 'las_vegas' | 'clearship'; matchedPattern?: string } {
+): { warehouse: 'las_vegas'; matchedPattern?: string } {
   for (const sku of skus) {
     const upperSku = sku.toUpperCase();
     for (const pattern of lasVegasPatterns) {
@@ -86,7 +95,7 @@ export function matchSkuToWarehouse(
       }
     }
   }
-  return { warehouse: 'clearship' };
+  return { warehouse: 'las_vegas' };
 }
 
 /**
@@ -281,24 +290,21 @@ export async function routeTikTokOrder(orderId: string): Promise<RoutingDecision
       orderId: order.id,
       orderNumber: order.orderNumber,
       skus: order.skus,
-      targetWarehouse: 'clearship',
-      targetWarehouseId: 'default',
+      targetWarehouse: 'las_vegas',
+      targetWarehouseId: WAREHOUSES.LAS_VEGAS,
       reason: `Not a TikTok order (shop: ${order.shopName}, tags: ${(order.tags || []).join(',')}), skipping`,
     };
   }
 
-  // 3. Get active routing patterns
+  // 3. Get active routing patterns (for telemetry only)
   const patterns = await getLasVegasSkuPatterns();
 
-  // 4. Match SKUs
+  // 4. Match SKUs for logging
   const match = matchSkuToWarehouse(order.skus, patterns);
 
-  // 5. Only change warehouse if it's a Las Vegas SKU match
-  // Non-matching orders stay wherever ShipHero defaults them (ClearShip)
-  if (match.warehouse === 'las_vegas') {
-    if (order.warehouseId !== WAREHOUSES.LAS_VEGAS) {
-      await changeOrderWarehouse(orderId, WAREHOUSES.LAS_VEGAS);
-    }
+  // 5. Always route TikTok orders to Clean Nutra LV (ClearShip decommissioned 2026-05-14)
+  if (order.warehouseId !== WAREHOUSES.LAS_VEGAS) {
+    await changeOrderWarehouse(orderId, WAREHOUSES.LAS_VEGAS);
   }
 
   // 5b. Auto-hold FBT (Fulfilled-by-TikTok) orders so the warehouse never picks
@@ -320,13 +326,13 @@ export async function routeTikTokOrder(orderId: string): Promise<RoutingDecision
     orderId: order.id,
     orderNumber: order.orderNumber,
     skus: order.skus,
-    targetWarehouse: match.warehouse,
-    targetWarehouseId: match.warehouse === 'las_vegas' ? WAREHOUSES.LAS_VEGAS : 'default',
+    targetWarehouse: 'las_vegas',
+    targetWarehouseId: WAREHOUSES.LAS_VEGAS,
     reason: fbtHeld
-      ? `FBT order auto-held (operator_hold). ${match.matchedPattern ? `SKU matched "${match.matchedPattern}"` : 'No LV SKU match'}.`
+      ? `FBT order auto-held (operator_hold)${match.matchedPattern ? `; SKU matched "${match.matchedPattern}"` : ''}.`
       : match.matchedPattern
-      ? `SKU matched pattern "${match.matchedPattern}" → Las Vegas`
-      : 'No Las Vegas SKU match → left at default warehouse',
+      ? `Routed to Las Vegas (SKU matched pattern "${match.matchedPattern}")`
+      : 'Routed to Las Vegas',
     matchedPattern: match.matchedPattern,
   };
 
