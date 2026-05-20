@@ -40,9 +40,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }),
     });
     const text = await r.text();
+    const respHeaders: Record<string, string> = {};
+    r.headers.forEach((v, k) => { respHeaders[k] = v; });
     debug.calls.directFetch = {
       status: r.status,
       bodyPreview: text.slice(0, 300),
+      respHeaders,
     };
   } catch (e: any) {
     debug.calls.directFetch = { error: e?.message || String(e) };
