@@ -367,28 +367,37 @@ export async function runFbaInboundWorkflow(
       method: 'POST',
       region,
       path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/packingInformation`,
+      // CASE-PACKED submission: ONE Box entry with quantity = total boxes.
+      // Every box has identical contents (single MSKU, `casePack` units per box).
+      // Sending N separate Box entries (quantity:1 each) puts Amazon into the
+      // "mixed individual units" workflow even when boxes are identical, which
+      // makes Seller Central show pack_mixed_unit_step instead of case-packed.
+      // Reference: SP-API FBA Inbound 2024-03-20 setPackingInformation — Box.quantity
+      // is the number of IDENTICAL boxes when items are uniform.
       body: {
         packageGroupings: [
           {
             packingGroupId,
-            boxes: Array.from({ length: options.boxQuantity || 1 }, () => ({
-              contentInformationSource: 'BOX_CONTENT_PROVIDED',
-              dimensions: {
-                length: options.box.length,
-                width: options.box.width,
-                height: options.box.height,
-                unitOfMeasurement: 'IN',
+            boxes: [
+              {
+                contentInformationSource: 'BOX_CONTENT_PROVIDED',
+                dimensions: {
+                  length: options.box.length,
+                  width: options.box.width,
+                  height: options.box.height,
+                  unitOfMeasurement: 'IN',
+                },
+                weight: { value: options.box.weightLbs, unit: 'LB' },
+                quantity: options.boxQuantity || 1,
+                items: options.items.map((i) => ({
+                  msku: i.sellerSku,
+                  quantity: options.casePack || i.quantity,
+                  labelOwner: 'SELLER' as const,
+                  prepOwner: (i.prepOwner || 'SELLER') as 'SELLER' | 'AMAZON' | 'NONE',
+                  ...(i.expiration ? { expiration: i.expiration } : {}),
+                })),
               },
-              weight: { value: options.box.weightLbs, unit: 'LB' },
-              quantity: 1,
-              items: options.items.map((i) => ({
-                msku: i.sellerSku,
-                quantity: options.casePack || i.quantity,
-                labelOwner: 'SELLER' as const,
-                prepOwner: (i.prepOwner || 'SELLER') as 'SELLER' | 'AMAZON' | 'NONE',
-                ...(i.expiration ? { expiration: i.expiration } : {}),
-              })),
-            })),
+            ],
           },
         ],
       },
