@@ -28,7 +28,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     debug.computed_url = url;
     const r = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'apikey': process.env.SUPABASE_SERVICE_ROLE_KEY || '',
+      },
       body: JSON.stringify({
         method: 'GET',
         path: '/inbound/fba/2024-03-20/inboundPlans?pageSize=1',
