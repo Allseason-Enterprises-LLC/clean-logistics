@@ -180,7 +180,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             name: `CIN7-${cin7_transfer_number}-${item.sku}`,
             marketplace_id: 'ATVPDKIKX0DER',
             ship_from_warehouse_id: warehouseId,
-            status: 'submitted',
+            status: 'plan_created',
             plan_id: planId,
             amazon_shipment_ids: confirmationIds.length ? confirmationIds : shipmentIds,
             box_length: casePack.boxLength,
