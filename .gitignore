@@ -4,3 +4,4 @@ node_modules/
 supabase/.temp/
 .env.production
 .env
+dist/
