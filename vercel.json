@@ -29,6 +29,14 @@
     {
       "path": "/api/cron/sync-cc-shiphero",
       "schedule": "17 6,12,18,23 * * *"
+    },
+    {
+      "path": "/api/cron/check-amazon-proxy-health",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/reconcile-fba-handoffs",
+      "schedule": "*/15 * * * *"
     }
   ],
   "functions": {

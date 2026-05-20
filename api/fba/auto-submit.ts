@@ -1,4 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { createClient } from '@supabase/supabase-js';
 import { getShipHeroProductData, getShipHeroToken } from '../../lib/shiphero-product-data';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
 import { postProcessFbaShipment } from '../../lib/fba-post-process';
@@ -50,10 +51,49 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // Get ShipHero token
     const shipheroToken = await getShipHeroToken(supabaseUrl, supabaseKey, warehouseId);
 
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false },
+    });
+
     const results: any[] = [];
 
     for (const item of items) {
       console.log(`[fba-auto] Processing ${item.sku} x ${item.quantity}...`);
+
+      // Idempotency check: skip if an active fba_shipments row already exists
+      // for this transfer+SKU. Prevents duplicate Amazon plans when the caller
+      // retries (Vercel timeout, reconciler re-fire, manual re-run).
+      try {
+        const { data: existing, error: lookupErr } = await supabase
+          .from('fba_shipments')
+          .select('id, status, plan_id, amazon_shipment_ids')
+          .eq('cin7_transfer_number', cin7_transfer_number)
+          .eq('cin7_sku', item.sku)
+          .not('status', 'in', '("failed","voided","cancelled")')
+          .maybeSingle();
+
+        if (lookupErr) {
+          console.warn(`[fba-auto] Idempotency lookup failed for ${item.sku}: ${lookupErr.message}`);
+          // Fall through and process anyway — better to risk a dup than block forever
+        } else if (existing) {
+          console.log(
+            `[fba-auto] Skipping ${item.sku} — active fba_shipments record exists ` +
+              `(id=${existing.id} status=${existing.status} plan=${existing.plan_id})`
+          );
+          results.push({
+            sku: item.sku,
+            status: 'skipped',
+            reason: `Already processed — plan ${existing.plan_id}, ` +
+              `${(existing.amazon_shipment_ids as any[] | null)?.length || 0} shipments. ` +
+              `If you need to re-run, mark the existing fba_shipments row status='cancelled' first.`,
+            existing_plan_id: existing.plan_id,
+            existing_record_id: existing.id,
+          });
+          continue;
+        }
+      } catch (idemErr: any) {
+        console.warn(`[fba-auto] Idempotency check threw: ${idemErr?.message || idemErr}`);
+      }
 
       // 1. Resolve CIN7 SKU → Amazon MSKU
       const skuMapping = await lookupSkuMapping(item.sku);
@@ -127,6 +167,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // 5. Post-process: fetch labels, upload to Supabase, attach to ShipHero, Telegram notify
       const shipmentIds = fbaResult.shipmentIds || fbaResult.amazon_shipment_ids || [];
       const confirmationIds = fbaResult.shipmentConfirmationIds || [];
+      const planId = fbaResult.planId || fbaResult.plan_id || null;
+
+      // Persist the fba_shipments row BEFORE post-process so idempotency
+      // works even if post-process (labels/Telegram) fails. The row captures
+      // the cin7 transfer + sku linkage so re-runs are blocked.
+      let fbaRecordId: string | null = null;
+      try {
+        const { data: rec, error: recErr } = await supabase
+          .from('fba_shipments')
+          .insert({
+            name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+            marketplace_id: 'ATVPDKIKX0DER',
+            ship_from_warehouse_id: warehouseId,
+            status: 'submitted',
+            plan_id: planId,
+            amazon_shipment_ids: confirmationIds.length ? confirmationIds : shipmentIds,
+            box_length: casePack.boxLength,
+            box_width: casePack.boxWidth,
+            box_height: casePack.boxHeight,
+            box_weight_lbs: casePack.boxWeightLbs,
+            cin7_transfer_number,
+            cin7_sku: item.sku,
+            prep_instructions: fbaResult.prepInstructions || fbaResult.prep_instructions || null,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .select('id')
+          .single();
+        if (recErr) {
+          console.warn(`[fba-auto] fba_shipments insert failed: ${recErr.message}`);
+        } else {
+          fbaRecordId = rec?.id || null;
+          console.log(`[fba-auto] fba_shipments row created: ${fbaRecordId}`);
+        }
+      } catch (recordErr: any) {
+        console.warn(`[fba-auto] fba_shipments persistence threw: ${recordErr?.message || recordErr}`);
+      }
 
       let postProcess: any = null;
       try {
@@ -159,6 +236,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           lot: productData.lotNumber ?? undefined,
         });
         console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments, telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
+
+        // Update fba_shipments status now that labels are attached and Telegram fired
+        if (fbaRecordId) {
+          try {
+            await supabase
+              .from('fba_shipments')
+              .update({
+                status: 'labels_ready',
+                labels_url: postProcess.labels?.[0]?.supabaseUrl ?? null,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', fbaRecordId);
+          } catch (updErr: any) {
+            console.warn(`[fba-auto] fba_shipments status update failed: ${updErr?.message}`);
+          }
+        }
       } catch (postErr: any) {
         console.error('[fba-auto] post-process failed (non-fatal):', postErr?.message);
       }
