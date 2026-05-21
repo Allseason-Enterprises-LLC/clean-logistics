@@ -499,12 +499,28 @@ export async function runFbaInboundWorkflow(
   if (!placementOptionId || shipmentIds.length === 0) throw new Error('Placement option missing placementOptionId or shipmentIds');
   console.log(`[fba-inbound] [${((Date.now() - startTime) / 1000).toFixed(1)}s] Step 7 COMPLETE: listPlacementOptions`);
 
+  // readyToShipWindow: provide a 7-day window starting tomorrow (Amazon requires a real window;
+  // start==end produces a zero-duration window that prevents partnered-carrier (UPS) quotes
+  // from being generated and forces USE_YOUR_OWN_CARRIER only).
   const readyStart = new Date();
   readyStart.setDate(readyStart.getDate() + 1);
-  const readyIso = readyStart.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const readyEnd = new Date(readyStart);
+  readyEnd.setDate(readyEnd.getDate() + 7);
+  const readyStartIso = readyStart.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const readyEndIso = readyEnd.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
   // Step 8: Generate Transportation Options
+  // CRITICAL: must include contactInformation per shipment for Amazon partnered carrier (PCP/UPS)
+  // options to be generated. Without it, Amazon returns only USE_YOUR_OWN_CARRIER options
+  // and confirmTransportationOptions fails with FBA_INB_0117.
+  const contactInformation = {
+    name: options.sourceAddress.name,
+    phoneNumber: options.sourceAddress.phoneNumber,
+    email: options.sourceAddress.email || 'shipping@cleannutra.com',
+  };
+
   console.log('[fba-inbound] Step 8: generateTransportationOptions...');
+  console.log(`[fba-inbound] readyToShipWindow: ${readyStartIso} → ${readyEndIso}`);
   let transGenData: any;
   try {
     const res = await callAmazonSpApi<any>({
@@ -515,7 +531,8 @@ export async function runFbaInboundWorkflow(
         placementOptionId,
         shipmentTransportationConfigurations: shipmentIds.map((sid) => ({
           shipmentId: sid,
-          readyToShipWindow: { start: readyIso },
+          contactInformation,
+          readyToShipWindow: { start: readyStartIso, end: readyEndIso },
         })),
       },
     });
