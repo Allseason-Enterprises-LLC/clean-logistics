@@ -297,12 +297,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     if (shipmentConfirmationId && boxIds.length > 0) {
       try {
-        // Build query string for v0 getLabels API
+        // Build query string for v0 getLabels API.
+        // PackageLabel_Thermal_No_Carrier_Rotation + UNIQUE gives the correct 2-in-1 label:
+        //   page 1 = FBA box label (4×6 portrait), page 2 = carrier shipping label (4×6 portrait).
+        // Do NOT use BARCODE_2D (omits carrier label entirely).
+        // Do NOT use PackageLabel_Thermal (carrier label is rotated 90° — broken format).
         const queryParams = new URLSearchParams();
         queryParams.set('ShipmentId', shipmentConfirmationId);
-        queryParams.set('PageType', 'PackageLabel_Thermal'); // 4x6 thermal format
+        queryParams.set('PageType', 'PackageLabel_Thermal_No_Carrier_Rotation');
         queryParams.set('LabelType', 'UNIQUE');
-        queryParams.set('PackageLabelsToPrint', boxIds.join(','));
+        for (const boxId of boxIds) {
+          queryParams.append('PackageLabelsToPrint', boxId);
+        }
 
         const labelPath = `/fba/inbound/v0/shipments/${shipmentConfirmationId}/labels?${queryParams.toString()}`;
         console.log('[full-pipeline] Calling v0 getLabels via proxy:', labelPath);

@@ -171,9 +171,12 @@ async function getShipmentDetails(
 }
 
 async function fetchLabelPdf(fbaId: string, nBoxes: number): Promise<Buffer> {
-  // LabelType=BARCODE_2D returns all N labels in one PDF (4x6 thermal).
-  // LabelType=UNIQUE only returns 1 label per request (v0 API quirk) — avoid.
-  const path = `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal&LabelType=BARCODE_2D&NumberOfPackages=${nBoxes}`;
+  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation gives the correct combined
+  // label PDF: page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6).
+  // Do NOT use BARCODE_2D (omits carrier label) or PackageLabel_Thermal (carrier label rotated 90°).
+  // Box IDs are formatted as {shipmentId}U{number} e.g. FBA19DNLZ885U000001.
+  const boxIds = Array.from({ length: nBoxes }, (_, i) => `${fbaId}U${String(i + 1).padStart(6, '0')}`);
+  const path = `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=UNIQUE&${boxIds.map(id => `PackageLabelsToPrint=${id}`).join('&')}`;
   const r = await callAmazonSpApi<any>({ method: 'GET', path });
   const url = r.data?.payload?.DownloadURL;
   if (!url) throw new Error(`No DownloadURL in getLabels response for ${fbaId}`);
