@@ -143,6 +143,43 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // 4. Submit to Amazon FBA
       console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${productData.expirationDate}`);
 
+      // Early-persistence: write fba_shipments row with status='in_progress' as soon as
+      // the Amazon plan is created (Step 1). This means if later steps fail (e.g.
+      // FBA_INB_0117 on confirmTransportationOptions), the idempotency check at the
+      // top of this loop will find the row and skip re-creating a duplicate plan.
+      let earlyRecordId: string | null = null;
+      const onPlanCreated = async (planId: string) => {
+        try {
+          const { data: earlyRec, error: earlyErr } = await supabase
+            .from('fba_shipments')
+            .insert({
+              name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+              marketplace_id: 'ATVPDKIKX0DER',
+              ship_from_warehouse_id: warehouseId,
+              status: 'in_progress',
+              plan_id: planId,
+              box_length: casePack.boxLength,
+              box_width: casePack.boxWidth,
+              box_height: casePack.boxHeight,
+              box_weight_lbs: casePack.boxWeightLbs,
+              cin7_transfer_number,
+              cin7_sku: item.sku,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .select('id')
+            .single();
+          if (earlyErr) {
+            console.warn(`[fba-auto] Early fba_shipments insert failed: ${earlyErr.message}`);
+          } else {
+            earlyRecordId = earlyRec?.id || null;
+            console.log(`[fba-auto] Early fba_shipments row written (in_progress): id=${earlyRecordId} plan=${planId}`);
+          }
+        } catch (e: any) {
+          console.warn(`[fba-auto] onPlanCreated threw: ${e?.message || e}`);
+        }
+      };
+
       const fbaResult = await createFbaInboundShipment(
         warehouseId,
         [{
@@ -161,6 +198,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         {
           boxQuantity: numBoxes,
           casePack: unitsPerBox,
+          onPlanCreated,
         }
       );
 
@@ -169,37 +207,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const confirmationIds = fbaResult.shipmentConfirmationIds || [];
       const planId = fbaResult.planId || fbaResult.plan_id || null;
 
-      // Persist the fba_shipments row BEFORE post-process so idempotency
-      // works even if post-process (labels/Telegram) fails. The row captures
-      // the cin7 transfer + sku linkage so re-runs are blocked.
-      let fbaRecordId: string | null = null;
+      // Persist the fba_shipments row with full details (the early write at plan creation
+      // captured plan_id + status='in_progress'; now update it with shipment IDs, or
+      // insert fresh if the early write failed).
+      let fbaRecordId: string | null = earlyRecordId;
       try {
-        const { data: rec, error: recErr } = await supabase
-          .from('fba_shipments')
-          .insert({
-            name: `CIN7-${cin7_transfer_number}-${item.sku}`,
-            marketplace_id: 'ATVPDKIKX0DER',
-            ship_from_warehouse_id: warehouseId,
-            status: 'plan_created',
-            plan_id: planId,
-            amazon_shipment_ids: confirmationIds.length ? confirmationIds : shipmentIds,
-            box_length: casePack.boxLength,
-            box_width: casePack.boxWidth,
-            box_height: casePack.boxHeight,
-            box_weight_lbs: casePack.boxWeightLbs,
-            cin7_transfer_number,
-            cin7_sku: item.sku,
-            prep_instructions: fbaResult.prepInstructions || fbaResult.prep_instructions || null,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .select('id')
-          .single();
-        if (recErr) {
-          console.warn(`[fba-auto] fba_shipments insert failed: ${recErr.message}`);
+        if (earlyRecordId) {
+          // Update the existing in_progress row with final shipment IDs
+          const { error: updErr } = await supabase
+            .from('fba_shipments')
+            .update({
+              status: 'plan_created',
+              amazon_shipment_ids: confirmationIds.length ? confirmationIds : shipmentIds,
+              prep_instructions: fbaResult.prepInstructions || fbaResult.prep_instructions || null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', earlyRecordId);
+          if (updErr) console.warn(`[fba-auto] fba_shipments update failed: ${updErr.message}`);
+          else console.log(`[fba-auto] fba_shipments updated to plan_created: ${earlyRecordId}`);
         } else {
-          fbaRecordId = rec?.id || null;
-          console.log(`[fba-auto] fba_shipments row created: ${fbaRecordId}`);
+          // Fallback: early write never ran, insert fresh
+          const { data: rec, error: recErr } = await supabase
+            .from('fba_shipments')
+            .insert({
+              name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+              marketplace_id: 'ATVPDKIKX0DER',
+              ship_from_warehouse_id: warehouseId,
+              status: 'plan_created',
+              plan_id: planId,
+              amazon_shipment_ids: confirmationIds.length ? confirmationIds : shipmentIds,
+              box_length: casePack.boxLength,
+              box_width: casePack.boxWidth,
+              box_height: casePack.boxHeight,
+              box_weight_lbs: casePack.boxWeightLbs,
+              cin7_transfer_number,
+              cin7_sku: item.sku,
+              prep_instructions: fbaResult.prepInstructions || fbaResult.prep_instructions || null,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .select('id')
+            .single();
+          if (recErr) {
+            console.warn(`[fba-auto] fba_shipments insert failed: ${recErr.message}`);
+          } else {
+            fbaRecordId = rec?.id || null;
+            console.log(`[fba-auto] fba_shipments row created: ${fbaRecordId}`);
+          }
         }
       } catch (recordErr: any) {
         console.warn(`[fba-auto] fba_shipments persistence threw: ${recordErr?.message || recordErr}`);

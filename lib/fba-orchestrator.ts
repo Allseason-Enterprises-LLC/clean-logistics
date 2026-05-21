@@ -166,6 +166,8 @@ export async function createFbaInboundShipment(
     shipFromAddressId?: string;
     boxQuantity?: number;
     casePack?: number;
+    /** Called immediately after Amazon plan creation (Step 1) so callers can persist the planId early. */
+    onPlanCreated?: (planId: string) => Promise<void>;
   }
 ): Promise<any> {
   const { runFbaInboundWorkflow } = await import('./fba-inbound');
@@ -186,6 +188,7 @@ export async function createFbaInboundShipment(
   return await runFbaInboundWorkflow({
     marketplaceId: MARKETPLACE_ID,
     sourceAddress,
+    onPlanCreated: options?.onPlanCreated,
     items: items.map((i) => ({
       sellerSku: i.sellerSku,
       quantity: i.quantity,

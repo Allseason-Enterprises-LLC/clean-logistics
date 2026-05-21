@@ -28,6 +28,12 @@ export interface FbaInboundOptions {
    */
   credentials?: { clientId: string; clientSecret: string; refreshToken: string };
   marketplaceId: string;
+  /**
+   * Optional callback fired immediately after the inbound plan is created (Step 1).
+   * Use this to persist the planId early so retries can detect the in-progress plan
+   * and avoid creating duplicates even if later steps fail (e.g. FBA_INB_0117).
+   */
+  onPlanCreated?: (planId: string) => Promise<void>;
   sourceAddress: {
     addressLine1: string;
     city: string;
@@ -298,6 +304,16 @@ export async function runFbaInboundWorkflow(
   if (!inboundPlanId || !createOpId) throw new Error('createInboundPlan: missing inboundPlanId or operationId');
   await pollUntilSuccess(region, createOpId);
   console.log(`[fba-inbound] [${((Date.now() - startTime) / 1000).toFixed(1)}s] Step 1 COMPLETE: createInboundPlan`);
+
+  // Fire early-persistence callback so callers can record the planId before later steps
+  // fail. This prevents duplicate plan creation on retries (e.g. FBA_INB_0117).
+  if (options.onPlanCreated) {
+    try {
+      await options.onPlanCreated(inboundPlanId);
+    } catch (cbErr: unknown) {
+      console.warn('[fba-inbound] onPlanCreated callback failed (non-fatal):', cbErr);
+    }
+  }
 
   // Step 2: Generate Packing Options
   console.log('[fba-inbound] Step 2: generatePackingOptions...');
