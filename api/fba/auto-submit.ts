@@ -143,10 +143,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // 4. Submit to Amazon FBA
       console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${productData.expirationDate}`);
 
-      // Early-persistence: write fba_shipments row with status='in_progress' as soon as
+      // Early-persistence: write fba_shipments row with status='draft' as soon as
       // the Amazon plan is created (Step 1). This means if later steps fail (e.g.
       // FBA_INB_0117 on confirmTransportationOptions), the idempotency check at the
       // top of this loop will find the row and skip re-creating a duplicate plan.
+      // NOTE: status='draft' is the only valid early state per fba_shipments_status_check
+      // (allowed: draft, plan_created, cancelled, failed, labels_ready).
       let earlyRecordId: string | null = null;
       const onPlanCreated = async (planId: string) => {
         try {
@@ -156,7 +158,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               name: `CIN7-${cin7_transfer_number}-${item.sku}`,
               marketplace_id: 'ATVPDKIKX0DER',
               ship_from_warehouse_id: warehouseId,
-              status: 'in_progress',
+              status: 'draft',
               plan_id: planId,
               box_length: casePack.boxLength,
               box_width: casePack.boxWidth,
@@ -170,10 +172,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             .select('id')
             .single();
           if (earlyErr) {
-            console.warn(`[fba-auto] Early fba_shipments insert failed: ${earlyErr.message}`);
+            console.warn(`[fba-auto] Early fba_shipments insert failed: ${earlyErr.message} (code=${earlyErr.code})`);
           } else {
             earlyRecordId = earlyRec?.id || null;
-            console.log(`[fba-auto] Early fba_shipments row written (in_progress): id=${earlyRecordId} plan=${planId}`);
+            console.log(`[fba-auto] Early fba_shipments row written (draft): id=${earlyRecordId} plan=${planId}`);
           }
         } catch (e: any) {
           console.warn(`[fba-auto] onPlanCreated threw: ${e?.message || e}`);
