@@ -135,8 +135,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(200).json({ healthy: true, latency_ms: probe.latency_ms });
   }
 
-  const details = probe.error || '';
-  const isRegionalLoss = probe.status === 404 && /not_found/i.test(details);
+  // HTTP 404 from the Supabase gateway = regional propagation loss.
+  // Don't rely on body text — the error message from callAmazonSpApi is
+  // "Proxy error (HTTP 404)" with no "NOT_FOUND" string in it.
+  const isRegionalLoss = probe.status === 404;
 
   console.error('[health] amazon-sp-api probe failed:', probe.error, 'status:', probe.status);
 
