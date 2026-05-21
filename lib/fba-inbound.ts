@@ -601,30 +601,38 @@ export async function runFbaInboundWorkflow(
       }));
       console.log(`[fba-inbound] Non-LTL transport options for ${sid}:`, JSON.stringify(transportSummary));
 
-      // Sort by priority and cost:
-      // Key 1: AMAZON_PARTNERED_CARRIER ranks above USE_YOUR_OWN_CARRIER (Amazon books shipping)
-      // Key 2: no-delivery-window ranks above needs-confirmed-window (saves a step)
-      // Key 3: lowest quoted cost
-      const rankSolution = (s: string) => (s === 'AMAZON_PARTNERED_CARRIER' ? 0 : 1);
-      const rankPreconds = (o: any) => ((o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW') ? 1 : 0);
-      const rankCost = (o: any) => (typeof o.quote?.cost?.amount === 'number' ? o.quote.cost.amount : Number.POSITIVE_INFINITY);
-      nonLtlOpts.sort((a: any, b: any) => {
-        const sA = rankSolution(a.shippingSolution);
-        const sB = rankSolution(b.shippingSolution);
-        if (sA !== sB) return sA - sB;
-        const pA = rankPreconds(a);
-        const pB = rankPreconds(b);
-        if (pA !== pB) return pA - pB;
-        return rankCost(a) - rankCost(b);
+      // CRITICAL CONSTRAINT: We MUST use AMAZON_PARTNERED_CARRIER only.
+      // Never USE_YOUR_OWN_CARRIER (which requires arranging our own shipping +
+      // CONFIRMED_DELIVERY_WINDOW step). If Amazon offers no partnered option
+      // for this shipment, fail loudly so the operator can investigate (typically
+      // means the plan needs to be regenerated, or volume/weight exceeds Amazon's
+      // partnered SPD limits and the plan needs to be split or the SKU's case-pack
+      // dimensions need correction in ShipHero).
+      const partneredOpts = nonLtlOpts.filter(
+        (o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER'
+      );
+
+      if (partneredOpts.length === 0) {
+        const carrierBreakdown = nonLtlOpts.map((o: any) => `${o.shippingSolution}/${o.carrier?.name ?? '?'}`).slice(0, 10).join(', ');
+        throw new Error(
+          `No AMAZON_PARTNERED_CARRIER options available for shipment ${sid}. ` +
+          `Amazon only offered ${nonLtlOpts.length} USE_YOUR_OWN_CARRIER option(s): [${carrierBreakdown}]. ` +
+          `Per Clean Nutra policy we never use our own carrier. ` +
+          `Likely causes: (1) shipment volume exceeds partnered SPD limits — check box dimensions/weight in ShipHero, ` +
+          `(2) destination FC has no partnered carrier coverage, ` +
+          `(3) plan needs to be regenerated. Cancel this plan and try again, or contact Amazon support.`
+        );
+      }
+
+      // Sort partnered options by cost (cheapest first). All partnered carriers
+      // are Amazon-booked so no delivery-window logic is needed for them.
+      partneredOpts.sort((a: any, b: any) => {
+        const costA = typeof a.quote?.cost?.amount === 'number' ? a.quote.cost.amount : Number.POSITIVE_INFINITY;
+        const costB = typeof b.quote?.cost?.amount === 'number' ? b.quote.cost.amount : Number.POSITIVE_INFINITY;
+        return costA - costB;
       });
 
-      let preferred = nonLtlOpts[0];
-
-      // Fallback: if for some reason we filtered everything out, use the first raw option
-      if (!preferred && allTransportOpts.length > 0) {
-        console.warn(`[fba-inbound] WARNING: All options were LTL - falling back to first LTL option for ${sid}`);
-        preferred = allTransportOpts[0];
-      }
+      const preferred = partneredOpts[0];
 
       if (!preferred?.transportationOptionId) throw new Error(`No transportation option for shipment ${sid}`);
       console.log(`[fba-inbound] Selected transport option for ${sid}: ${preferred.transportationOptionId} (mode=${preferred.shippingMode}, solution=${preferred.shippingSolution}, preconditions=${JSON.stringify(preferred.preconditions)})`);
