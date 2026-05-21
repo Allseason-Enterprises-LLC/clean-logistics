@@ -261,7 +261,7 @@ async function updatePackingNote(token: string, orderId: string, note: string): 
 
 async function sendTelegram(text: string): Promise<boolean> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID;
+  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
   if (!botToken || !chatId) {
     console.warn('[fba-post-process] Telegram env vars not set — skipping notification');
     return false;

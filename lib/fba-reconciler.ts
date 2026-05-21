@@ -112,7 +112,7 @@ function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
 
 async function sendTelegramAlert(message: string): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID;
+  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
   if (!token || !chatId) return;
   try {
     await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {

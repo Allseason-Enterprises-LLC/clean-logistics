@@ -30,7 +30,7 @@ function authorized(req: VercelRequest): boolean {
 
 async function alertTelegram(message: string): Promise<void> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID;
+  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
   if (!botToken || !chatId) {
     console.warn(
       '[refresh-shiphero-token] No Telegram creds — skipping alert'
