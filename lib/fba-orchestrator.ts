@@ -213,7 +213,7 @@ export async function fetchFbaLabels(
 
   try {
     const searchParams = new URLSearchParams();
-    searchParams.set('PageType', 'PackageLabel_Thermal');
+    searchParams.set('PageType', 'PackageLabel_Thermal_No_Carrier_Rotation');
     searchParams.set('LabelType', 'UNIQUE');
     searchParams.set('NumberOfPackages', '1');
 

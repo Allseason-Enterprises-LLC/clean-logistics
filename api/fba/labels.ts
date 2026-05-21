@@ -95,9 +95,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // Page type for labels - default to 4x6 thermal for warehouse printing
-  const effectivePageType = (pageType as string) || 'PackageLabel_Thermal';
-  // Label types: UNIQUE (box/carton labels), BARCODE_2D (simple barcode), PALLET
-  // UNIQUE is what Amazon Seller Central uses for "Print box and shipping labels"
+  const effectivePageType = (pageType as string) || 'PackageLabel_Thermal_No_Carrier_Rotation';
+  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation: correct 2-in-1 combined label.
+  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6, no rotation).
   const effectiveLabelType = (labelType as string) || 'UNIQUE';
 
   try {

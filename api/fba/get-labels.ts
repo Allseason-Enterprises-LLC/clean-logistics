@@ -5,15 +5,15 @@ export const config = { maxDuration: 60 };
 
 /**
  * Fetch FBA shipping labels via the amazon-sp-api Supabase edge function proxy.
- * GET /api/fba/get-labels?shipmentId=FBA19CBZ0CPX&boxIds=FBA19CBZ0CPXU000001&pageType=PackageLabel_Thermal
+ * GET /api/fba/get-labels?shipmentId=FBA19CBZ0CPX&boxIds=FBA19CBZ0CPXU000001&pageType=PackageLabel_Thermal_No_Carrier_Rotation
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const shipmentId = (req.query.shipmentId || req.body?.shipmentId) as string;
-  const pageType = (req.query.pageType || req.body?.pageType || 'PackageLabel_Thermal') as string;
-  // LabelType=BARCODE_2D returns one PDF with all N labels (one per box).
-  // LabelType=UNIQUE only returns 1 label per request regardless of cartonIdList size,
-  // which is a v0 API quirk — avoid it for multi-box shipments.
-  const labelType = (req.query.labelType || req.body?.labelType || 'BARCODE_2D') as string;
+  const pageType = (req.query.pageType || req.body?.pageType || 'PackageLabel_Thermal_No_Carrier_Rotation') as string;
+  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation gives the correct 2-in-1 label PDF:
+  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6, no rotation).
+  // Do NOT default to BARCODE_2D (omits carrier label) or PackageLabel_Thermal (carrier rotated 90°).
+  const labelType = (req.query.labelType || req.body?.labelType || 'UNIQUE') as string;
   const numberOfPackages = req.query.numberOfPackages || req.body?.numberOfPackages;
   const boxIdsParam = req.query.boxIds
     ? (Array.isArray(req.query.boxIds) ? req.query.boxIds : (req.query.boxIds as string).split(','))
