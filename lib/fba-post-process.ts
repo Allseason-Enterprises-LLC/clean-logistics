@@ -194,35 +194,53 @@ async function getShipmentDetails(
 }
 
 async function fetchLabelPdf(fbaId: string, nBoxes: number, boxIds: string[]): Promise<Buffer> {
-  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation gives the correct combined
-  // label PDF: page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6).
-  // Do NOT use BARCODE_2D (omits carrier label) or PackageLabel_Thermal (carrier label rotated 90°).
+  // Use LabelType=BARCODE_2D (NOT UNIQUE) — this returns 2 pages PER BOX:
+  //   page 1 = FBA box label (portrait 4×6, unique boxId barcode)
+  //   page 2 = carrier shipping label (portrait 4×6)
+  // Verified 2026-05-22: 2 boxes → 4 pages, 23 boxes → 46 pages, 24 boxes → 48 pages.
   //
-  // CRITICAL: PackageLabelsToPrint must be the REAL box IDs returned by listShipmentBoxes
-  // (e.g. "bxi-..."), NOT a guessed `${fbaId}U000001` format. Faking them causes Amazon to
-  // return only the carrier label + at most one FBA box label, leaving multi-box destinations
-  // under-labeled. See 2026-05-22 incident (TR-00079..00084).
+  // Do NOT use LabelType=UNIQUE — despite the name, it returns ONLY ONE combined sheet
+  // (2 pages total) regardless of box count, even when PackageLabelsToPrint lists every
+  // real box ID. This caused the 2026-05-22 incident (TR-00079..00084): multi-box
+  // shipments shipped with a single box label and a single carrier label.
+  //
+  // PackageLabelsToPrint is NOT used with BARCODE_2D — Amazon generates labels for all
+  // boxes registered against the shipment via the packing-info workflow. boxIds is kept
+  // as a sanity input only (used by callers for filename + verification).
+  if (nBoxes <= 0) {
+    throw new Error(`fetchLabelPdf: nBoxes=${nBoxes} for ${fbaId} — cannot fetch zero labels.`);
+  }
   if (!boxIds || boxIds.length === 0) {
-    throw new Error(
-      `fetchLabelPdf: no box IDs supplied for ${fbaId} — Amazon listShipmentBoxes returned empty. ` +
-        `Refusing to fall back to guessed IDs (produces wrong label counts).`
-    );
-  }
-  if (boxIds.length !== nBoxes) {
     console.warn(
-      `[fba-post-process] fetchLabelPdf: nBoxes=${nBoxes} but received ${boxIds.length} box IDs for ${fbaId}`
+      `[fba-post-process] fetchLabelPdf: ${fbaId} has nBoxes=${nBoxes} but listShipmentBoxes returned empty boxIds — ` +
+        `proceeding with BARCODE_2D (which doesn't require IDs), but verify page count after upload.`
     );
   }
-  const path = `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=UNIQUE&${boxIds
-    .map((id) => `PackageLabelsToPrint=${encodeURIComponent(id)}`)
-    .join('&')}`;
+  const path =
+    `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=BARCODE_2D`;
   const r = await callAmazonSpApi<any>({ method: 'GET', path });
   const url = r.data?.payload?.DownloadURL;
   if (!url) throw new Error(`No DownloadURL in getLabels response for ${fbaId}`);
   const pdfRes = await fetch(url);
   if (!pdfRes.ok) throw new Error(`S3 label download failed: HTTP ${pdfRes.status}`);
   const arr = new Uint8Array(await pdfRes.arrayBuffer());
-  return Buffer.from(arr);
+  const buf = Buffer.from(arr);
+
+  // Verify page count: PDF page count should be ~2 * nBoxes (1 box label + 1 carrier label each).
+  // Use a lightweight regex on the raw bytes — no PDF parser needed.
+  const pageMatches = buf.toString('latin1').match(/\/Type\s*\/Page[^s]/g);
+  const pageCount = pageMatches ? pageMatches.length : 0;
+  const expected = nBoxes * 2;
+  if (pageCount < expected) {
+    throw new Error(
+      `fetchLabelPdf: ${fbaId} expected ~${expected} pages (${nBoxes} boxes × 2) but PDF has ${pageCount}. ` +
+        `Aborting — would ship under-labeled.`
+    );
+  }
+  console.log(
+    `[fba-post-process] ${fbaId}: ${nBoxes} boxes → ${pageCount} pages (size=${buf.length})`
+  );
+  return buf;
 }
 
 async function uploadToSupabase(
