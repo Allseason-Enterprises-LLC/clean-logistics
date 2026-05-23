@@ -43,9 +43,15 @@ export function isFbaDestination(destinationName: string | null | undefined): bo
 }
 
 /**
- * Fire (do not await). Logs results; returns nothing.
- * Timeout after 8s so we don't block the sync cron — the FBA workflow continues
- * running even after we disconnect.
+ * Fire (do not await). Logs results AND records dispatch state on the bridge
+ * row so the reconciler can see "we tried, here's when" rather than treating
+ * never-attempted and attempted-but-failed rows identically.
+ *
+ * The actual /api/fba/auto-submit call runs in its OWN Vercel function
+ * invocation (separate container, separate timeout budget). Our AbortController
+ * only governs how long we wait for that function to accept the request — once
+ * Vercel routes the POST and the auto-submit container starts, it runs
+ * independently for up to its own maxDuration=300s.
  */
 export function fireFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
   return triggerFbaAutoSubmit(input).catch((err) => {
@@ -56,10 +62,51 @@ export function fireFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
   });
 }
 
+async function recordHandoffDispatch(
+  cin7TransferNumber: string,
+  status: 'dispatched' | 'dispatch_failed',
+  details?: string
+): Promise<void> {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return;
+  try {
+    const { createClient } = await import('@supabase/supabase-js');
+    const db = createClient(url, key, { auth: { persistSession: false } });
+
+    // Bump fba_handoff_attempts and stamp the time. The reconciler uses these
+    // to know whether to retry. By recording dispatch_failed eagerly here, the
+    // reconciler can immediately pick up the slack on its next 15-min tick
+    // rather than waiting a full hour after a never-attempted state.
+    const { data: existing } = await db
+      .from('cin7_transfer_shiphero_orders')
+      .select('id, fba_handoff_attempts')
+      .eq('cin7_transfer_number', cin7TransferNumber)
+      .maybeSingle();
+
+    if (!existing) return;
+
+    await db
+      .from('cin7_transfer_shiphero_orders')
+      .update({
+        last_fba_handoff_at: new Date().toISOString(),
+        fba_handoff_attempts: (existing.fba_handoff_attempts || 0) + 1,
+        last_fba_handoff_status: status,
+        last_fba_handoff_detail: details ? details.slice(0, 500) : null,
+      })
+      .eq('id', existing.id);
+  } catch (err: any) {
+    console.warn(
+      `[cin7-fba-handoff] Failed to record handoff dispatch for ${cin7TransferNumber}: ${err?.message || err}`
+    );
+  }
+}
+
 async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
   const cronSecret = process.env.CRON_SECRET;
   if (!cronSecret) {
     console.warn('[cin7-fba-handoff] CRON_SECRET not set — skipping FBA handoff');
+    await recordHandoffDispatch(input.cin7TransferNumber, 'dispatch_failed', 'CRON_SECRET not set');
     return;
   }
 
@@ -81,8 +128,11 @@ async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
     `[cin7-fba-handoff] Firing FBA handoff to ${url}: ${payload.cin7_transfer_number} (${input.items.length} items)`
   );
 
+  // 30s timeout — generous for Vercel cold starts but still bounded so the
+  // parent sync cron doesn't sit forever. The auto-submit function itself has
+  // its own maxDuration=300s and keeps running after we disconnect.
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8_000);
+  const timeout = setTimeout(() => controller.abort(), 30_000);
 
   try {
     const res = await fetch(url, {
@@ -100,6 +150,11 @@ async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
       console.warn(
         `[cin7-fba-handoff] FBA handoff returned HTTP ${res.status}: ${body.slice(0, 500)}`
       );
+      await recordHandoffDispatch(
+        input.cin7TransferNumber,
+        'dispatch_failed',
+        `HTTP ${res.status}: ${body.slice(0, 200)}`
+      );
       return;
     }
 
@@ -107,13 +162,28 @@ async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
     console.log(
       `[cin7-fba-handoff] FBA handoff accepted for ${payload.cin7_transfer_number}: ${JSON.stringify(json)?.slice(0, 300)}`
     );
+    await recordHandoffDispatch(input.cin7TransferNumber, 'dispatched', 'auto-submit returned 200');
   } catch (err: any) {
     if (err?.name === 'AbortError') {
+      // The 30s timeout fired before auto-submit returned. The auto-submit
+      // function is still running in its own Vercel invocation, but we don't
+      // know if it'll succeed. Record as dispatched-but-unverified — the
+      // reconciler's existence check will catch true failures.
       console.log(
-        `[cin7-fba-handoff] FBA handoff kicked off for ${payload.cin7_transfer_number} (disconnected after 8s; FBA pipeline continues)`
+        `[cin7-fba-handoff] FBA handoff kicked off for ${payload.cin7_transfer_number} (disconnected after 30s; FBA pipeline continues)`
+      );
+      await recordHandoffDispatch(
+        input.cin7TransferNumber,
+        'dispatched',
+        'aborted after 30s — auto-submit still running independently'
       );
       return;
     }
+    await recordHandoffDispatch(
+      input.cin7TransferNumber,
+      'dispatch_failed',
+      `fetch error: ${err?.message || String(err)}`
+    );
     throw err;
   } finally {
     clearTimeout(timeout);

@@ -52,11 +52,23 @@ async function fbaRecordExists(
   db: SupabaseClient,
   transferNumber: string
 ): Promise<boolean> {
-  // Check the new columns first (post-migration writes will populate these)
+  // The bridge table stores `cin7_transfer_number` as the bare CIN7 number
+  // (e.g. "TR-00079"), but the FBA workflow writes rows with the ShipHero
+  // order-number form ("CIN7-TR-00079"). Historically this caused
+  // `fbaRecordExists` to always return false for cron-created rows, so the
+  // reconciler kept firing already-completed transfers until they hit
+  // `MAX_ATTEMPTS`. Query both forms.
+  const candidates = Array.from(
+    new Set([
+      transferNumber,
+      transferNumber.startsWith('CIN7-') ? transferNumber.slice(5) : `CIN7-${transferNumber}`,
+    ])
+  );
+
   const { data: byColumn, error: colErr } = await db
     .from('fba_shipments')
-    .select('id, status')
-    .eq('cin7_transfer_number', transferNumber)
+    .select('id, status, cin7_transfer_number')
+    .in('cin7_transfer_number', candidates)
     .not('status', 'in', '("failed","voided","cancelled")')
     .limit(1);
 
