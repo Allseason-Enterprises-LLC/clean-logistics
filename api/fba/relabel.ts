@@ -141,18 +141,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   for (const sid of (accepted.shipmentIds as string[]) || []) {
     void sid; // placeholder to keep lint happy; real summing happens next
   }
-  // Fetch each shipment to sum item quantities (also gives confirmation IDs later).
+  // Fetch each shipment's items to sum quantities. Items are NOT on the
+  // /shipments/{id} response — they live on /shipments/{id}/items. Calling
+  // /shipments/{id} alone returns destination + tracking but no items, which
+  // is why earlier relabel runs sent "Units: 0" Telegram messages.
   for (const internalId of internalShipmentIds) {
     try {
       const sres = await callAmazonSpApi<any>({
         method: 'GET',
-        path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/shipments/${internalId}`,
+        path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/shipments/${internalId}/items`,
       });
       for (const it of (sres.data?.items as any[]) || []) {
         totalUnits += it.quantity || 0;
       }
     } catch (e: any) {
-      console.warn(`[relabel] Could not fetch shipment ${internalId} for totals: ${e?.message}`);
+      console.warn(`[relabel] Could not fetch shipment ${internalId} items for totals: ${e?.message}`);
     }
   }
   const cases = unitsPerBox > 0 ? Math.ceil(totalUnits / unitsPerBox) : 0;
