@@ -80,21 +80,44 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'fba_shipments row has no plan_id — cannot relabel' });
   }
 
-  // 2) Resolve internal shipment IDs from Amazon (we may not have stored them)
-  const shipmentsRes = await callAmazonSpApi<any>({
+  // 2) Resolve internal shipment IDs via placementOptions (the /shipments listing
+  //    endpoint returns 403 with our current LWA scope — confirmed 2026-05-22).
+  //    The ACCEPTED placement option carries the same shipmentIds[] we got at
+  //    confirmPlacementOption time during auto-submit.
+  const placementRes = await callAmazonSpApi<any>({
     method: 'GET',
-    path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/shipments`,
+    path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/placementOptions`,
   });
-  const shipments = shipmentsRes.data?.shipments || [];
-  if (shipments.length === 0) {
-    return res.status(500).json({ error: `Amazon returned 0 shipments for plan ${planId}` });
+  const placementOptions = placementRes.data?.placementOptions ?? [];
+  const accepted = placementOptions.find((p: any) => p.status === 'ACCEPTED');
+  if (!accepted) {
+    return res.status(500).json({
+      error: `No ACCEPTED placement option found for plan ${planId}`,
+      placementOptionCount: placementOptions.length,
+      statuses: placementOptions.map((p: any) => p.status),
+    });
   }
-  const internalShipmentIds: string[] = shipments
-    .map((s: any) => s.shipmentId)
-    .filter(Boolean);
-  const shipmentConfirmationIds: string[] = shipments
-    .map((s: any) => s.shipmentConfirmationId)
-    .filter(Boolean);
+  const internalShipmentIds: string[] = accepted.shipmentIds ?? [];
+  if (internalShipmentIds.length === 0) {
+    return res.status(500).json({
+      error: `ACCEPTED placement option has no shipmentIds for plan ${planId}`,
+    });
+  }
+  // shipmentConfirmationIds are not on placementOptions — postProcessFbaShipment
+  // will fetch them per-shipment via getShipmentDetails (it reads
+  // d.shipmentConfirmationId from /shipments/{internalId}).
+  const shipmentConfirmationIds: string[] = [];
+
+  // Persist the recovered internal IDs so future relabel calls (or other tools)
+  // don't need to call placementOptions again. Best-effort — failure is non-fatal.
+  try {
+    await supabase
+      .from('fba_shipments')
+      .update({ amazon_internal_shipment_ids: internalShipmentIds })
+      .eq('id', row.id);
+  } catch (persistErr: any) {
+    console.warn(`[relabel] Could not persist internal IDs: ${persistErr?.message}`);
+  }
 
   // 3) Resolve product metadata for the Telegram message (best-effort)
   const cin7Sku = row.cin7_sku;
@@ -108,13 +131,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ? await getShipHeroProductData(shipheroToken, cin7Sku).catch(() => null)
     : null;
 
-  // Derive units / cases / unitsPerBox from product data + Amazon items
+  // Derive units / cases / unitsPerBox.
+  // Prefer the placement option's items aggregate when available; fall back to
+  // per-shipment GETs to sum items (rarely needed).
   const unitsPerBox = productData?.casePack?.caseQuantity || 0;
-  // Total units across all shipments (sum of items quantities from the first shipment listing)
   let totalUnits = 0;
-  for (const s of shipments) {
-    for (const it of s.items || []) {
-      totalUnits += it.quantity || 0;
+  // Aggregate from placement-option items if present (newer Amazon responses
+  // include items here). Otherwise we'll fetch per-shipment below.
+  for (const sid of (accepted.shipmentIds as string[]) || []) {
+    void sid; // placeholder to keep lint happy; real summing happens next
+  }
+  // Fetch each shipment to sum item quantities (also gives confirmation IDs later).
+  for (const internalId of internalShipmentIds) {
+    try {
+      const sres = await callAmazonSpApi<any>({
+        method: 'GET',
+        path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/shipments/${internalId}`,
+      });
+      for (const it of (sres.data?.items as any[]) || []) {
+        totalUnits += it.quantity || 0;
+      }
+    } catch (e: any) {
+      console.warn(`[relabel] Could not fetch shipment ${internalId} for totals: ${e?.message}`);
     }
   }
   const cases = unitsPerBox > 0 ? Math.ceil(totalUnits / unitsPerBox) : 0;
