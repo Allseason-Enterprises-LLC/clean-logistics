@@ -109,6 +109,7 @@ async function getShipmentDetails(
   destinationState: string;
   warehouseCode: string;
   nBoxes: number;
+  boxIds: string[];
   shippingCost?: number;
   shippingCurrency?: string;
 }> {
@@ -122,17 +123,38 @@ async function getShipmentDetails(
   const addr = d.destination?.address ?? {};
   const wh = d.destination?.warehouse ?? {};
 
-  // Box count (paginated)
+  // Box count + REAL box IDs (paginated).
+  // CRITICAL: we must use Amazon's actual boxId values (e.g. "bxi-...") when calling getLabels.
+  // The previous implementation faked them as `${fbaId}U000001` and Amazon silently returned
+  // only the carrier label + one FBA box label per PDF, causing destinations with >1 boxes to
+  // be under-labeled. See 2026-05-22 incident (TR-00079..00084).
   let nBoxes = 0;
+  const boxIds: string[] = [];
   let token: string | undefined;
   do {
     const path = `/inbound/fba/2024-03-20/inboundPlans/${planId}/shipments/${internalShipmentId}/boxes${
       token ? `?paginationToken=${token}` : ''
     }`;
     const boxRes = await callAmazonSpApi<any>({ method: 'GET', path });
-    nBoxes += (boxRes.data?.boxes ?? []).length;
+    const boxes = boxRes.data?.boxes ?? [];
+    nBoxes += boxes.length;
+    for (const box of boxes) {
+      const id = box.boxId || box.packageId || box.cartonId || box.contentId || box.id;
+      if (id) {
+        boxIds.push(id);
+      } else {
+        console.warn(`[fba-post-process] Box has no recognizable ID field:`, Object.keys(box));
+      }
+    }
     token = boxRes.data?.pagination?.nextToken;
   } while (token);
+
+  if (boxIds.length !== nBoxes) {
+    console.warn(
+      `[fba-post-process] Box ID count mismatch for ${fbaId}: ${boxIds.length} ids vs ${nBoxes} boxes. ` +
+        `Labels may be incomplete — check listShipmentBoxes response.`
+    );
+  }
 
   // Get the selected transportation option cost (for Telegram summary)
   let shippingCost: number | undefined;
@@ -165,18 +187,35 @@ async function getShipmentDetails(
     destinationState: addr.stateOrProvinceCode ?? 'XX',
     warehouseCode: wh.warehouseId ?? (d.name?.match(/-([A-Z0-9]{3,4})$/)?.[1] ?? '?'),
     nBoxes,
+    boxIds,
     shippingCost,
     shippingCurrency,
   };
 }
 
-async function fetchLabelPdf(fbaId: string, nBoxes: number): Promise<Buffer> {
+async function fetchLabelPdf(fbaId: string, nBoxes: number, boxIds: string[]): Promise<Buffer> {
   // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation gives the correct combined
   // label PDF: page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6).
   // Do NOT use BARCODE_2D (omits carrier label) or PackageLabel_Thermal (carrier label rotated 90°).
-  // Box IDs are formatted as {shipmentId}U{number} e.g. FBA19DNLZ885U000001.
-  const boxIds = Array.from({ length: nBoxes }, (_, i) => `${fbaId}U${String(i + 1).padStart(6, '0')}`);
-  const path = `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=UNIQUE&${boxIds.map(id => `PackageLabelsToPrint=${id}`).join('&')}`;
+  //
+  // CRITICAL: PackageLabelsToPrint must be the REAL box IDs returned by listShipmentBoxes
+  // (e.g. "bxi-..."), NOT a guessed `${fbaId}U000001` format. Faking them causes Amazon to
+  // return only the carrier label + at most one FBA box label, leaving multi-box destinations
+  // under-labeled. See 2026-05-22 incident (TR-00079..00084).
+  if (!boxIds || boxIds.length === 0) {
+    throw new Error(
+      `fetchLabelPdf: no box IDs supplied for ${fbaId} — Amazon listShipmentBoxes returned empty. ` +
+        `Refusing to fall back to guessed IDs (produces wrong label counts).`
+    );
+  }
+  if (boxIds.length !== nBoxes) {
+    console.warn(
+      `[fba-post-process] fetchLabelPdf: nBoxes=${nBoxes} but received ${boxIds.length} box IDs for ${fbaId}`
+    );
+  }
+  const path = `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=UNIQUE&${boxIds
+    .map((id) => `PackageLabelsToPrint=${encodeURIComponent(id)}`)
+    .join('&')}`;
   const r = await callAmazonSpApi<any>({ method: 'GET', path });
   const url = r.data?.payload?.DownloadURL;
   if (!url) throw new Error(`No DownloadURL in getLabels response for ${fbaId}`);
@@ -342,7 +381,7 @@ export async function postProcessFbaShipment(
       const objectPath = `${input.cin7TransferNumber.replace(/^CIN7-/, '')}/${filename}`;
 
       // Fetch + upload
-      const pdfBytes = await fetchLabelPdf(det.fbaId, det.nBoxes);
+      const pdfBytes = await fetchLabelPdf(det.fbaId, det.nBoxes, det.boxIds);
       const publicUrl = await uploadToSupabase(objectPath, pdfBytes);
 
       // Attach to ShipHero
