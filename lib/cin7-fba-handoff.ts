@@ -22,10 +22,30 @@ export interface FbaHandoffInput {
 }
 
 /**
- * Self URL: prefer VERCEL_URL (production deployment URL), fall back to the canonical
- * prod domain. Both paths are HTTPS.
+ * Self URL resolution.
+ *
+ * IMPORTANT: inside a Vercel function, `process.env.VERCEL_URL` is the per-deployment
+ * hostname (e.g. `shiphero-shipstation-bridge-<hash>-wcoricas-projects.vercel.app`),
+ * which is gated by Vercel Deployment Protection (SSO). Requests to that host get a
+ * 401 HTML wall at the edge regardless of `Authorization: Bearer $CRON_SECRET` — the
+ * protection runs BEFORE the function handler. The public alias
+ * `shiphero-shipstation-bridge.vercel.app` is not protected, so all self-POSTs must
+ * target the alias (or a custom domain) instead of `VERCEL_URL`.
+ *
+ * Resolution order:
+ *   1. `FBA_SELF_BASE_URL` — explicit override (custom domain, or any unprotected host).
+ *   2. In production (`VERCEL_ENV === 'production'`) — always the prod alias, NEVER
+ *      `VERCEL_URL`, because the latter is protected.
+ *   3. `VERCEL_URL` — for preview/dev where Deployment Protection is fine.
+ *   4. Hardcoded prod alias — last-resort fallback for local dev.
  */
 function getSelfBaseUrl(): string {
+  if (process.env.FBA_SELF_BASE_URL) {
+    return process.env.FBA_SELF_BASE_URL.replace(/\/+$/, '');
+  }
+  if (process.env.VERCEL_ENV === 'production') {
+    return 'https://shiphero-shipstation-bridge.vercel.app';
+  }
   if (process.env.VERCEL_URL) {
     return `https://${process.env.VERCEL_URL.replace(/\/+$/, '')}`;
   }
