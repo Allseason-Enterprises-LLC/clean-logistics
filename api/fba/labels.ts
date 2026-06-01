@@ -95,9 +95,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   // Page type for labels - default to 4x6 thermal for warehouse printing
-  const effectivePageType = (pageType as string) || 'PackageLabel_Thermal_No_Carrier_Rotation';
-  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation: correct 2-in-1 combined label.
-  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6, no rotation).
+  const effectivePageType = (pageType as string) || 'PackageLabel_Thermal';
+  // LabelType=UNIQUE + PackageLabel_Thermal: correct 2-in-1 combined label.
+  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6).
+  // PackageLabel_Thermal_No_Carrier_Rotation rotates the carrier 90° — broken (TR-00104, 2026-06-01).
   const effectiveLabelType = (labelType as string) || 'UNIQUE';
 
   try {

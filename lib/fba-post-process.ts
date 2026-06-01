@@ -217,7 +217,7 @@ async function fetchLabelPdf(fbaId: string, nBoxes: number, boxIds: string[]): P
     );
   }
   const path =
-    `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal_No_Carrier_Rotation&LabelType=BARCODE_2D`;
+    `/fba/inbound/v0/shipments/${fbaId}/labels?PageType=PackageLabel_Thermal&LabelType=BARCODE_2D`;
   const r = await callAmazonSpApi<any>({ method: 'GET', path });
   const url = r.data?.payload?.DownloadURL;
   if (!url) throw new Error(`No DownloadURL in getLabels response for ${fbaId}`);

@@ -5,14 +5,15 @@ export const config = { maxDuration: 60 };
 
 /**
  * Fetch FBA shipping labels via the amazon-sp-api Supabase edge function proxy.
- * GET /api/fba/get-labels?shipmentId=FBA19CBZ0CPX&boxIds=FBA19CBZ0CPXU000001&pageType=PackageLabel_Thermal_No_Carrier_Rotation
+ * GET /api/fba/get-labels?shipmentId=FBA19CBZ0CPX&boxIds=FBA19CBZ0CPXU000001&pageType=PackageLabel_Thermal
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const shipmentId = (req.query.shipmentId || req.body?.shipmentId) as string;
-  const pageType = (req.query.pageType || req.body?.pageType || 'PackageLabel_Thermal_No_Carrier_Rotation') as string;
-  // LabelType=UNIQUE + PackageLabel_Thermal_No_Carrier_Rotation gives the correct 2-in-1 label PDF:
-  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6, no rotation).
-  // Do NOT default to BARCODE_2D (omits carrier label) or PackageLabel_Thermal (carrier rotated 90°).
+  const pageType = (req.query.pageType || req.body?.pageType || 'PackageLabel_Thermal') as string;
+  // LabelType=UNIQUE + PackageLabel_Thermal gives the correct 2-in-1 label PDF:
+  // page 1 = FBA box label (portrait 4×6), page 2 = carrier shipping label (portrait 4×6).
+  // Do NOT default to BARCODE_2D (omits carrier label) or PackageLabel_Thermal_No_Carrier_Rotation
+  // (carrier rotated 90° — confirmed broken on TR-00104, 2026-06-01).
   const labelType = (req.query.labelType || req.body?.labelType || 'UNIQUE') as string;
   const numberOfPackages = req.query.numberOfPackages || req.body?.numberOfPackages;
   const boxIdsParam = req.query.boxIds
