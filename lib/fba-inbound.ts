@@ -196,26 +196,43 @@ export async function runFbaInboundWorkflow(
     box: options.box,
   }, null, 2));
 
-  // Step 0: Look up each MSKU's registered prep category.
+  // Step 0: Look up each MSKU's owner constraints.
   //
-  // Side effect: populates `prepCategoryByMsku` so Step 1 (createInboundPlan)
-  // and Step 5 (setPackingInformation) can send the correct `prepOwner`.
-  // Amazon's owner-vs-category rules are STRICT and asymmetric:
-  //   - prepCategory === 'NONE'  →  prepOwner MUST be 'NONE'  (sending SELLER
-  //       fails with "does not require prepOwner but SELLER was assigned")
-  //   - prepCategory anything else →  prepOwner MUST be 'SELLER' or 'AMAZON'
-  //       (sending NONE fails with "requires prepOwner but NONE was assigned.
-  //       Accepted values: [AMAZON, SELLER]")
+  // The source of truth for what we must send as `prepOwner`/`labelOwner` is
+  // Amazon's `prepOwnerConstraint` / `labelOwnerConstraint` fields, NOT the
+  // `prepCategory`. Subtle but critical: an MSKU can have `prepCategory=NONE`
+  // (no prep work required) but still demand `prepOwnerConstraint=SELLER_ONLY`
+  // (the seller must register as the owner of that no-op prep). We learned
+  // this from CLN-MULTIMAG-01 (TR-00107):
+  //   { prepCategory: NONE, prepOwnerConstraint: SELLER_ONLY,
+  //     labelOwnerConstraint: SELLER_ONLY, allOwnersConstraint: MUST_MATCH }
   //
-  // Default for unknown/missing prep category: SELLER. This is safe because:
-  //   (a) SELLER is what worked historically before this branch existed
-  //   (b) we'd rather attach a label/prep we don't strictly need than skip
-  //       one Amazon expects
-  // We do NOT attempt to flip an unclassified MSKU to NONE via setPrepDetails;
-  // Amazon's catalog may still classify it as requiring prep, and a successful
-  // setPrepDetails response does not guarantee the registered state is NONE.
-  console.log('[fba-inbound] Checking prep details for MSKUs...');
-  const prepCategoryByMsku: Record<string, string> = {};
+  // Constraint mapping → value we must send:
+  //   prepOwnerConstraint=NONE_ONLY   → prepOwner=NONE
+  //   prepOwnerConstraint=SELLER_ONLY → prepOwner=SELLER
+  //   prepOwnerConstraint=AMAZON_ONLY → prepOwner=AMAZON
+  // (Same for labelOwnerConstraint.)
+  //
+  // Amazon enforces this in BOTH createInboundPlan and setPackingInformation,
+  // so we cache the resolved owners up-front and reuse in both steps.
+  //
+  // Default for unknown/missing constraint: SELLER. This is safe because:
+  //   (a) SELLER was the historical default before any of this branching
+  //   (b) Amazon will accept SELLER for any item that ALLOWS seller-owned
+  //       prep or labeling; we'd rather over-attribute than under-attribute.
+  console.log('[fba-inbound] Resolving owner constraints for MSKUs...');
+  type OwnerVal = 'NONE' | 'SELLER' | 'AMAZON';
+  const prepOwnerByMsku: Record<string, OwnerVal> = {};
+  const labelOwnerByMsku: Record<string, OwnerVal> = {};
+
+  function constraintToOwner(c: string | undefined | null): OwnerVal | null {
+    if (!c) return null;
+    if (c === 'NONE_ONLY') return 'NONE';
+    if (c === 'SELLER_ONLY') return 'SELLER';
+    if (c === 'AMAZON_ONLY') return 'AMAZON';
+    return null; // unknown constraint shape — fall through to default
+  }
+
   for (const item of options.items) {
     try {
       const prepRes = await callAmazonSpApi<any>({
@@ -230,13 +247,22 @@ export async function runFbaInboundWorkflow(
       const mskuPrepDetail = (prepRes.data?.mskuPrepDetails ?? []);
       const detail = mskuPrepDetail.find((d: any) => d.msku === item.sellerSku);
       const prepCategory = detail?.prepCategory;
-      if (prepCategory && prepCategory !== 'UNKNOWN') {
-        prepCategoryByMsku[item.sellerSku] = prepCategory;
-      }
-      console.log(`[fba-inbound] Prep details for ${item.sellerSku}: category=${prepCategory ?? 'NOT_SET'} (using ${prepCategoryByMsku[item.sellerSku] ?? 'default=SELLER'})`);
+      const prepOwnerC = detail?.prepOwnerConstraint;
+      const labelOwnerC = detail?.labelOwnerConstraint;
+
+      const resolvedPrepOwner = constraintToOwner(prepOwnerC);
+      const resolvedLabelOwner = constraintToOwner(labelOwnerC);
+      if (resolvedPrepOwner) prepOwnerByMsku[item.sellerSku] = resolvedPrepOwner;
+      if (resolvedLabelOwner) labelOwnerByMsku[item.sellerSku] = resolvedLabelOwner;
+
+      console.log(
+        `[fba-inbound] ${item.sellerSku}: prepCategory=${prepCategory ?? '-'} ` +
+        `prepOwnerConstraint=${prepOwnerC ?? '-'} → prepOwner=${prepOwnerByMsku[item.sellerSku] ?? 'default=SELLER'}, ` +
+        `labelOwnerConstraint=${labelOwnerC ?? '-'} → labelOwner=${labelOwnerByMsku[item.sellerSku] ?? 'default=SELLER'}`
+      );
     } catch (prepErr: unknown) {
-      console.warn(`[fba-inbound] Could not check prep details for ${item.sellerSku} — defaulting to SELLER:`, prepErr);
-      // Fall through with no entry in prepCategoryByMsku — Step 1 defaults to SELLER.
+      console.warn(`[fba-inbound] Could not fetch prepDetails for ${item.sellerSku} — defaulting to SELLER:`, prepErr);
+      // Fall through with no entries — items.map below defaults to SELLER for both.
     }
   }
 
@@ -262,25 +288,16 @@ export async function runFbaInboundWorkflow(
           companyName: options.sourceAddress.companyName,
           email: options.sourceAddress.email,
         },
-        items: options.items.map((i) => {
-          // Owner-vs-category rules from Amazon:
-          //   - prepOwner mirrors prepCategory: NONE→NONE, otherwise SELLER.
-          //     (Amazon rejects prepOwner=SELLER when category is NONE with
-          //      "does not require prepOwner but SELLER was assigned".)
-          //   - labelOwner is ALWAYS SELLER/AMAZON regardless of prep — even
-          //     no-prep items need FNSKU labels applied. Amazon rejects
-          //     labelOwner=NONE with "requires labelOwner but NONE was
-          //     assigned. Accepted values: [AMAZON, SELLER]".
-          const cat = prepCategoryByMsku[i.sellerSku];
-          const noPrepOwner = cat === 'NONE';
-          return {
-            msku: i.sellerSku,
-            quantity: i.quantity,
-            labelOwner: 'SELLER' as const,
-            prepOwner: (noPrepOwner ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
-            ...(i.expiration ? { expiration: i.expiration } : {}),
-          };
-        }),
+        items: options.items.map((i) => ({
+          msku: i.sellerSku,
+          quantity: i.quantity,
+          // Use Amazon's per-MSKU owner constraints (resolved in Step 0).
+          // Default to SELLER for both when we couldn't resolve — historically
+          // safe, accepted by Amazon for items that allow seller ownership.
+          labelOwner: (labelOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+          prepOwner: (prepOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+          ...(i.expiration ? { expiration: i.expiration } : {}),
+        })),
       },
     });
     createRes = res.data;
@@ -397,22 +414,17 @@ export async function runFbaInboundWorkflow(
                 },
                 weight: { value: options.box.weightLbs, unit: 'LB' },
                 quantity: options.boxQuantity || 1,
-                items: options.items.map((i) => {
-                  // Reuse the same prep-owner rule from Step 1 (createInboundPlan).
-                  // Amazon validates this against the plan's recorded values and
-                  // rejects with "Package group ... did not contain expected
-                  // items and/or quantities. Invalid item details ... expected
-                  // prepOwner=NONE, provided prepOwner=SELLER" if it mismatches.
-                  const cat = prepCategoryByMsku[i.sellerSku];
-                  const ownerPrep = cat === 'NONE' ? 'NONE' : (i.prepOwner || 'SELLER');
-                  return {
-                    msku: i.sellerSku,
-                    quantity: options.casePack || i.quantity,
-                    labelOwner: 'SELLER' as const,
-                    prepOwner: ownerPrep as 'SELLER' | 'AMAZON' | 'NONE',
-                    ...(i.expiration ? { expiration: i.expiration } : {}),
-                  };
-                }),
+                items: options.items.map((i) => ({
+                  msku: i.sellerSku,
+                  quantity: options.casePack || i.quantity,
+                  // Reuse the resolved owners from Step 0. Amazon validates these
+                  // against the plan's recorded values and rejects packing with
+                  // "Package group ... did not contain expected items" if they
+                  // don't match what was registered in createInboundPlan.
+                  labelOwner: (labelOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+                  prepOwner: (prepOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+                  ...(i.expiration ? { expiration: i.expiration } : {}),
+                })),
               },
             ],
           },
