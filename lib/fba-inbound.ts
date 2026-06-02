@@ -293,17 +293,21 @@ export async function runFbaInboundWorkflow(
           email: options.sourceAddress.email,
         },
         items: options.items.map((i) => {
-          // Match prep ownership to the registered prep category. Amazon rejects
-          // the plan if these don't agree (BadRequest "does not require prepOwner
-          // but SELLER was assigned"). When prepCategory is NONE we must send
-          // both labelOwner and prepOwner as NONE; otherwise SELLER.
+          // Owner-vs-category rules from Amazon:
+          //   - prepOwner mirrors prepCategory: NONE→NONE, otherwise SELLER.
+          //     (Amazon rejects prepOwner=SELLER when category is NONE with
+          //      "does not require prepOwner but SELLER was assigned".)
+          //   - labelOwner is ALWAYS SELLER/AMAZON regardless of prep — even
+          //     no-prep items need FNSKU labels applied. Amazon rejects
+          //     labelOwner=NONE with "requires labelOwner but NONE was
+          //     assigned. Accepted values: [AMAZON, SELLER]".
           const cat = prepCategoryByMsku[i.sellerSku];
-          const ownerForNoPrep = cat === 'NONE';
+          const noPrepOwner = cat === 'NONE';
           return {
             msku: i.sellerSku,
             quantity: i.quantity,
-            labelOwner: (ownerForNoPrep ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
-            prepOwner: (ownerForNoPrep ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
+            labelOwner: 'SELLER' as const,
+            prepOwner: (noPrepOwner ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
             ...(i.expiration ? { expiration: i.expiration } : {}),
           };
         }),
