@@ -197,7 +197,14 @@ export async function runFbaInboundWorkflow(
   }, null, 2));
 
   // Step 0: Ensure prep details are set for each MSKU
+  //
+  // Side effect: populates `prepCategoryByMsku` so Step 1 (createInboundPlan)
+  // can send the correct `prepOwner`/`labelOwner`. Amazon will REJECT plans
+  // (BadRequest "does not require prepOwner but SELLER was assigned") for any
+  // MSKU whose registered prepCategory is NONE if we send prepOwner=SELLER —
+  // the owner must mirror the category, i.e. NONE→NONE, otherwise SELLER.
   console.log('[fba-inbound] Checking prep details for MSKUs...');
+  const prepCategoryByMsku: Record<string, string> = {};
   for (const item of options.items) {
     try {
       const prepRes = await callAmazonSpApi<any>({
@@ -212,6 +219,7 @@ export async function runFbaInboundWorkflow(
       const mskuPrepDetail = (prepRes.data?.mskuPrepDetails ?? []);
       const detail = mskuPrepDetail.find((d: any) => d.msku === item.sellerSku);
       const prepCategory = detail?.prepCategory;
+      if (prepCategory) prepCategoryByMsku[item.sellerSku] = prepCategory;
       console.log(`[fba-inbound] Prep details for ${item.sellerSku}: category=${prepCategory}`);
 
       if (!prepCategory || prepCategory === 'UNKNOWN') {
@@ -231,6 +239,7 @@ export async function runFbaInboundWorkflow(
             },
           });
           console.log(`[fba-inbound] Successfully set prep category for ${item.sellerSku}`);
+          prepCategoryByMsku[item.sellerSku] = 'NONE';
         } catch (setPrepErr: unknown) {
           console.error(`[fba-inbound] Failed to set prep category for ${item.sellerSku}:`, setPrepErr);
           // Continue anyway — createInboundPlan might still work
@@ -254,6 +263,7 @@ export async function runFbaInboundWorkflow(
           },
         });
         console.log(`[fba-inbound] Successfully set prep category for ${item.sellerSku} (fallback)`);
+        prepCategoryByMsku[item.sellerSku] = 'NONE';
       } catch (fallbackErr: unknown) {
         console.error(`[fba-inbound] Fallback setPrepDetails also failed for ${item.sellerSku}:`, fallbackErr);
       }
@@ -282,13 +292,21 @@ export async function runFbaInboundWorkflow(
           companyName: options.sourceAddress.companyName,
           email: options.sourceAddress.email,
         },
-        items: options.items.map((i) => ({
-          msku: i.sellerSku,
-          quantity: i.quantity,
-          labelOwner: 'SELLER' as const,
-          prepOwner: 'SELLER' as const,
-          ...(i.expiration ? { expiration: i.expiration } : {}),
-        })),
+        items: options.items.map((i) => {
+          // Match prep ownership to the registered prep category. Amazon rejects
+          // the plan if these don't agree (BadRequest "does not require prepOwner
+          // but SELLER was assigned"). When prepCategory is NONE we must send
+          // both labelOwner and prepOwner as NONE; otherwise SELLER.
+          const cat = prepCategoryByMsku[i.sellerSku];
+          const ownerForNoPrep = cat === 'NONE';
+          return {
+            msku: i.sellerSku,
+            quantity: i.quantity,
+            labelOwner: (ownerForNoPrep ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
+            prepOwner: (ownerForNoPrep ? 'NONE' : 'SELLER') as 'NONE' | 'SELLER',
+            ...(i.expiration ? { expiration: i.expiration } : {}),
+          };
+        }),
       },
     });
     createRes = res.data;

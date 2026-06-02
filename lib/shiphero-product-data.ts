@@ -24,10 +24,17 @@ interface ProductData {
 
 /**
  * Parse ShipHero product_note for case pack dimensions.
- * Expected format:
- *   Box Weight: 22 Lbs
- *   Box Size: 16 x 20 x 5 inches
- *   Quantity per Case: 90 bottles
+ *
+ * Accepts both common label formats observed in the wild:
+ *
+ *   Format A:                          Format B (Case Spec):
+ *     Box Weight: 22 Lbs                 Case Spec:
+ *     Box Size: 16 x 20 x 5 inches       Qty per case: 60
+ *     Quantity per Case: 90 bottles      Weight: 35 lbs
+ *                                        Dims: 20 x 14 x 6
+ *
+ * Match is case-insensitive, tolerates extra/missing units, and only requires
+ * that we end up with both a positive case quantity and a length dimension.
  */
 function parseCasePackFromNote(note: string | null): CasePackData | null {
   if (!note) return null;
@@ -38,22 +45,29 @@ function parseCasePackFromNote(note: string | null): CasePackData | null {
   let boxHeight = 0;
   let caseQuantity = 0;
 
-  // Parse Box Weight
-  const weightMatch = note.match(/Box\s*Weight[:\s]*(\d+\.?\d*)\s*(Lbs?|pounds?)/i);
+  // Box Weight  /  Weight
+  const weightMatch =
+    note.match(/Box\s*Weight[:\s]*(\d+\.?\d*)\s*(Lbs?|pounds?)?/i) ||
+    note.match(/(?:^|\n)\s*Weight[:\s]*(\d+\.?\d*)\s*(Lbs?|pounds?)?/i);
   if (weightMatch) {
     boxWeight = parseFloat(weightMatch[1]);
   }
 
-  // Parse Box Size (L x W x H)
-  const sizeMatch = note.match(/Box\s*Size[:\s]*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*(inches?|in)?/i);
+  // Box Size  /  Dims  /  Dimensions  (L x W x H)
+  const sizeMatch =
+    note.match(/Box\s*Size[:\s]*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*(inches?|in)?/i) ||
+    note.match(/Dim(?:ension)?s?[:\s]*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*x\s*(\d+\.?\d*)\s*(inches?|in)?/i);
   if (sizeMatch) {
     boxLength = parseFloat(sizeMatch[1]);
     boxWidth = parseFloat(sizeMatch[2]);
     boxHeight = parseFloat(sizeMatch[3]);
   }
 
-  // Parse Quantity per Case
-  const qtyMatch = note.match(/Quantity\s*per\s*Case[:\s]*(\d+)\s*(bottles?|units?|pcs?|ea)?/i);
+  // Quantity per Case  /  Qty per case  /  Case Qty
+  const qtyMatch =
+    note.match(/Quantity\s*per\s*Case[:\s]*(\d+)\s*(bottles?|units?|pcs?|ea)?/i) ||
+    note.match(/Qty\s*per\s*case[:\s]*(\d+)\s*(bottles?|units?|pcs?|ea)?/i) ||
+    note.match(/Case\s*Qty[:\s]*(\d+)\s*(bottles?|units?|pcs?|ea)?/i);
   if (qtyMatch) {
     caseQuantity = parseInt(qtyMatch[1]);
   }
