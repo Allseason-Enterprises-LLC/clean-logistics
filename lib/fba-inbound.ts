@@ -427,13 +427,22 @@ export async function runFbaInboundWorkflow(
                 },
                 weight: { value: options.box.weightLbs, unit: 'LB' },
                 quantity: options.boxQuantity || 1,
-                items: options.items.map((i) => ({
-                  msku: i.sellerSku,
-                  quantity: options.casePack || i.quantity,
-                  labelOwner: 'SELLER' as const,
-                  prepOwner: (i.prepOwner || 'SELLER') as 'SELLER' | 'AMAZON' | 'NONE',
-                  ...(i.expiration ? { expiration: i.expiration } : {}),
-                })),
+                items: options.items.map((i) => {
+                  // Reuse the same prep-owner rule from Step 1 (createInboundPlan).
+                  // Amazon validates this against the plan's recorded values and
+                  // rejects with "Package group ... did not contain expected
+                  // items and/or quantities. Invalid item details ... expected
+                  // prepOwner=NONE, provided prepOwner=SELLER" if it mismatches.
+                  const cat = prepCategoryByMsku[i.sellerSku];
+                  const ownerPrep = cat === 'NONE' ? 'NONE' : (i.prepOwner || 'SELLER');
+                  return {
+                    msku: i.sellerSku,
+                    quantity: options.casePack || i.quantity,
+                    labelOwner: 'SELLER' as const,
+                    prepOwner: ownerPrep as 'SELLER' | 'AMAZON' | 'NONE',
+                    ...(i.expiration ? { expiration: i.expiration } : {}),
+                  };
+                }),
               },
             ],
           },
