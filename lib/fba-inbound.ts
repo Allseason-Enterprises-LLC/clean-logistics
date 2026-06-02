@@ -196,13 +196,24 @@ export async function runFbaInboundWorkflow(
     box: options.box,
   }, null, 2));
 
-  // Step 0: Ensure prep details are set for each MSKU
+  // Step 0: Look up each MSKU's registered prep category.
   //
   // Side effect: populates `prepCategoryByMsku` so Step 1 (createInboundPlan)
-  // can send the correct `prepOwner`/`labelOwner`. Amazon will REJECT plans
-  // (BadRequest "does not require prepOwner but SELLER was assigned") for any
-  // MSKU whose registered prepCategory is NONE if we send prepOwner=SELLER —
-  // the owner must mirror the category, i.e. NONE→NONE, otherwise SELLER.
+  // and Step 5 (setPackingInformation) can send the correct `prepOwner`.
+  // Amazon's owner-vs-category rules are STRICT and asymmetric:
+  //   - prepCategory === 'NONE'  →  prepOwner MUST be 'NONE'  (sending SELLER
+  //       fails with "does not require prepOwner but SELLER was assigned")
+  //   - prepCategory anything else →  prepOwner MUST be 'SELLER' or 'AMAZON'
+  //       (sending NONE fails with "requires prepOwner but NONE was assigned.
+  //       Accepted values: [AMAZON, SELLER]")
+  //
+  // Default for unknown/missing prep category: SELLER. This is safe because:
+  //   (a) SELLER is what worked historically before this branch existed
+  //   (b) we'd rather attach a label/prep we don't strictly need than skip
+  //       one Amazon expects
+  // We do NOT attempt to flip an unclassified MSKU to NONE via setPrepDetails;
+  // Amazon's catalog may still classify it as requiring prep, and a successful
+  // setPrepDetails response does not guarantee the registered state is NONE.
   console.log('[fba-inbound] Checking prep details for MSKUs...');
   const prepCategoryByMsku: Record<string, string> = {};
   for (const item of options.items) {
@@ -219,54 +230,13 @@ export async function runFbaInboundWorkflow(
       const mskuPrepDetail = (prepRes.data?.mskuPrepDetails ?? []);
       const detail = mskuPrepDetail.find((d: any) => d.msku === item.sellerSku);
       const prepCategory = detail?.prepCategory;
-      if (prepCategory) prepCategoryByMsku[item.sellerSku] = prepCategory;
-      console.log(`[fba-inbound] Prep details for ${item.sellerSku}: category=${prepCategory}`);
-
-      if (!prepCategory || prepCategory === 'UNKNOWN') {
-        console.log(`[fba-inbound] Setting prep category for ${item.sellerSku} to NONE...`);
-        try {
-          await callAmazonSpApi<any>({
-            method: 'POST',
-            region,
-            path: `${FBA_INBOUND_BASE}/items/prepDetails`,
-            body: {
-              marketplaceId: options.marketplaceId,
-              mskuPrepDetails: [{
-                msku: item.sellerSku,
-                prepCategory: 'NONE',
-                prepTypes: ['ITEM_NO_PREP'],
-              }],
-            },
-          });
-          console.log(`[fba-inbound] Successfully set prep category for ${item.sellerSku}`);
-          prepCategoryByMsku[item.sellerSku] = 'NONE';
-        } catch (setPrepErr: unknown) {
-          console.error(`[fba-inbound] Failed to set prep category for ${item.sellerSku}:`, setPrepErr);
-          // Continue anyway — createInboundPlan might still work
-        }
+      if (prepCategory && prepCategory !== 'UNKNOWN') {
+        prepCategoryByMsku[item.sellerSku] = prepCategory;
       }
+      console.log(`[fba-inbound] Prep details for ${item.sellerSku}: category=${prepCategory ?? 'NOT_SET'} (using ${prepCategoryByMsku[item.sellerSku] ?? 'default=SELLER'})`);
     } catch (prepErr: unknown) {
-      console.warn(`[fba-inbound] Could not check prep details for ${item.sellerSku}:`, prepErr);
-      console.log(`[fba-inbound] Attempting to set prep category for ${item.sellerSku} to NONE (fallback)...`);
-      try {
-        await callAmazonSpApi<any>({
-          method: 'POST',
-          region,
-          path: `${FBA_INBOUND_BASE}/items/prepDetails`,
-          body: {
-            marketplaceId: options.marketplaceId,
-            mskuPrepDetails: [{
-              msku: item.sellerSku,
-              prepCategory: 'NONE',
-              prepTypes: ['ITEM_NO_PREP'],
-            }],
-          },
-        });
-        console.log(`[fba-inbound] Successfully set prep category for ${item.sellerSku} (fallback)`);
-        prepCategoryByMsku[item.sellerSku] = 'NONE';
-      } catch (fallbackErr: unknown) {
-        console.error(`[fba-inbound] Fallback setPrepDetails also failed for ${item.sellerSku}:`, fallbackErr);
-      }
+      console.warn(`[fba-inbound] Could not check prep details for ${item.sellerSku} — defaulting to SELLER:`, prepErr);
+      // Fall through with no entry in prepCategoryByMsku — Step 1 defaults to SELLER.
     }
   }
 
