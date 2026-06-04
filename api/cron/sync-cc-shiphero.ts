@@ -128,9 +128,15 @@ async function pushOrders(log: string[]) {
     if (hasUnmapped || mappedItems.length === 0) { skipped++; continue; }
 
     try {
-      const checkResult = await shGraphQL(`{ orders(order_number: "${esc(orderId)}", customer_account_id: "${CUSTOMER_ACCOUNT_ID}") { data(first: 3) { edges { node { shop_name } } } } }`);
-      const existingShops = checkResult.data?.orders?.data?.edges?.map((e: any) => e.node.shop_name) || [];
-      if (existingShops.includes('CheckoutChamp') || existingShops.includes('Checkout Champ') || existingShops.includes('CC-Bridge')) {
+      // Dedup: skip if an order with this order_number already exists in ShipHero
+      // under ANY store. The primary CheckoutChamp->ShipHero integration lands
+      // orders under the "Manual Order" store, so the old shop_name allowlist
+      // (CheckoutChamp/Checkout Champ/CC-Bridge only) never matched them — and
+      // this cron duplicated ~100% of CC orders as $0 copies (64 double-shipped in
+      // a 4-day sample). Matching on existence alone, regardless of store, fixes it.
+      const checkResult = await shGraphQL(`{ orders(order_number: "${esc(orderId)}", customer_account_id: "${CUSTOMER_ACCOUNT_ID}") { data(first: 3) { edges { node { id shop_name } } } } }`);
+      const existing = checkResult.data?.orders?.data?.edges || [];
+      if (existing.length > 0) {
         alreadyExists++;
         continue;
       }
@@ -375,10 +381,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   let pushResult = { pushed: 0, alreadyExists: 0, skipped: 0, failed: 0, errors: [] as any[] };
   let trackResult = { synced: 0, skipped: 0, failed: 0, errors: [] as any[] };
 
-  try {
-    pushResult = await pushOrders(log);
-  } catch (e: any) {
-    log.push(`[PUSH] Fatal error: ${e.message}`);
+  // PUSH phase is DISABLED by default. CheckoutChamp orders already enter ShipHero
+  // via the primary integration (they appear under the "Manual Order" store with
+  // correct pricing). This cron's push phase was duplicating ~100% of them as $0
+  // orders. Only set CC_PUSH_ENABLED="true" if the primary integration is down and
+  // you intentionally want this cron to create orders (the dedup above now matches
+  // any store, so it won't re-duplicate). The tracking sync-back phase below still
+  // runs unconditionally.
+  if (process.env.CC_PUSH_ENABLED === 'true') {
+    try {
+      pushResult = await pushOrders(log);
+    } catch (e: any) {
+      log.push(`[PUSH] Fatal error: ${e.message}`);
+    }
+  } else {
+    log.push('[PUSH] Skipped — disabled (CC_PUSH_ENABLED != "true"). Orders arrive via the primary CC->ShipHero integration under the "Manual Order" store.');
   }
 
   try {
