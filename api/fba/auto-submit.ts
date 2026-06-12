@@ -3,6 +3,8 @@ import { createClient } from '@supabase/supabase-js';
 import { getShipHeroProductData, getShipHeroToken } from '../../lib/shiphero-product-data';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
 import { postProcessFbaShipment } from '../../lib/fba-post-process';
+import { PartneredUnavailableError } from '../../lib/fba-inbound';
+import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
 export const config = { maxDuration: 300 };
 
@@ -13,6 +15,50 @@ function requireAuth(req: VercelRequest, res: VercelResponse): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Send an alert to the FBA Telegram channel. Best-effort: failures are logged but
+ * never thrown, so an alert outage doesn't compound a real failure.
+ */
+async function sendFbaAlert(text: string): Promise<void> {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
+  if (!botToken || !chatId) {
+    console.warn('[fba-auto] Telegram env vars not set — skipping alert');
+    return;
+  }
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
+    });
+    if (!resp.ok) {
+      console.error('[fba-auto] Telegram alert failed:', resp.status, (await resp.text()).slice(0, 300));
+    }
+  } catch (err: any) {
+    console.error('[fba-auto] Telegram alert threw:', err?.message);
+  }
+}
+
+/**
+ * Cancel an Amazon FBA inbound plan via SP-API. Best-effort: errors logged not thrown
+ * because we only call this in cleanup paths where we already have a primary failure.
+ */
+async function cancelInboundPlan(planId: string): Promise<boolean> {
+  try {
+    await callAmazonSpApi({
+      method: 'PUT',
+      path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/cancellation`,
+      body: {},
+    });
+    console.log(`[fba-auto] Cancelled Amazon plan ${planId} (retry cleanup)`);
+    return true;
+  } catch (err: any) {
+    console.warn(`[fba-auto] Failed to cancel Amazon plan ${planId}: ${err?.message}`);
+    return false;
+  }
 }
 
 /**
@@ -182,27 +228,118 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         }
       };
 
-      const fbaResult = await createFbaInboundShipment(
-        warehouseId,
-        [{
-          sellerSku: skuMapping.amz_sku,
-          quantity: totalQty,
-          casePack: unitsPerBox,
-          cases: numBoxes,
-          expiration: productData.expirationDate,
-        }],
-        {
-          length: casePack.boxLength,
-          width: casePack.boxWidth,
-          height: casePack.boxHeight,
-        },
-        casePack.boxWeightLbs,
-        {
-          boxQuantity: numBoxes,
-          casePack: unitsPerBox,
-          onPlanCreated,
+      // Cascading retry on PartneredUnavailableError: Amazon's placement algorithm is
+      // stochastic — a fresh roll may offer partnered SPD where the previous didn't.
+      // We retry up to 3 times. Each retry:
+      //   1. Cancels the failed plan on Amazon (so it doesn't leave ACTIVE junk)
+      //   2. Marks the early-persisted fba_shipments row as cancelled
+      //   3. Calls createFbaInboundShipment again (which mints a fresh inboundPlan)
+      //
+      // After 3 attempts, send a Telegram alert with full diagnostics and fail the SKU.
+      const MAX_PARTNERED_RETRIES = 3;
+      let fbaResult: any = null;
+      let partneredAttempts: PartneredUnavailableError[] = [];
+
+      for (let attempt = 1; attempt <= MAX_PARTNERED_RETRIES; attempt++) {
+        // Reset early-record state for this attempt (each attempt creates a fresh plan + row)
+        earlyRecordId = null;
+        try {
+          fbaResult = await createFbaInboundShipment(
+            warehouseId,
+            [{
+              sellerSku: skuMapping.amz_sku,
+              quantity: totalQty,
+              casePack: unitsPerBox,
+              cases: numBoxes,
+              expiration: productData.expirationDate,
+            }],
+            {
+              length: casePack.boxLength,
+              width: casePack.boxWidth,
+              height: casePack.boxHeight,
+            },
+            casePack.boxWeightLbs,
+            {
+              boxQuantity: numBoxes,
+              casePack: unitsPerBox,
+              onPlanCreated,
+            }
+          );
+          break; // success
+        } catch (err: any) {
+          if (err instanceof PartneredUnavailableError) {
+            partneredAttempts.push(err);
+            console.warn(
+              `[fba-auto] PartneredUnavailable attempt ${attempt}/${MAX_PARTNERED_RETRIES} for ${item.sku} ` +
+              `plan=${err.diagnostics.planId}: ${err.message}`
+            );
+            // Cancel the dud plan on Amazon
+            await cancelInboundPlan(err.diagnostics.planId);
+            // Mark the early-persisted draft row cancelled
+            if (earlyRecordId) {
+              try {
+                await supabase
+                  .from('fba_shipments')
+                  .update({
+                    status: 'cancelled',
+                    error_message: `partnered unavailable (attempt ${attempt}/${MAX_PARTNERED_RETRIES})`,
+                    cancelled_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                  })
+                  .eq('id', earlyRecordId);
+              } catch (markErr: any) {
+                console.warn(`[fba-auto] Failed to mark dud row cancelled: ${markErr?.message}`);
+              }
+            }
+            if (attempt < MAX_PARTNERED_RETRIES) {
+              // Brief pause before re-rolling (Amazon's placement service caches briefly)
+              await new Promise((r) => setTimeout(r, 30_000));
+              continue;
+            }
+          }
+          // Either not partnered-related, or we've exhausted retries — bubble up
+          throw err;
         }
-      );
+      }
+
+      if (!fbaResult) {
+        // All retries hit PartneredUnavailableError. Build a structured alert.
+        const last = partneredAttempts[partneredAttempts.length - 1];
+        const placementSummary = last.diagnostics.placements
+          .map(p => `• POID ${p.placementOptionId.slice(0, 12)}…  $${p.fee.toFixed(2)}  ${p.shipments} shipments  partneredCoverage=${(p.partneredCoverage * 100).toFixed(0)}%`)
+          .join('\n');
+        const alertText =
+          `🚨 *FBA Pipeline: Partnered Carrier Unavailable After ${MAX_PARTNERED_RETRIES} Retries*\n` +
+          `\n` +
+          `*Transfer:* ${cin7_transfer_number}\n` +
+          `*SKU:* \`${item.sku}\` (Amazon: \`${skuMapping.amz_sku}\`)\n` +
+          `*Quantity:* ${totalQty} units, ${numBoxes} boxes\n` +
+          `*Box:* ${casePack.boxLength}×${casePack.boxWidth}×${casePack.boxHeight} in, ${casePack.boxWeightLbs} lbs\n` +
+          `\n` +
+          `Across ${partneredAttempts.length} fresh plan rolls, Amazon never offered AMAZON_PARTNERED_CARRIER ` +
+          `(UPS Ground SPD) coverage on every shipment of any placement option.\n` +
+          `\n` +
+          `*Last roll's placements:*\n` +
+          placementSummary +
+          `\n\n` +
+          `*Likely root causes (in order of likelihood):*\n` +
+          `1. ASIN-level restock/IPI limit at the destination FCs Amazon picked\n` +
+          `2. Per-SKU partnered SPD volume threshold exceeded — try splitting transfer\n` +
+          `3. Box dimensions edge case (verify in ShipHero: must be ≥6×4×1 in, ≤25" longest, ≤50 lbs)\n` +
+          `\n` +
+          `*Next steps:* Cancel CIN7 transfer ${cin7_transfer_number} or split into smaller batches. ` +
+          `Check Seller Central Restock Limits for ${skuMapping.amz_sku}.`;
+        await sendFbaAlert(alertText);
+
+        results.push({
+          sku: item.sku,
+          status: 'failed',
+          error: `Partnered unavailable after ${MAX_PARTNERED_RETRIES} retries (alert sent to FBA channel)`,
+          partnered_attempts: partneredAttempts.length,
+          last_diagnostics: last.diagnostics,
+        });
+        continue;
+      }
 
       // 5. Post-process: fetch labels, upload to Supabase, attach to ShipHero, Telegram notify
       const shipmentIds = fbaResult.shipmentIds || fbaResult.amazon_shipment_ids || [];

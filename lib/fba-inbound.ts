@@ -61,6 +61,45 @@ export interface FbaInboundResult {
   prepInstructions: Record<string, unknown> | null;
 }
 
+/**
+ * Thrown when none of the placement options Amazon offered have AMAZON_PARTNERED_CARRIER
+ * (UPS Ground SPD) coverage on EVERY shipment.
+ *
+ * Carries a structured diagnostic payload so the outer retry/alert layer can decide
+ * whether to re-roll (cancel + retry with a fresh plan) or escalate to humans.
+ *
+ * Background: prior to commit shipping this class, the workflow blindly picked the
+ * cheapest placement and only THEN checked partnered availability — failing the
+ * whole workflow if that one placement had no partnered, even when other placements
+ * did. The 2026-06-11 rescue (TR-00121, TR-00129) exposed this. The fix pre-vets
+ * every placement and only throws when ALL fail.
+ */
+export class PartneredUnavailableError extends Error {
+  constructor(
+    public readonly diagnostics: {
+      planId: string;
+      placements: Array<{
+        placementOptionId: string;
+        fee: number;
+        currency: string;
+        shipments: number;
+        partneredCoverage: number; // 0..1 = fraction of shipments with ≥1 partnered SPD
+        carrierBreakdown: string[]; // sample of carriers offered (USE_YOUR_OWN_CARRIER suffix)
+      }>;
+    },
+  ) {
+    const summary = diagnostics.placements
+      .map(p => `${p.placementOptionId.slice(0, 12)}…(fee=$${p.fee},ships=${p.shipments},partnered=${(p.partneredCoverage * 100).toFixed(0)}%)`)
+      .join(' | ');
+    super(
+      `No placement has AMAZON_PARTNERED_CARRIER coverage on all shipments. ` +
+      `Amazon offered ${diagnostics.placements.length} placement(s): ${summary}. ` +
+      `Per Clean Nutra policy we never use our own carrier.`
+    );
+    this.name = 'PartneredUnavailableError';
+  }
+}
+
 function getRegion(marketplaceId: string): Region {
   return MARKETPLACE_TO_REGION[marketplaceId] ?? 'na';
 }
@@ -494,27 +533,32 @@ export async function runFbaInboundWorkflow(
   });
   console.log('[fba-inbound] Placement options:', JSON.stringify(placementSummary));
 
-  // Pick the LOWEST total placement fee. Amazon charges a "Placement Services" fee
-  // for keeping the shipment in as few destinations as possible; the cheapest option
-  // is usually the "Amazon Optimized Shipment Splits" one with $0 fee (where Amazon
-  // decides the FC mix). Tie-break by fewest shipments so the warehouse has less work.
-  placeOpts.sort((a: any, b: any) => {
-    const feeA = (a.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
-    const feeB = (b.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
-    if (feeA !== feeB) return feeA - feeB;
-    return (a.shipmentIds?.length ?? 99) - (b.shipmentIds?.length ?? 99);
-  });
-  const place = placeOpts[0];
-  const placeFee = (place.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
-  console.log(`[fba-inbound] Selected placement: ${place.placementOptionId} with ${place.shipmentIds?.length} shipment(s), placement fee: $${placeFee} (out of ${placeOpts.length} options)`);
-  const placementOptionId = place.placementOptionId;
-  const shipmentIds: string[] = place.shipmentIds ?? [];
-  if (!placementOptionId || shipmentIds.length === 0) throw new Error('Placement option missing placementOptionId or shipmentIds');
-  console.log(`[fba-inbound] [${((Date.now() - startTime) / 1000).toFixed(1)}s] Step 7 COMPLETE: listPlacementOptions`);
+  // Pre-vet ALL placements before picking. The old logic blindly picked the cheapest
+  // placement, then failed at Step 9 if that placement happened to have zero
+  // AMAZON_PARTNERED_CARRIER (UPS SPD) options — even when OTHER placements would have
+  // worked fine. This broke TR-00121 and TR-00129 on 2026-06-11 because Amazon offered
+  // multiple $0-fee splits with different partnered coverage and the picker tie-broke
+  // on array order.
+  //
+  // Strategy now:
+  //   1. For EVERY placement Amazon offered, generate + list transportation options.
+  //   2. A placement is "viable" if EVERY shipment under it has ≥1 partnered SPD option.
+  //   3. Among viable placements, pick lowest fee → fewest shipments → cheapest partnered total cost.
+  //   4. If NO placement is viable, throw PartneredUnavailableError with full diagnostics.
+  //      The outer retry layer in auto-submit decides whether to re-roll or escalate.
+  //
+  // Cost: O(N) more SP-API calls (one TO probe per placement). Typical workflows have
+  // 3-5 placements, adding ~30-60s. The existing workflow budget is 300s (Vercel maxDuration),
+  // so this is well within bounds.
 
-  // readyToShipWindow: provide a 7-day window starting tomorrow (Amazon requires a real window;
-  // start==end produces a zero-duration window that prevents partnered-carrier (UPS) quotes
-  // from being generated and forces USE_YOUR_OWN_CARRIER only).
+  console.log('[fba-inbound] Step 7.5: pre-vetting ALL placements for partnered SPD coverage...');
+
+  // Shared transportation-options inputs (same for every placement probe)
+  const contactInformation = {
+    name: options.sourceAddress.name,
+    phoneNumber: options.sourceAddress.phoneNumber,
+    email: options.sourceAddress.email || 'shipping@cleannutra.com',
+  };
   const readyStart = new Date();
   readyStart.setDate(readyStart.getDate() + 1);
   const readyEnd = new Date(readyStart);
@@ -522,143 +566,193 @@ export async function runFbaInboundWorkflow(
   const readyStartIso = readyStart.toISOString().replace(/\.\d{3}Z$/, 'Z');
   const readyEndIso = readyEnd.toISOString().replace(/\.\d{3}Z$/, 'Z');
 
-  // Step 8: Generate Transportation Options
-  // CRITICAL: must include contactInformation per shipment for Amazon partnered carrier (PCP/UPS)
-  // options to be generated. Without it, Amazon returns only USE_YOUR_OWN_CARRIER options
-  // and confirmTransportationOptions fails with FBA_INB_0117.
-  const contactInformation = {
-    name: options.sourceAddress.name,
-    phoneNumber: options.sourceAddress.phoneNumber,
-    email: options.sourceAddress.email || 'shipping@cleannutra.com',
+  type PlacementProbe = {
+    placement: any;
+    fee: number;
+    optsByShipment: Map<string, any[]>; // shipmentId → all transport options
+    partneredViable: boolean; // true if EVERY shipment has ≥1 partnered SPD
   };
 
-  console.log('[fba-inbound] Step 8: generateTransportationOptions...');
-  console.log(`[fba-inbound] readyToShipWindow: ${readyStartIso} → ${readyEndIso}`);
-  let transGenData: any;
-  try {
-    const res = await callAmazonSpApi<any>({
-      method: 'POST',
-      region,
-      path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/transportationOptions`,
-      body: {
-        placementOptionId,
-        shipmentTransportationConfigurations: shipmentIds.map((sid) => ({
-          shipmentId: sid,
-          contactInformation,
-          readyToShipWindow: { start: readyStartIso, end: readyEndIso },
-        })),
-      },
-    });
-    transGenData = res.data;
-    console.log('[fba-inbound] generateTransportationOptions response:', JSON.stringify(transGenData));
-  } catch (e) {
-    console.error('[fba-inbound] generateTransportationOptions failed:', e);
-    throw new Error(`generateTransportationOptions failed: ${extractAmazonError(e)}`);
-  }
-  const transGenOpId = transGenData?.operationId;
-  if (!transGenOpId) throw new Error('generateTransportationOptions: missing operationId');
-  await pollUntilSuccess(region, transGenOpId);
-  console.log(`[fba-inbound] [${((Date.now() - startTime) / 1000).toFixed(1)}s] Step 8 COMPLETE: generateTransportationOptions`);
+  // Probe placements sequentially to stay under SP-API rate limits. The transportationOptions
+  // POST is rate-limited at 0.025 req/sec (1 per 40s) per Amazon docs — but typical workflows
+  // have ≤5 placements so this is fine. Parallel calls have historically caused 429s.
+  const LTL_MODES = new Set(['FREIGHT_LTL', 'FREIGHT_FTL_PALLET', 'FREIGHT_FTL_NONPALLET', 'PARTIAL_TRUCK_LOAD', 'FULL_TRUCK_LOAD']);
+  const placementProbes: PlacementProbe[] = [];
 
-  // Step 9: List and Select Transportation Options (with pagination)
-  console.log('[fba-inbound] Step 9: listTransportationOptions...');
+  for (const p of placeOpts) {
+    const fee = (p.fees ?? []).reduce((s: number, f: any) => s + (f?.value?.amount ?? 0), 0);
+    const shipIds: string[] = p.shipmentIds ?? [];
+    if (shipIds.length === 0) {
+      placementProbes.push({ placement: p, fee, optsByShipment: new Map(), partneredViable: false });
+      continue;
+    }
+
+    // generateTransportationOptions for this placement
+    try {
+      const gen = await callAmazonSpApi<any>({
+        method: 'POST',
+        region,
+        path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/transportationOptions`,
+        body: {
+          placementOptionId: p.placementOptionId,
+          shipmentTransportationConfigurations: shipIds.map((sid) => ({
+            shipmentId: sid,
+            contactInformation,
+            readyToShipWindow: { start: readyStartIso, end: readyEndIso },
+          })),
+        },
+      });
+      const opId = gen.data?.operationId;
+      if (opId) await pollUntilSuccess(region, opId);
+    } catch (e) {
+      console.warn(`[fba-inbound] pre-vet generateTransportationOptions failed for placement ${p.placementOptionId}: ${extractAmazonError(e)}`);
+      placementProbes.push({ placement: p, fee, optsByShipment: new Map(), partneredViable: false });
+      continue;
+    }
+
+    // listTransportationOptions for each shipment under this placement, with pagination
+    const optsByShipment = new Map<string, any[]>();
+    let perPlacementError = false;
+    for (const sid of shipIds) {
+      try {
+        let allOpts: any[] = [];
+        let nextToken: string | undefined;
+        do {
+          const qp: Record<string, string> = { shipmentId: sid };
+          if (nextToken) qp.paginationToken = nextToken;
+          const r = await callAmazonSpApi<any>({
+            method: 'GET',
+            region,
+            path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/transportationOptions`,
+            query: qp,
+          });
+          allOpts = allOpts.concat(r.data?.transportationOptions ?? []);
+          nextToken = r.data?.pagination?.nextToken;
+        } while (nextToken);
+        optsByShipment.set(sid, allOpts.filter((o: any) => !LTL_MODES.has(o.shippingMode)));
+      } catch (e) {
+        console.warn(`[fba-inbound] pre-vet listTransportationOptions failed for placement ${p.placementOptionId} shipment ${sid}: ${extractAmazonError(e)}`);
+        perPlacementError = true;
+        optsByShipment.set(sid, []);
+      }
+    }
+    if (perPlacementError) {
+      placementProbes.push({ placement: p, fee, optsByShipment, partneredViable: false });
+      continue;
+    }
+
+    // Viability = EVERY shipment has ≥1 AMAZON_PARTNERED_CARRIER option (any mode)
+    const partneredCounts = shipIds.map((sid) => {
+      const opts = optsByShipment.get(sid) ?? [];
+      return opts.filter((o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER').length;
+    });
+    const partneredViable = partneredCounts.every((n) => n > 0);
+    placementProbes.push({ placement: p, fee, optsByShipment, partneredViable });
+
+    const partneredSummary = partneredCounts.join('/');
+    console.log(
+      `[fba-inbound]   placement ${p.placementOptionId.slice(0, 12)}… ` +
+      `fee=$${fee} ships=${shipIds.length} partneredPerShipment=[${partneredSummary}] viable=${partneredViable}`
+    );
+  }
+
+  // Pick the best placement among viable ones
+  const viable = placementProbes.filter((pr) => pr.partneredViable);
+  if (viable.length === 0) {
+    // Build diagnostic for the outer layer to log/alert/retry
+    const diagPlacements = placementProbes.map((pr) => {
+      const shipIds: string[] = pr.placement.shipmentIds ?? [];
+      const partneredCount = shipIds.filter((sid) => (pr.optsByShipment.get(sid) ?? []).some((o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER')).length;
+      const carriers = new Set<string>();
+      for (const sid of shipIds) {
+        for (const o of pr.optsByShipment.get(sid) ?? []) {
+          carriers.add(`${o.shippingSolution}/${o.carrier?.name ?? '?'}`);
+        }
+      }
+      return {
+        placementOptionId: pr.placement.placementOptionId,
+        fee: pr.fee,
+        currency: (pr.placement.fees?.[0]?.value?.code as string) ?? 'USD',
+        shipments: shipIds.length,
+        partneredCoverage: shipIds.length > 0 ? partneredCount / shipIds.length : 0,
+        carrierBreakdown: Array.from(carriers).slice(0, 10),
+      };
+    });
+    throw new PartneredUnavailableError({ planId: inboundPlanId, placements: diagPlacements });
+  }
+
+  // Sort viable: lowest fee → fewest shipments → cheapest total partnered cost
+  viable.sort((a, b) => {
+    if (a.fee !== b.fee) return a.fee - b.fee;
+    const sA = a.placement.shipmentIds?.length ?? 99;
+    const sB = b.placement.shipmentIds?.length ?? 99;
+    if (sA !== sB) return sA - sB;
+    // Tie-break: cheapest sum of cheapest-per-shipment partnered SPD costs
+    const cheapestPartneredSum = (pr: PlacementProbe): number => {
+      let sum = 0;
+      for (const sid of pr.placement.shipmentIds ?? []) {
+        const partnered = (pr.optsByShipment.get(sid) ?? []).filter((o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER');
+        const costs = partnered.map((o: any) => (typeof o.quote?.cost?.amount === 'number' ? o.quote.cost.amount : Number.POSITIVE_INFINITY));
+        sum += Math.min(...(costs.length ? costs : [Number.POSITIVE_INFINITY]));
+      }
+      return sum;
+    };
+    return cheapestPartneredSum(a) - cheapestPartneredSum(b);
+  });
+
+  const chosen = viable[0];
+  const place = chosen.placement;
+  const placeFee = chosen.fee;
+  console.log(
+    `[fba-inbound] Selected placement: ${place.placementOptionId} with ${place.shipmentIds?.length} shipment(s), ` +
+    `placement fee: $${placeFee} (out of ${placeOpts.length} options, ${viable.length} viable for partnered)`
+  );
+  const placementOptionId = place.placementOptionId;
+  const shipmentIds: string[] = place.shipmentIds ?? [];
+  if (!placementOptionId || shipmentIds.length === 0) throw new Error('Placement option missing placementOptionId or shipmentIds');
+  console.log(`[fba-inbound] [${((Date.now() - startTime) / 1000).toFixed(1)}s] Step 7.5 COMPLETE: placement vetting`);
+
+  // Cache the transportation options for the chosen placement so Step 9 doesn't re-fetch.
+  const cachedOptsByShipment = chosen.optsByShipment;
+
+  // Step 8 (formerly): Transportation options were already generated during pre-vet.
+  // We just need to pick the cheapest AMAZON_PARTNERED_CARRIER option per shipment
+  // from the cached results. No additional Amazon API calls needed here.
+  console.log('[fba-inbound] Step 9: selecting partnered transport option per shipment (from cache)...');
   const transportSelections: Array<{ shipmentId: string; transportationOptionId: string }> = [];
   const shipmentsNeedingDeliveryWindow: Array<{ shipmentId: string; transportationOptionId: string }> = [];
 
   for (const sid of shipmentIds) {
-    try {
-      let allTransportOpts: any[] = [];
-      let nextToken: string | undefined;
+    const nonLtlOpts = cachedOptsByShipment.get(sid) ?? [];
+    const partneredOpts = nonLtlOpts.filter((o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER');
 
-      do {
-        const queryParams: Record<string, string> = { shipmentId: sid };
-        if (nextToken) queryParams.paginationToken = nextToken;
-        const res = await callAmazonSpApi<any>({
-          method: 'GET',
-          region,
-          // SDK path: /inboundPlans/{id}/transportationOptions with shipmentId as QUERY param, NOT path segment.
-          // (Wrong path returns 403 Unauthorized, not 404 — took a while to track down.)
-          path: `${FBA_INBOUND_BASE}/inboundPlans/${inboundPlanId}/transportationOptions`,
-          query: queryParams,
-        });
-        console.log(`[fba-inbound] listTransportationOptions for ${sid}${nextToken ? ' (page)' : ''}:`, JSON.stringify(res.data));
-
-        const opts = res.data?.transportationOptions ?? [];
-        allTransportOpts = allTransportOpts.concat(opts);
-        nextToken = res.data?.pagination?.nextToken;
-
-        if (nextToken) {
-          console.log(`[fba-inbound] Fetching next page of transportation options for ${sid}...`);
-        }
-      } while (nextToken);
-
-      console.log(`[fba-inbound] Found ${allTransportOpts.length} total transportation options for ${sid}`);
-
-      // HARD FILTER: never use LTL / freight / pallet shipping
-      const LTL_MODES = new Set(['FREIGHT_LTL', 'FREIGHT_FTL_PALLET', 'FREIGHT_FTL_NONPALLET', 'PARTIAL_TRUCK_LOAD', 'FULL_TRUCK_LOAD']);
-      const nonLtlOpts = allTransportOpts.filter((o: any) => !LTL_MODES.has(o.shippingMode));
-      const ltlDropped = allTransportOpts.length - nonLtlOpts.length;
-      if (ltlDropped > 0) {
-        console.log(`[fba-inbound] Dropped ${ltlDropped} LTL/freight option(s); keeping ${nonLtlOpts.length} small-parcel option(s)`);
-      }
-
-      // Log every non-LTL option with cost for cost-aware selection
-      const transportSummary = nonLtlOpts.map((o: any) => ({
-        id: o.transportationOptionId?.slice(0, 20) + '...',
-        mode: o.shippingMode,
-        solution: o.shippingSolution,
-        carrier: o.carrier?.name,
-        cost: o.quote?.cost?.amount,
-        currency: o.quote?.cost?.code,
-        needsDeliveryWindow: (o.preconditions ?? []).includes('CONFIRMED_DELIVERY_WINDOW'),
-      }));
-      console.log(`[fba-inbound] Non-LTL transport options for ${sid}:`, JSON.stringify(transportSummary));
-
-      // CRITICAL CONSTRAINT: We MUST use AMAZON_PARTNERED_CARRIER only.
-      // Never USE_YOUR_OWN_CARRIER (which requires arranging our own shipping +
-      // CONFIRMED_DELIVERY_WINDOW step). If Amazon offers no partnered option
-      // for this shipment, fail loudly so the operator can investigate (typically
-      // means the plan needs to be regenerated, or volume/weight exceeds Amazon's
-      // partnered SPD limits and the plan needs to be split or the SKU's case-pack
-      // dimensions need correction in ShipHero).
-      const partneredOpts = nonLtlOpts.filter(
-        (o: any) => o.shippingSolution === 'AMAZON_PARTNERED_CARRIER'
+    if (partneredOpts.length === 0) {
+      // Should be unreachable — pre-vet guarantees viable placements have ≥1 partnered per shipment.
+      // Defensive throw in case Amazon's offered set changes between pre-vet and now.
+      throw new Error(
+        `Defensive failure: chosen placement has no partnered option for shipment ${sid}. ` +
+        `This indicates a race between pre-vet and selection. Cancel the plan and retry.`
       );
+    }
 
-      if (partneredOpts.length === 0) {
-        const carrierBreakdown = nonLtlOpts.map((o: any) => `${o.shippingSolution}/${o.carrier?.name ?? '?'}`).slice(0, 10).join(', ');
-        throw new Error(
-          `No AMAZON_PARTNERED_CARRIER options available for shipment ${sid}. ` +
-          `Amazon only offered ${nonLtlOpts.length} USE_YOUR_OWN_CARRIER option(s): [${carrierBreakdown}]. ` +
-          `Per Clean Nutra policy we never use our own carrier. ` +
-          `Likely causes: (1) shipment volume exceeds partnered SPD limits — check box dimensions/weight in ShipHero, ` +
-          `(2) destination FC has no partnered carrier coverage, ` +
-          `(3) plan needs to be regenerated. Cancel this plan and try again, or contact Amazon support.`
-        );
-      }
+    partneredOpts.sort((a: any, b: any) => {
+      const costA = typeof a.quote?.cost?.amount === 'number' ? a.quote.cost.amount : Number.POSITIVE_INFINITY;
+      const costB = typeof b.quote?.cost?.amount === 'number' ? b.quote.cost.amount : Number.POSITIVE_INFINITY;
+      return costA - costB;
+    });
 
-      // Sort partnered options by cost (cheapest first). All partnered carriers
-      // are Amazon-booked so no delivery-window logic is needed for them.
-      partneredOpts.sort((a: any, b: any) => {
-        const costA = typeof a.quote?.cost?.amount === 'number' ? a.quote.cost.amount : Number.POSITIVE_INFINITY;
-        const costB = typeof b.quote?.cost?.amount === 'number' ? b.quote.cost.amount : Number.POSITIVE_INFINITY;
-        return costA - costB;
-      });
+    const preferred = partneredOpts[0];
+    if (!preferred?.transportationOptionId) throw new Error(`No transportation option for shipment ${sid}`);
+    console.log(
+      `[fba-inbound] Selected transport for ${sid}: ${preferred.transportationOptionId} ` +
+      `(mode=${preferred.shippingMode}, carrier=${preferred.carrier?.name}, cost=$${preferred.quote?.cost?.amount}, preconditions=${JSON.stringify(preferred.preconditions)})`
+    );
+    transportSelections.push({ shipmentId: sid, transportationOptionId: preferred.transportationOptionId });
 
-      const preferred = partneredOpts[0];
-
-      if (!preferred?.transportationOptionId) throw new Error(`No transportation option for shipment ${sid}`);
-      console.log(`[fba-inbound] Selected transport option for ${sid}: ${preferred.transportationOptionId} (mode=${preferred.shippingMode}, solution=${preferred.shippingSolution}, preconditions=${JSON.stringify(preferred.preconditions)})`);
-      transportSelections.push({ shipmentId: sid, transportationOptionId: preferred.transportationOptionId });
-
-      const preconditions = preferred.preconditions ?? [];
-      if (preconditions.includes('CONFIRMED_DELIVERY_WINDOW')) {
-        console.log(`[fba-inbound] Shipment ${sid} requires CONFIRMED_DELIVERY_WINDOW`);
-        shipmentsNeedingDeliveryWindow.push({ shipmentId: sid, transportationOptionId: preferred.transportationOptionId });
-      }
-    } catch (e) {
-      console.error(`[fba-inbound] listTransportationOptions failed for ${sid}:`, e);
-      throw new Error(`listTransportationOptions failed: ${extractAmazonError(e)}`);
+    const preconditions = preferred.preconditions ?? [];
+    if (preconditions.includes('CONFIRMED_DELIVERY_WINDOW')) {
+      console.log(`[fba-inbound] Shipment ${sid} requires CONFIRMED_DELIVERY_WINDOW`);
+      shipmentsNeedingDeliveryWindow.push({ shipmentId: sid, transportationOptionId: preferred.transportationOptionId });
     }
   }
 
