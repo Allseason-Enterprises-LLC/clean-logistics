@@ -308,44 +308,85 @@ export async function runFbaInboundWorkflow(
   // Step 1: Create Inbound Plan
   let createRes: any;
   console.log('[fba-inbound] Calling createInboundPlan...');
-  try {
-    const res = await callAmazonSpApi<any>({
-      method: 'POST',
-      region,
-      path: `${FBA_INBOUND_BASE}/inboundPlans`,
-      body: {
-        destinationMarketplaces: [options.marketplaceId],
-        sourceAddress: {
-          addressLine1: options.sourceAddress.addressLine1,
-          city: options.sourceAddress.city,
-          countryCode: options.sourceAddress.countryCode,
-          name: options.sourceAddress.name,
-          phoneNumber: options.sourceAddress.phoneNumber,
-          postalCode: options.sourceAddress.postalCode,
-          stateOrProvinceCode: options.sourceAddress.stateOrProvinceCode,
-          addressLine2: options.sourceAddress.addressLine2,
-          companyName: options.sourceAddress.companyName,
-          email: options.sourceAddress.email,
-        },
-        items: options.items.map((i) => ({
-          msku: i.sellerSku,
-          quantity: i.quantity,
-          // Use Amazon's per-MSKU owner constraints (resolved in Step 0).
-          // Default to SELLER for both when we couldn't resolve — historically
-          // safe, accepted by Amazon for items that allow seller ownership.
-          labelOwner: (labelOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
-          prepOwner: (prepOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
-          ...(i.expiration ? { expiration: i.expiration } : {}),
-        })),
+
+  // Helper to build the item list — reused if we need to retry with corrected owners.
+  const buildItems = () => options.items.map((i) => ({
+    msku: i.sellerSku,
+    quantity: i.quantity,
+    // Use Amazon's per-MSKU owner constraints (resolved in Step 0).
+    // Default to SELLER for both when we couldn't resolve — historically
+    // safe, accepted by Amazon for items that allow seller ownership.
+    labelOwner: (labelOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+    prepOwner: (prepOwnerByMsku[i.sellerSku] ?? 'SELLER') as OwnerVal,
+    ...(i.expiration ? { expiration: i.expiration } : {}),
+  }));
+
+  const doCreatePlan = async () => callAmazonSpApi<any>({
+    method: 'POST',
+    region,
+    path: `${FBA_INBOUND_BASE}/inboundPlans`,
+    body: {
+      destinationMarketplaces: [options.marketplaceId],
+      sourceAddress: {
+        addressLine1: options.sourceAddress.addressLine1,
+        city: options.sourceAddress.city,
+        countryCode: options.sourceAddress.countryCode,
+        name: options.sourceAddress.name,
+        phoneNumber: options.sourceAddress.phoneNumber,
+        postalCode: options.sourceAddress.postalCode,
+        stateOrProvinceCode: options.sourceAddress.stateOrProvinceCode,
+        addressLine2: options.sourceAddress.addressLine2,
+        companyName: options.sourceAddress.companyName,
+        email: options.sourceAddress.email,
       },
-    });
+      items: buildItems(),
+    },
+  });
+
+  try {
+    const res = await doCreatePlan();
     createRes = res.data;
     console.log('[fba-inbound] createInboundPlan response:', JSON.stringify(createRes));
   } catch (e: unknown) {
     console.error('[fba-inbound] createInboundPlan EXCEPTION:', e);
     const errDetail = extractAmazonError(e);
     console.error('[fba-inbound] Extracted error:', errDetail);
-    throw new Error(`createInboundPlan failed: ${errDetail}`);
+
+    // Owner-mismatch recovery. Amazon returns messages like:
+    //   "ERROR: <MSKU> does not require prepOwner but SELLER was assigned. Accepted values: [NONE]"
+    //   "ERROR: <MSKU> does not require labelOwner but SELLER was assigned. Accepted values: [NONE]"
+    // This happens when `/items/prepDetails` didn't return a constraint (e.g.
+    // inactive listing) and we fell back to SELLER, but Amazon actually wants NONE.
+    // Parse the accepted value from the error and retry once.
+    const ownerErrRe = /([A-Z0-9\-_]+)\s+does not require (prepOwner|labelOwner) but \w+ was assigned\.\s*Accepted values:\s*\[([A-Z, ]+)\]/gi;
+    let m: RegExpExecArray | null;
+    let correctedAny = false;
+    const errStr = String(errDetail);
+    while ((m = ownerErrRe.exec(errStr)) !== null) {
+      const [, msku, ownerField, acceptedRaw] = m;
+      const accepted = acceptedRaw.split(',').map(s => s.trim()).filter(Boolean)[0];
+      if (msku && accepted && (accepted === 'NONE' || accepted === 'SELLER' || accepted === 'AMAZON')) {
+        if (ownerField === 'prepOwner') prepOwnerByMsku[msku] = accepted as OwnerVal;
+        else labelOwnerByMsku[msku] = accepted as OwnerVal;
+        console.warn(`[fba-inbound] Owner-mismatch recovery: setting ${ownerField}=${accepted} for ${msku}`);
+        correctedAny = true;
+      }
+    }
+
+    if (correctedAny) {
+      console.log('[fba-inbound] Retrying createInboundPlan with corrected owners...');
+      try {
+        const res2 = await doCreatePlan();
+        createRes = res2.data;
+        console.log('[fba-inbound] createInboundPlan (retry) response:', JSON.stringify(createRes));
+      } catch (e2: unknown) {
+        const errDetail2 = extractAmazonError(e2);
+        console.error('[fba-inbound] Retry also failed:', errDetail2);
+        throw new Error(`createInboundPlan failed: ${errDetail2}`);
+      }
+    } else {
+      throw new Error(`createInboundPlan failed: ${errDetail}`);
+    }
   }
 
   const { inboundPlanId, operationId: createOpId } = createRes ?? {};
