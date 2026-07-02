@@ -106,39 +106,74 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (const item of items) {
       console.log(`[fba-auto] Processing ${item.sku} x ${item.quantity}...`);
 
-      // Idempotency check: skip if an active fba_shipments row already exists
-      // for this transfer+SKU. Prevents duplicate Amazon plans when the caller
-      // retries (Vercel timeout, reconciler re-fire, manual re-run).
-      try {
-        const { data: existing, error: lookupErr } = await supabase
+      // Atomic idempotency reservation.
+      //
+      // Historical race (fixed 2026-07-02): the previous SELECT-then-INSERT
+      // guard had Amazon's createInboundPlan sitting inside its window. Two
+      // concurrent callers ~7s apart (TR-00203 CN-POW-WMNSCREATIORA-30SV)
+      // both passed the SELECT and both created independent Amazon plans.
+      //
+      // New approach: INSERT a `draft` reservation row BEFORE calling Amazon.
+      // A partial unique index (fba_shipments_active_transfer_sku_uniq) on
+      // (cin7_transfer_number, cin7_sku) WHERE status NOT IN
+      // ('cancelled','failed','voided') makes this atomic. If a concurrent
+      // caller already reserved, Postgres returns 23505 → we skip.
+      //
+      // Then later, onPlanCreated UPDATEs this reserved row with the real
+      // plan_id instead of INSERTing a fresh row.
+      let reservationId: string | null = null;
+      {
+        const { data: reserved, error: reserveErr } = await supabase
           .from('fba_shipments')
-          .select('id, status, plan_id, amazon_shipment_ids')
-          .eq('cin7_transfer_number', cin7_transfer_number)
-          .eq('cin7_sku', item.sku)
-          .not('status', 'in', '("failed","voided","cancelled")')
-          .maybeSingle();
+          .insert({
+            name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+            marketplace_id: 'ATVPDKIKX0DER',
+            ship_from_warehouse_id: warehouseId,
+            status: 'draft',
+            cin7_transfer_number,
+            cin7_sku: item.sku,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .select('id')
+          .single();
 
-        if (lookupErr) {
-          console.warn(`[fba-auto] Idempotency lookup failed for ${item.sku}: ${lookupErr.message}`);
-          // Fall through and process anyway — better to risk a dup than block forever
-        } else if (existing) {
-          console.log(
-            `[fba-auto] Skipping ${item.sku} — active fba_shipments record exists ` +
-              `(id=${existing.id} status=${existing.status} plan=${existing.plan_id})`
+        if (reserveErr) {
+          // 23505 = unique_violation → active row already exists for this
+          // (transfer, sku). Look it up and report as skipped.
+          if ((reserveErr as any).code === '23505') {
+            const { data: existing } = await supabase
+              .from('fba_shipments')
+              .select('id, status, plan_id, amazon_shipment_ids')
+              .eq('cin7_transfer_number', cin7_transfer_number)
+              .eq('cin7_sku', item.sku)
+              .not('status', 'in', '("failed","voided","cancelled")')
+              .maybeSingle();
+            console.log(
+              `[fba-auto] Skipping ${item.sku} — active reservation exists ` +
+                `(id=${existing?.id} status=${existing?.status} plan=${existing?.plan_id})`
+            );
+            results.push({
+              sku: item.sku,
+              status: 'skipped',
+              reason: `Already processed / in-flight — plan ${existing?.plan_id ?? 'pending'}, ` +
+                `${(existing?.amazon_shipment_ids as any[] | null)?.length || 0} shipments. ` +
+                `To re-run, mark the existing fba_shipments row status='cancelled' first.`,
+              existing_plan_id: existing?.plan_id,
+              existing_record_id: existing?.id,
+            });
+            continue;
+          }
+          // Non-unique error: log and fall through to processing (better to
+          // risk a dup than block forever on a transient DB hiccup).
+          console.warn(
+            `[fba-auto] Reservation insert failed for ${item.sku}: ${reserveErr.message} ` +
+              `(code=${(reserveErr as any).code}) — proceeding without reservation`
           );
-          results.push({
-            sku: item.sku,
-            status: 'skipped',
-            reason: `Already processed — plan ${existing.plan_id}, ` +
-              `${(existing.amazon_shipment_ids as any[] | null)?.length || 0} shipments. ` +
-              `If you need to re-run, mark the existing fba_shipments row status='cancelled' first.`,
-            existing_plan_id: existing.plan_id,
-            existing_record_id: existing.id,
-          });
-          continue;
+        } else {
+          reservationId = reserved?.id || null;
+          console.log(`[fba-auto] Reserved fba_shipments row ${reservationId} for ${item.sku}`);
         }
-      } catch (idemErr: any) {
-        console.warn(`[fba-auto] Idempotency check threw: ${idemErr?.message || idemErr}`);
       }
 
       // 1. Resolve CIN7 SKU → Amazon MSKU
@@ -189,42 +224,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // 4. Submit to Amazon FBA
       console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${productData.expirationDate}`);
 
-      // Early-persistence: write fba_shipments row with status='draft' as soon as
-      // the Amazon plan is created (Step 1). This means if later steps fail (e.g.
-      // FBA_INB_0117 on confirmTransportationOptions), the idempotency check at the
-      // top of this loop will find the row and skip re-creating a duplicate plan.
-      // NOTE: status='draft' is the only valid early state per fba_shipments_status_check
-      // (allowed: draft, plan_created, cancelled, failed, labels_ready).
-      let earlyRecordId: string | null = null;
+      // Early-persistence: the reservation row already exists (created above
+      // atomically before we called Amazon). Once Amazon returns a plan_id,
+      // UPDATE that row with the plan_id + box dims so downstream steps and
+      // any concurrent retriers can see the plan is bound to this reservation.
+      let earlyRecordId: string | null = reservationId;
       const onPlanCreated = async (planId: string) => {
+        if (!reservationId) {
+          // Reservation insert failed earlier (non-unique error). Fall back to
+          // inserting a fresh row so downstream code still has an id to update.
+          try {
+            const { data: earlyRec, error: earlyErr } = await supabase
+              .from('fba_shipments')
+              .insert({
+                name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+                marketplace_id: 'ATVPDKIKX0DER',
+                ship_from_warehouse_id: warehouseId,
+                status: 'draft',
+                plan_id: planId,
+                box_length: casePack.boxLength,
+                box_width: casePack.boxWidth,
+                box_height: casePack.boxHeight,
+                box_weight_lbs: casePack.boxWeightLbs,
+                cin7_transfer_number,
+                cin7_sku: item.sku,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              })
+              .select('id')
+              .single();
+            if (earlyErr) {
+              console.warn(`[fba-auto] Fallback early insert failed: ${earlyErr.message} (code=${earlyErr.code})`);
+            } else {
+              earlyRecordId = earlyRec?.id || null;
+              console.log(`[fba-auto] Fallback early row written: id=${earlyRecordId} plan=${planId}`);
+            }
+          } catch (e: any) {
+            console.warn(`[fba-auto] onPlanCreated fallback threw: ${e?.message || e}`);
+          }
+          return;
+        }
+        // Normal path: bind the plan_id + dims to our reserved row.
         try {
-          const { data: earlyRec, error: earlyErr } = await supabase
+          const { error: updErr } = await supabase
             .from('fba_shipments')
-            .insert({
-              name: `CIN7-${cin7_transfer_number}-${item.sku}`,
-              marketplace_id: 'ATVPDKIKX0DER',
-              ship_from_warehouse_id: warehouseId,
-              status: 'draft',
+            .update({
               plan_id: planId,
               box_length: casePack.boxLength,
               box_width: casePack.boxWidth,
               box_height: casePack.boxHeight,
               box_weight_lbs: casePack.boxWeightLbs,
-              cin7_transfer_number,
-              cin7_sku: item.sku,
-              created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             })
-            .select('id')
-            .single();
-          if (earlyErr) {
-            console.warn(`[fba-auto] Early fba_shipments insert failed: ${earlyErr.message} (code=${earlyErr.code})`);
+            .eq('id', reservationId);
+          if (updErr) {
+            console.warn(`[fba-auto] Bind plan_id to reservation failed: ${updErr.message} (code=${updErr.code})`);
           } else {
-            earlyRecordId = earlyRec?.id || null;
-            console.log(`[fba-auto] Early fba_shipments row written (draft): id=${earlyRecordId} plan=${planId}`);
+            console.log(`[fba-auto] Bound plan ${planId} to reservation ${reservationId}`);
           }
         } catch (e: any) {
-          console.warn(`[fba-auto] onPlanCreated threw: ${e?.message || e}`);
+          console.warn(`[fba-auto] onPlanCreated update threw: ${e?.message || e}`);
         }
       };
 
@@ -241,8 +300,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       let partneredAttempts: PartneredUnavailableError[] = [];
 
       for (let attempt = 1; attempt <= MAX_PARTNERED_RETRIES; attempt++) {
-        // Reset early-record state for this attempt (each attempt creates a fresh plan + row)
+        // Reset early-record state for this attempt. Each retry creates a fresh
+        // plan + row — the cancelled reservation from the previous attempt is
+        // out of the partial unique index, so onPlanCreated's fallback INSERT
+        // will succeed.
         earlyRecordId = null;
+        if (attempt > 1) reservationId = null;
         try {
           fbaResult = await createFbaInboundShipment(
             warehouseId,
