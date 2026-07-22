@@ -5,6 +5,8 @@
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
 
+import type { LotAvailability } from './lot-allocation';
+
 interface CasePackData {
   caseQuantity: number;
   boxLength: number;
@@ -20,6 +22,7 @@ interface ProductData {
   casePack: CasePackData | null;
   expirationDate: string | null;
   lotNumber: string | null;
+  isKit: boolean;
 }
 
 /**
@@ -260,7 +263,74 @@ export async function getShipHeroProductData(
     casePack,
     expirationDate,
     lotNumber,
+    isKit,
   };
+}
+
+/**
+ * Per-lot availability for a SKU, aggregated across warehouse locations.
+ *
+ * ShipHero's `Lot` type has NO quantity field — per-lot quantity must be
+ * derived from warehouse_products → locations → expiration_lot (verified
+ * against the live schema 2026-07-22). Locations with expiration_lot: null
+ * (untracked stock) and inactive lots are excluded.
+ */
+export async function getLotBreakdown(
+  shipheroToken: string,
+  sku: string,
+): Promise<LotAvailability[]> {
+  const query = `{
+    warehouse_products(sku: "${sku}") {
+      data(first: 5) {
+        edges {
+          node {
+            sku
+            locations(first: 200) {
+              edges {
+                node {
+                  quantity
+                  expiration_lot { name expires_at is_active }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`;
+
+  const resp = await fetch(SHIPHERO_API, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${shipheroToken}`,
+    },
+    body: JSON.stringify({ query }),
+  });
+  const json: any = await resp.json();
+  if (json.errors) {
+    throw new Error(`ShipHero lot breakdown error for ${sku}: ${JSON.stringify(json.errors)}`);
+  }
+
+  const byLot = new Map<string, LotAvailability>();
+  for (const we of json.data?.warehouse_products?.data?.edges || []) {
+    for (const le of we.node?.locations?.edges || []) {
+      const n = le.node;
+      const lot = n?.expiration_lot;
+      if (!lot?.name || !lot.is_active || !lot.expires_at) continue;
+      const cur = byLot.get(lot.name);
+      if (cur) {
+        cur.availableQty += n.quantity || 0;
+      } else {
+        byLot.set(lot.name, {
+          name: lot.name,
+          expiresAt: lot.expires_at,
+          availableQty: n.quantity || 0,
+        });
+      }
+    }
+  }
+  return Array.from(byLot.values());
 }
 
 /**
