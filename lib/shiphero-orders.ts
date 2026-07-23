@@ -1,5 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { ShipHeroCredentials, ShipHeroOrderCreateResult, ShipHeroTransferOrderInput } from './cin7-transfer-types';
+import { getShipHeroProductData, getLotBreakdown } from './shiphero-product-data';
+import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from './lot-allocation';
 
 const SHIPHERO_GRAPHQL_ENDPOINT = 'https://public-api.shiphero.com/graphql';
 
@@ -178,11 +180,23 @@ async function createOrderViaGraphQL(credentials: ShipHeroCredentials, input: Sh
 }
 
 /**
- * Create a ShipHero Wholesale Order for FBA transfers.
- * Supports lot-aware FEFO picking from non-pickable locations.
+ * Create ONE ShipHero wholesale order (create + FEFO auto-allocate).
+ * Extracted so the lot-split fan-out can create N of these per transfer.
  */
-async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, input: ShipHeroTransferOrderInput) {
-  console.log(`[shiphero-orders] Creating WHOLESALE order for FBA transfer: ${input.orderNumber}`);
+async function createOneWholesaleOrder(
+  credentials: ShipHeroCredentials,
+  input: ShipHeroTransferOrderInput,
+  overrides?: {
+    orderNumber?: string;
+    partnerOrderId?: string;
+    packingNote?: string;
+    lineItems?: Array<{ sku: string; quantity: number }>;
+  }
+) {
+  const orderNumber = overrides?.orderNumber || input.orderNumber;
+  const partnerOrderId = overrides?.partnerOrderId || input.externalOrderId;
+  const packingNote = overrides?.packingNote || input.notes || `FBA Transfer: ${input.orderNumber}`;
+  const lineItems = overrides?.lineItems || (input.partnerLineItems || []);
 
   const createMutation = `
     mutation WholesaleOrderCreate($data: CreateWholesaleOrderInput!) {
@@ -200,9 +214,6 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
     }
   `;
 
-  // Build packing note with lot/expiration info
-  const packingNote = input.notes || `FBA Transfer: ${input.orderNumber}`;
-
   const response = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
     method: 'POST',
     headers: {
@@ -213,8 +224,8 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
       query: createMutation,
       variables: {
         data: {
-          order_number: input.orderNumber,
-          partner_order_id: input.externalOrderId,
+          order_number: orderNumber,
+          partner_order_id: partnerOrderId,
           customer_account_id: '95145',
           fulfillment_status: 'pending',
           shipping_option: 'FREIGHT',
@@ -223,11 +234,11 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
           skip_address_validation: true,
           ignore_address_validation_errors: true,
           shipping_address: input.shippingAddress,
-          line_items: (input.partnerLineItems || []).map((item, idx) => ({
+          line_items: lineItems.map((item, idx) => ({
             sku: item.sku,
             quantity: item.quantity,
             price: '0.00',
-            partner_line_item_id: `${input.orderNumber}-line-${idx + 1}`,
+            partner_line_item_id: `${orderNumber}-line-${idx + 1}`,
             warehouse_id: 'V2FyZWhvdXNlOjEzNTg3Mg==',
           })),
           tags: [...(input.tags || []), 'FBA', 'Wholesale'],
@@ -253,9 +264,11 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
   }
 
   const orderId = String(order.id);
-  const wholesaleId = order.wholesale_order?.id || orderId;
 
-  // Auto-allocate picking with FEFO (First Expired, First Out) from non-pickable locations
+  // Auto-allocate picking with FEFO (First Expired, First Out) from non-pickable locations.
+  // Done immediately after create — for lot-split children this sequential
+  // create→allocate ordering is what steers each child order onto its intended
+  // lot (ShipHero's FEFO allocator consumes the earliest lot first).
   console.log(`[shiphero-orders] Auto-allocating wholesale order ${orderId} with FEFO...`);
   try {
     const allocateMutation = `
@@ -297,8 +310,143 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
 
   return {
     shipheroOrderId: orderId,
-    shipheroOrderNumber: order.order_number || order.legacy_id || input.orderNumber,
+    shipheroOrderNumber: order.order_number || order.legacy_id || orderNumber,
     responsePayload: json,
+  };
+}
+
+/**
+ * Compute the per-lot allocation plan for a transfer's line items.
+ * Returns null when the transfer should use the LEGACY single-order path:
+ * kits, missing case pack, no lot-tracked stock, or insufficient lot capacity.
+ */
+async function computeLotSplitPlan(
+  accessToken: string,
+  input: ShipHeroTransferOrderInput,
+): Promise<Array<{ sku: string; lot: LotAllocation }> | null> {
+  const plan: Array<{ sku: string; lot: LotAllocation }> = [];
+
+  for (const item of input.partnerLineItems || []) {
+    let productData;
+    try {
+      productData = await getShipHeroProductData(accessToken, item.sku);
+    } catch (err: any) {
+      console.warn(`[lot-split] product data fetch failed for ${item.sku} — legacy path: ${err?.message}`);
+      return null;
+    }
+
+    if (productData.isKit) {
+      console.log(`[lot-split] ${item.sku} is a kit — using legacy single-shipment path`);
+      return null;
+    }
+    if (!productData.casePack?.caseQuantity) {
+      console.log(`[lot-split] ${item.sku} has no case pack data — using legacy single-shipment path`);
+      return null;
+    }
+
+    let lots;
+    try {
+      lots = await getLotBreakdown(accessToken, item.sku);
+    } catch (err: any) {
+      console.warn(`[lot-split] lot breakdown failed for ${item.sku} — legacy path: ${err?.message}`);
+      return null;
+    }
+    if (!lots.length) {
+      console.log(`[lot-split] ${item.sku} has no lot-tracked stock — using legacy single-shipment path`);
+      return null;
+    }
+
+    let allocations: LotAllocation[];
+    try {
+      allocations = allocateFefoByLot(lots, item.quantity, productData.casePack.caseQuantity);
+    } catch (err: any) {
+      // Stock math shouldn't block the bridge — auto-submit does its own gate.
+      console.warn(`[lot-split] allocation failed for ${item.sku} — legacy path: ${err?.message}`);
+      return null;
+    }
+
+    for (const lot of allocations) {
+      plan.push({ sku: item.sku, lot });
+    }
+  }
+
+  return plan.length ? plan : null;
+}
+
+/**
+ * Create ShipHero Wholesale Order(s) for FBA transfers.
+ * Supports lot-aware FEFO picking from non-pickable locations.
+ *
+ * LOT SPLIT (2026-07-22): non-kit SKUs with lot-tracked stock fan out into
+ * ONE wholesale order PER LOT (FEFO order, full-case multiples) so each
+ * physical shipment contains a single lot. Kits / missing case pack /
+ * insufficient lot data fall back to the legacy single-order behavior.
+ */
+async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, input: ShipHeroTransferOrderInput) {
+  console.log(`[shiphero-orders] Creating WHOLESALE order(s) for FBA transfer: ${input.orderNumber}`);
+
+  const lotPlan = await computeLotSplitPlan(credentials.accessToken, input);
+
+  if (!lotPlan) {
+    // Legacy: one order for the whole transfer.
+    return createOneWholesaleOrder(credentials, input);
+  }
+
+  console.log(
+    `[lot-split] ${input.orderNumber}: splitting into ${lotPlan.length} order(s): ` +
+      lotPlan.map((p) => `${p.sku}@${p.lot.name}=${p.lot.qty}`).join(', ')
+  );
+
+  // Create child orders SEQUENTIALLY in plan order (FEFO within each SKU) so
+  // ShipHero's allocator consumes lot N before child N+1 allocates.
+  const childOrders: Array<{
+    orderId: string;
+    orderNumber: string;
+    sku: string;
+    lot: string;
+    expiresAt: string;
+    qty: number;
+    cases: number;
+  }> = [];
+  let firstResponsePayload: any = null;
+
+  for (const { sku, lot } of lotPlan) {
+    const lotSuffix = sanitizeLotName(lot.name);
+    const childNumber = `${input.orderNumber}-${lotSuffix}`;
+    const childPartnerId = `${input.externalOrderId}:${lotSuffix}`;
+    const packingNote =
+      `Lot ${lot.name} · Exp ${lot.expiresAt} · ${lot.qty} units (${lot.cases} cases) · SINGLE LOT — DO NOT MIX\n` +
+      (input.notes || '');
+
+    const result = await createOneWholesaleOrder(credentials, input, {
+      orderNumber: childNumber,
+      partnerOrderId: childPartnerId,
+      packingNote,
+      lineItems: [{ sku, quantity: lot.qty }],
+    });
+
+    if (!firstResponsePayload) firstResponsePayload = result.responsePayload;
+    childOrders.push({
+      orderId: result.shipheroOrderId,
+      orderNumber: result.shipheroOrderNumber,
+      sku,
+      lot: lot.name,
+      expiresAt: lot.expiresAt,
+      qty: lot.qty,
+      cases: lot.cases,
+    });
+    console.log(`[lot-split] Created child order ${result.shipheroOrderNumber} (${result.shipheroOrderId}) for lot ${lot.name}`);
+  }
+
+  // Return shape: first child (earliest lot) as the primary order, full list in payload.
+  return {
+    shipheroOrderId: childOrders[0].orderId,
+    shipheroOrderNumber: childOrders[0].orderNumber,
+    responsePayload: {
+      lot_split: true,
+      child_orders: childOrders,
+      first_order_response: firstResponsePayload,
+    },
   };
 }
 

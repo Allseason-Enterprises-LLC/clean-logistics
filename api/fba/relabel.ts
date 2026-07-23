@@ -160,10 +160,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
   const cases = unitsPerBox > 0 ? Math.ceil(totalUnits / unitsPerBox) : 0;
 
-  // 4) Re-run post-process
+  // 4) Re-run post-process. Lot-split rows carry cin7_lot/lot_expiration —
+  // prefer those over the live product lookup so relabels stay lot-true.
   try {
+    const lotName: string | undefined = row.cin7_lot || productData?.lotNumber || undefined;
+    const lotExp: string | undefined = row.lot_expiration || productData?.expirationDate || undefined;
     const result = await postProcessFbaShipment({
       cin7TransferNumber: row.cin7_transfer_number || cin7_transfer_number,
+      shipheroOrderNumberOverride: row.cin7_lot
+        ? `${row.cin7_transfer_number}-${String(row.cin7_lot).replace(/[^A-Za-z0-9_-]/g, '')}`
+        : undefined,
       fbaResult: {
         planId,
         shipmentIds: internalShipmentIds,
@@ -187,8 +193,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         height: Number(row.box_height) || 0,
         weightLbs: Number(row.box_weight_lbs) || 0,
       },
-      expiration: productData?.expirationDate || undefined,
-      lot: productData?.lotNumber || undefined,
+      expiration: lotExp,
+      lot: lotName,
     });
 
     return res.status(result.errors.length > 0 ? 207 : 200).json({

@@ -7,6 +7,13 @@ const SUPABASE_BUCKET = 'shipment-labels';
 export interface PostProcessInput {
   /** CIN7-TR-XXXXX — used for folder naming + ShipHero order lookup */
   cin7TransferNumber: string;
+  /**
+   * Lot-split child order number (e.g. CIN7-TR-00123-CN61522602). When set,
+   * the ShipHero order lookup tries this first so labels/notes attach to the
+   * per-lot child order instead of a legacy parent. Falls back to
+   * cin7TransferNumber if not found.
+   */
+  shipheroOrderNumberOverride?: string;
   /** Output of runFbaInboundWorkflow */
   fbaResult: {
     planId?: string;
@@ -380,11 +387,25 @@ export async function postProcessFbaShipment(
     console.warn('[fba-post-process] Could not fetch placement fee:', e);
   }
 
-  // Process each shipment: fetch label → upload → attach
+  // Process each shipment: fetch label → upload → attach.
+  // Lot-split: try the per-lot child order first (e.g. CIN7-TR-00123-CN61522602),
+  // fall back to the legacy transfer-level order number.
   const shToken = await getShipHeroToken();
-  const shOrder = await findShipheroOrder(shToken, input.cin7TransferNumber);
+  let shOrder = input.shipheroOrderNumberOverride
+    ? await findShipheroOrder(shToken, input.shipheroOrderNumberOverride)
+    : null;
+  let shOrderNumber = input.shipheroOrderNumberOverride || input.cin7TransferNumber;
   if (!shOrder) {
-    throw new Error(`ShipHero order not found for ${input.cin7TransferNumber}`);
+    if (input.shipheroOrderNumberOverride) {
+      console.warn(
+        `[fba-post-process] Child order ${input.shipheroOrderNumberOverride} not found — falling back to ${input.cin7TransferNumber}`
+      );
+    }
+    shOrder = await findShipheroOrder(shToken, input.cin7TransferNumber);
+    shOrderNumber = input.cin7TransferNumber;
+  }
+  if (!shOrder) {
+    throw new Error(`ShipHero order not found for ${input.shipheroOrderNumberOverride || input.cin7TransferNumber}`);
   }
   result.shipheroOrderId = shOrder.orderId;
 
@@ -396,7 +417,9 @@ export async function postProcessFbaShipment(
       const det = await getShipmentDetails(planId, internalId);
       const slug = destinationSlug(det.destinationCity, det.destinationState);
       const filename = `${det.fbaId}-${slug}-${det.nBoxes}boxes.pdf`;
-      const objectPath = `${input.cin7TransferNumber.replace(/^CIN7-/, '')}/${filename}`;
+      // Per-lot subfolder keeps label PDFs from colliding across sibling lot shipments.
+      const lotFolder = input.lot ? `/${input.lot.replace(/[^A-Za-z0-9_-]/g, '')}` : '';
+      const objectPath = `${input.cin7TransferNumber.replace(/^CIN7-/, '')}${lotFolder}/${filename}`;
 
       // Fetch + upload
       const pdfBytes = await fetchLabelPdf(det.fbaId, det.nBoxes, det.boxIds);
@@ -486,7 +509,7 @@ function buildTelegramMessage(input: PostProcessInput, result: PostProcessResult
   lines.push(`• Box Dims: ${input.box.length} × ${input.box.width} × ${input.box.height} inches, ${input.box.weightLbs} lbs/case`);
   lines.push(`• Ship From: Clean Nutra, 6425 S Jones Blvd, Las Vegas NV 89118`);
   lines.push('');
-  lines.push(`*ShipHero Order:* ${input.cin7TransferNumber}`);
+  lines.push(`*ShipHero Order:* ${input.shipheroOrderNumberOverride || input.cin7TransferNumber}`);
   lines.push(`*Inbound Plan:* \`${input.fbaResult.planId}\``);
   lines.push('');
   lines.push(`*Amazon Optimized Splits — ${result.labels.length} destination(s) (Partnered UPS Ground):*`);
@@ -504,7 +527,7 @@ function buildTelegramMessage(input: PostProcessInput, result: PostProcessResult
     lines.push(`• [${l.destination} (${l.boxes})](${l.supabaseUrl})`);
   }
   lines.push('');
-  lines.push(`(Labels also attached to ShipHero order \`${input.cin7TransferNumber}\` + in packing note)`);
+  lines.push(`(Labels also attached to ShipHero order \`${input.shipheroOrderNumberOverride || input.cin7TransferNumber}\` + in packing note)`);
   lines.push('');
   lines.push(`*Prep:* FNSKU labeling — apply one unique label per box · SELLER`);
   lines.push('');

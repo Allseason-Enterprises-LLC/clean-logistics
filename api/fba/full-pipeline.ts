@@ -192,6 +192,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     // Fallback: create the order if bridge hasn't run
+    // NOTE (lot-split 2026-07-22): this manual fallback intentionally keeps the
+    // legacy single-order behavior. The primary automated path (CIN7 bridge →
+    // createShipHeroOrderFromCIN7Transfer → auto-submit) fans out one wholesale
+    // order + one Amazon plan PER LOT. This endpoint is a rare manual path with
+    // its own FBA-* naming; if it ever becomes primary, wire it through
+    // computeLotSplitPlan in lib/shiphero-orders.ts.
     if (!shipheroFound) {
       console.log('[full-pipeline] Step 2: Bridge order not found, creating manually...');
       const orderNumber = `FBA-${cin7TaskId.slice(0, 8)}-${Date.now()}`;

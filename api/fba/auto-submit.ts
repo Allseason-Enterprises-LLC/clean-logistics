@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
-import { getShipHeroProductData, getShipHeroToken } from '../../lib/shiphero-product-data';
+import { getShipHeroProductData, getShipHeroToken, getLotBreakdown } from '../../lib/shiphero-product-data';
+import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from '../../lib/lot-allocation';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
 import { postProcessFbaShipment } from '../../lib/fba-post-process';
 import { PartneredUnavailableError } from '../../lib/fba-inbound';
@@ -106,76 +107,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     for (const item of items) {
       console.log(`[fba-auto] Processing ${item.sku} x ${item.quantity}...`);
 
-      // Atomic idempotency reservation.
-      //
-      // Historical race (fixed 2026-07-02): the previous SELECT-then-INSERT
-      // guard had Amazon's createInboundPlan sitting inside its window. Two
-      // concurrent callers ~7s apart (TR-00203 CN-POW-WMNSCREATIORA-30SV)
-      // both passed the SELECT and both created independent Amazon plans.
-      //
-      // New approach: INSERT a `draft` reservation row BEFORE calling Amazon.
-      // A partial unique index (fba_shipments_active_transfer_sku_uniq) on
-      // (cin7_transfer_number, cin7_sku) WHERE status NOT IN
-      // ('cancelled','failed','voided') makes this atomic. If a concurrent
-      // caller already reserved, Postgres returns 23505 → we skip.
-      //
-      // Then later, onPlanCreated UPDATEs this reserved row with the real
-      // plan_id instead of INSERTing a fresh row.
-      let reservationId: string | null = null;
-      {
-        const { data: reserved, error: reserveErr } = await supabase
-          .from('fba_shipments')
-          .insert({
-            name: `CIN7-${cin7_transfer_number}-${item.sku}`,
-            marketplace_id: 'ATVPDKIKX0DER',
-            ship_from_warehouse_id: warehouseId,
-            status: 'draft',
-            cin7_transfer_number,
-            cin7_sku: item.sku,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .select('id')
-          .single();
-
-        if (reserveErr) {
-          // 23505 = unique_violation → active row already exists for this
-          // (transfer, sku). Look it up and report as skipped.
-          if ((reserveErr as any).code === '23505') {
-            const { data: existing } = await supabase
-              .from('fba_shipments')
-              .select('id, status, plan_id, amazon_shipment_ids')
-              .eq('cin7_transfer_number', cin7_transfer_number)
-              .eq('cin7_sku', item.sku)
-              .not('status', 'in', '("failed","voided","cancelled")')
-              .maybeSingle();
-            console.log(
-              `[fba-auto] Skipping ${item.sku} — active reservation exists ` +
-                `(id=${existing?.id} status=${existing?.status} plan=${existing?.plan_id})`
-            );
-            results.push({
-              sku: item.sku,
-              status: 'skipped',
-              reason: `Already processed / in-flight — plan ${existing?.plan_id ?? 'pending'}, ` +
-                `${(existing?.amazon_shipment_ids as any[] | null)?.length || 0} shipments. ` +
-                `To re-run, mark the existing fba_shipments row status='cancelled' first.`,
-              existing_plan_id: existing?.plan_id,
-              existing_record_id: existing?.id,
-            });
-            continue;
-          }
-          // Non-unique error: log and fall through to processing (better to
-          // risk a dup than block forever on a transient DB hiccup).
-          console.warn(
-            `[fba-auto] Reservation insert failed for ${item.sku}: ${reserveErr.message} ` +
-              `(code=${(reserveErr as any).code}) — proceeding without reservation`
-          );
-        } else {
-          reservationId = reserved?.id || null;
-          console.log(`[fba-auto] Reserved fba_shipments row ${reservationId} for ${item.sku}`);
-        }
-      }
-
       // 1. Resolve CIN7 SKU → Amazon MSKU
       const skuMapping = await lookupSkuMapping(item.sku);
       if (!skuMapping?.amz_sku) {
@@ -193,6 +124,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         casePack: productData.casePack,
         expiration: productData.expirationDate,
         lot: productData.lotNumber,
+        isKit: productData.isKit,
       }));
 
       if (!productData.casePack) {
@@ -213,16 +145,134 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         continue;
       }
 
-      // 3. Calculate box count
       const casePack = productData.casePack;
-      const totalQty = item.quantity;
-      const numBoxes = Math.ceil(totalQty / casePack.caseQuantity);
       const unitsPerBox = casePack.caseQuantity;
 
-      console.log(`[fba-auto] ${totalQty} units ÷ ${unitsPerBox} per case = ${numBoxes} boxes`);
+      // 3. LOT SPLIT: one Amazon plan per lot (FEFO, full-case multiples), each
+      // carrying that lot's TRUE expiration from ShipHero. Kits and SKUs without
+      // lot-tracked stock fall back to a single "lot" using the legacy earliest
+      // expiration (unchanged behavior).
+      let lotPlan: LotAllocation[];
+      if (!productData.isKit) {
+        const lots = await getLotBreakdown(shipheroToken, item.sku);
+        if (lots.length) {
+          try {
+            lotPlan = allocateFefoByLot(lots, item.quantity, unitsPerBox);
+          } catch (allocErr: any) {
+            results.push({
+              sku: item.sku,
+              status: 'failed',
+              error: `Lot allocation failed: ${allocErr?.message}`,
+            });
+            continue;
+          }
+        } else {
+          console.log(`[fba-auto] ${item.sku} has no lot-tracked stock — single legacy shipment`);
+          lotPlan = [{
+            name: productData.lotNumber ?? 'UNKNOWN',
+            expiresAt: productData.expirationDate.slice(0, 10),
+            qty: item.quantity,
+            cases: Math.ceil(item.quantity / unitsPerBox),
+          }];
+        }
+      } else {
+        console.log(`[fba-auto] ${item.sku} is a kit — single legacy shipment (earliest component expiry)`);
+        lotPlan = [{
+          name: productData.lotNumber ?? 'UNKNOWN',
+          expiresAt: productData.expirationDate.slice(0, 10),
+          qty: item.quantity,
+          cases: Math.ceil(item.quantity / unitsPerBox),
+        }];
+      }
+
+      console.log(
+        `[fba-auto] Lot plan for ${item.sku}: ` +
+          lotPlan.map((l) => `${l.name}=${l.qty}u/${l.cases}c exp ${l.expiresAt}`).join(', ')
+      );
+
+      for (const lot of lotPlan) {
+      const totalQty = lot.qty;
+      const numBoxes = lot.cases;
+      const lotSuffix = sanitizeLotName(lot.name);
+
+      // Atomic idempotency reservation (per transfer+sku+lot).
+      //
+      // Historical race (fixed 2026-07-02): the previous SELECT-then-INSERT
+      // guard had Amazon's createInboundPlan sitting inside its window. Two
+      // concurrent callers ~7s apart (TR-00203 CN-POW-WMNSCREATIORA-30SV)
+      // both passed the SELECT and both created independent Amazon plans.
+      //
+      // New approach: INSERT a `draft` reservation row BEFORE calling Amazon.
+      // A partial unique index (fba_shipments_active_transfer_sku_lot_uniq) on
+      // (cin7_transfer_number, cin7_sku, cin7_lot) WHERE status NOT IN
+      // ('cancelled','failed','voided') makes this atomic. If a concurrent
+      // caller already reserved, Postgres returns 23505 → we skip.
+      //
+      // Then later, onPlanCreated UPDATEs this reserved row with the real
+      // plan_id instead of INSERTing a fresh row.
+      let reservationId: string | null = null;
+      {
+        const { data: reserved, error: reserveErr } = await supabase
+          .from('fba_shipments')
+          .insert({
+            name: `CIN7-${cin7_transfer_number}-${item.sku}-${lotSuffix}`,
+            marketplace_id: 'ATVPDKIKX0DER',
+            ship_from_warehouse_id: warehouseId,
+            status: 'draft',
+            cin7_transfer_number,
+            cin7_sku: item.sku,
+            cin7_lot: lot.name,
+            lot_expiration: lot.expiresAt,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .select('id')
+          .single();
+
+        if (reserveErr) {
+          // 23505 = unique_violation → active row already exists for this
+          // (transfer, sku, lot). Look it up and report as skipped.
+          if ((reserveErr as any).code === '23505') {
+            const { data: existing } = await supabase
+              .from('fba_shipments')
+              .select('id, status, plan_id, amazon_shipment_ids')
+              .eq('cin7_transfer_number', cin7_transfer_number)
+              .eq('cin7_sku', item.sku)
+              .eq('cin7_lot', lot.name)
+              .not('status', 'in', '("failed","voided","cancelled")')
+              .maybeSingle();
+            console.log(
+              `[fba-auto] Skipping ${item.sku} lot ${lot.name} — active reservation exists ` +
+                `(id=${existing?.id} status=${existing?.status} plan=${existing?.plan_id})`
+            );
+            results.push({
+              sku: item.sku,
+              lot: lot.name,
+              status: 'skipped',
+              reason: `Already processed / in-flight — plan ${existing?.plan_id ?? 'pending'}, ` +
+                `${(existing?.amazon_shipment_ids as any[] | null)?.length || 0} shipments. ` +
+                `To re-run, mark the existing fba_shipments row status='cancelled' first.`,
+              existing_plan_id: existing?.plan_id,
+              existing_record_id: existing?.id,
+            });
+            continue;
+          }
+          // Non-unique error: log and fall through to processing (better to
+          // risk a dup than block forever on a transient DB hiccup).
+          console.warn(
+            `[fba-auto] Reservation insert failed for ${item.sku} lot ${lot.name}: ${reserveErr.message} ` +
+              `(code=${(reserveErr as any).code}) — proceeding without reservation`
+          );
+        } else {
+          reservationId = reserved?.id || null;
+          console.log(`[fba-auto] Reserved fba_shipments row ${reservationId} for ${item.sku} lot ${lot.name}`);
+        }
+      }
+
+      console.log(`[fba-auto] ${totalQty} units ÷ ${unitsPerBox} per case = ${numBoxes} boxes (lot ${lot.name})`);
 
       // 4. Submit to Amazon FBA
-      console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${productData.expirationDate}`);
+      console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${lot.expiresAt} (lot ${lot.name})`);
 
       // Early-persistence: the reservation row already exists (created above
       // atomically before we called Amazon). Once Amazon returns a plan_id,
@@ -237,7 +287,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             const { data: earlyRec, error: earlyErr } = await supabase
               .from('fba_shipments')
               .insert({
-                name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+                name: `CIN7-${cin7_transfer_number}-${item.sku}-${lotSuffix}`,
                 marketplace_id: 'ATVPDKIKX0DER',
                 ship_from_warehouse_id: warehouseId,
                 status: 'draft',
@@ -248,6 +298,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
                 box_weight_lbs: casePack.boxWeightLbs,
                 cin7_transfer_number,
                 cin7_sku: item.sku,
+                cin7_lot: lot.name,
+                lot_expiration: lot.expiresAt,
                 created_at: new Date().toISOString(),
                 updated_at: new Date().toISOString(),
               })
@@ -314,7 +366,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               quantity: totalQty,
               casePack: unitsPerBox,
               cases: numBoxes,
-              expiration: productData.expirationDate,
+              expiration: lot.expiresAt,
             }],
             {
               length: casePack.boxLength,
@@ -376,6 +428,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           `\n` +
           `*Transfer:* ${cin7_transfer_number}\n` +
           `*SKU:* \`${item.sku}\` (Amazon: \`${skuMapping.amz_sku}\`)\n` +
+          `*Lot:* \`${lot.name}\` (exp ${lot.expiresAt})\n` +
           `*Quantity:* ${totalQty} units, ${numBoxes} boxes\n` +
           `*Box:* ${casePack.boxLength}×${casePack.boxWidth}×${casePack.boxHeight} in, ${casePack.boxWeightLbs} lbs\n` +
           `\n` +
@@ -396,6 +449,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
         results.push({
           sku: item.sku,
+          lot: lot.name,
           status: 'failed',
           error: `Partnered unavailable after ${MAX_PARTNERED_RETRIES} retries (alert sent to FBA channel)`,
           partnered_attempts: partneredAttempts.length,
@@ -432,7 +486,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           const { data: rec, error: recErr } = await supabase
             .from('fba_shipments')
             .insert({
-              name: `CIN7-${cin7_transfer_number}-${item.sku}`,
+              name: `CIN7-${cin7_transfer_number}-${item.sku}-${lotSuffix}`,
               marketplace_id: 'ATVPDKIKX0DER',
               ship_from_warehouse_id: warehouseId,
               status: 'plan_created',
@@ -444,6 +498,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               box_weight_lbs: casePack.boxWeightLbs,
               cin7_transfer_number,
               cin7_sku: item.sku,
+              cin7_lot: lot.name,
+              lot_expiration: lot.expiresAt,
               prep_instructions: fbaResult.prepInstructions || fbaResult.prep_instructions || null,
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
@@ -465,6 +521,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       try {
         postProcess = await postProcessFbaShipment({
           cin7TransferNumber: cin7_transfer_number,
+          shipheroOrderNumberOverride: `${cin7_transfer_number}-${lotSuffix}`,
           fbaResult: {
             planId: fbaResult.planId || fbaResult.plan_id,
             shipmentIds,
@@ -488,8 +545,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
             height: casePack.boxHeight,
             weightLbs: casePack.boxWeightLbs,
           },
-          expiration: productData.expirationDate ?? undefined,
-          lot: productData.lotNumber ?? undefined,
+          expiration: lot.expiresAt,
+          lot: lot.name,
         });
         console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments, telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
 
@@ -521,8 +578,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         units_per_box: unitsPerBox,
         box_dims: `${casePack.boxLength}x${casePack.boxWidth}x${casePack.boxHeight} in`,
         box_weight: `${casePack.boxWeightLbs} lbs`,
-        expiration: productData.expirationDate,
-        lot: productData.lotNumber,
+        expiration: lot.expiresAt,
+        lot: lot.name,
         amazon_shipment_ids: shipmentIds,
         shipment_confirmation_ids: confirmationIds,
         labels: postProcess?.labels ?? [],
@@ -534,6 +591,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         post_process_errors: postProcess?.errors ?? [],
         prep: fbaResult.prepInstructions || fbaResult.prep_instructions,
       });
+      } // end lot loop
     }
 
     res.status(200).json({
