@@ -84,12 +84,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const { cin7_transfer_number, items } = req.body;
+    const chainDepth = Number(req.body.chain_depth ?? 0);
 
     if (!cin7_transfer_number || !items?.length) {
       return res.status(400).json({
         error: 'Required: cin7_transfer_number, items (array of {sku, quantity})',
       });
     }
+
+    // ---- Multi-lot timeout guard (added 2026-08-01 after TR-00242/00283) ----
+    // Each lot = a full Amazon inbound workflow (plan→pack→place→partnered→labels,
+    // ~2-4 min). Running N lots sequentially blows the 300s maxDuration mid-lot,
+    // leaving an OFFERED plan + frozen draft row. Instead: once we've completed at
+    // least one real lot AND the elapsed time passes the soft deadline, DEFER the
+    // remaining lots and self-chain (re-invoke this endpoint with the same payload;
+    // the (transfer,sku,lot) dedup index skips finished lots).
+    const startedAt = Date.now();
+    const SOFT_DEADLINE_MS = Number(process.env.FBA_LOT_SOFT_DEADLINE_MS || 60_000);
+    const MAX_CHAIN_DEPTH = 6;
+    let lotsProcessedThisRun = 0;
+    const deferredLots: Array<{ sku: string; lot: string }> = [];
 
     const supabaseUrl = process.env.SUPABASE_URL!;
     const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -195,6 +209,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const numBoxes = lot.cases;
       const lotSuffix = sanitizeLotName(lot.name);
 
+      // Timeout guard: if we've already burned past the soft deadline and have
+      // completed at least one lot this run, defer the rest to a chained
+      // invocation rather than dying mid-Amazon-workflow. (Deferral happens
+      // BEFORE the reservation insert, so deferred lots stay unreserved.)
+      if (lotsProcessedThisRun > 0 && Date.now() - startedAt > SOFT_DEADLINE_MS) {
+        console.log(
+          `[fba-auto] Soft deadline (${SOFT_DEADLINE_MS}ms) exceeded — deferring ${item.sku} lot ${lot.name} to chained invocation`
+        );
+        deferredLots.push({ sku: item.sku, lot: lot.name });
+        results.push({ sku: item.sku, lot: lot.name, status: 'deferred', reason: 'soft deadline — will be picked up by self-chained re-invocation' });
+        continue;
+      }
+
       // Atomic idempotency reservation (per transfer+sku+lot).
       //
       // Historical race (fixed 2026-07-02): the previous SELECT-then-INSERT
@@ -270,6 +297,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
 
       console.log(`[fba-auto] ${totalQty} units ÷ ${unitsPerBox} per case = ${numBoxes} boxes (lot ${lot.name})`);
+      lotsProcessedThisRun++; // real Amazon work begins for this lot
 
       // 4. Submit to Amazon FBA
       console.log(`[fba-auto] Submitting to Amazon: ${skuMapping.amz_sku} x ${totalQty}, ${numBoxes} boxes of ${unitsPerBox} each, exp ${lot.expiresAt} (lot ${lot.name})`);
@@ -594,11 +622,58 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       } // end lot loop
     }
 
+    // ---- Self-chain deferred lots (multi-lot timeout guard) ----
+    // Re-invoke this same endpoint with the ORIGINAL payload. The dedup index
+    // skips every lot already reserved/completed, so the chained run converges
+    // on the deferred lots with a fresh 300s budget. We only wait ~8s for the
+    // request to be delivered (the chained invocation runs independently).
+    if (deferredLots.length > 0) {
+      if (chainDepth >= MAX_CHAIN_DEPTH) {
+        const msg =
+          `🚨 *FBA Pipeline: chain depth ${chainDepth} exhausted on ${cin7_transfer_number}* — ` +
+          `${deferredLots.length} lot(s) still pending: ` +
+          deferredLots.map((d) => `\`${d.sku}/${d.lot}\``).join(', ') +
+          `. Re-fire auto-submit manually with the same payload.`;
+        console.error(`[fba-auto] ${msg}`);
+        await sendFbaAlert(msg);
+      } else {
+        const selfUrl = process.env.FBA_SELF_URL
+          || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : null)
+          || 'https://shiphero-shipstation-bridge.vercel.app';
+        console.log(
+          `[fba-auto] Self-chaining ${deferredLots.length} deferred lot(s) via ${selfUrl} (depth ${chainDepth + 1})`
+        );
+        try {
+          const chainReq = fetch(`${selfUrl}/api/fba/auto-submit`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${process.env.CRON_SECRET}`,
+            },
+            body: JSON.stringify({ cin7_transfer_number, items, chain_depth: chainDepth + 1 }),
+          }).then(
+            (r) => console.log(`[fba-auto] Chained invocation returned ${r.status}`),
+            (e) => console.warn(`[fba-auto] Chained invocation fetch error: ${e?.message}`)
+          );
+          // Give the request time to be delivered; the chained function keeps
+          // running server-side even if this lambda freezes afterwards.
+          await Promise.race([chainReq, new Promise((r) => setTimeout(r, 8_000))]);
+        } catch (chainErr: any) {
+          console.warn(`[fba-auto] Self-chain failed: ${chainErr?.message}`);
+          await sendFbaAlert(
+            `⚠️ FBA auto-submit self-chain failed on ${cin7_transfer_number} — re-fire the same payload manually to finish ${deferredLots.length} lot(s).`
+          );
+        }
+      }
+    }
+
     res.status(200).json({
       cin7_transfer_number,
       processed: results.length,
       successful: results.filter(r => r.status === 'success').length,
       failed: results.filter(r => r.status === 'failed').length,
+      deferred: deferredLots.length,
+      chain_depth: chainDepth,
       results,
     });
   } catch (error) {
