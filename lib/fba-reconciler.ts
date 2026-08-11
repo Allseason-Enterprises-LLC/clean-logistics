@@ -7,24 +7,32 @@
  * silently (e.g. proxy down, Vercel timeout) and the system needs to retry.
  *
  * Behavior:
- *   - Only considers bridges synced in the last 24h
- *   - Throttles per-bridge: re-fire at most once per hour
- *   - Caps at 3 attempts per bridge before alerting via Telegram and stopping
+ *   - Considers bridges synced in the last 7 days (was 24h — outages like the
+ *     2026-08-04..07 401/credit-exhaustion window outlasted both the 3-attempt
+ *     cap AND the 24h lookback, so 5 transfers went silently dark forever)
+ *   - NEVER stops retrying: re-fires are dedup-idempotent (the (transfer,sku,lot)
+ *     unique index makes retrying a completed transfer a no-op), so a hard
+ *     attempt cap only creates permanent silent failures. Instead, backoff:
+ *     attempts 1-3 → retry hourly; attempts 4+ → retry every 4h.
+ *   - Alerts via Telegram at attempt 3, then every 6th attempt thereafter,
+ *     so a persistent failure stays visible without spamming.
  *   - Uses the same `fireFbaAutoSubmit` path the cron uses for first-time fires
  */
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 
-const MAX_ATTEMPTS = 3;
-const MIN_RETRY_GAP_MS = 60 * 60 * 1000; // 1 hour
-const LOOKBACK_HOURS = 24;
+const ALERT_AT_ATTEMPT = 3; // first Telegram alert
+const ALERT_EVERY_AFTER = 6; // then every Nth attempt
+const RETRY_GAP_EARLY_MS = 60 * 60 * 1000; // 1 hour (attempts 1-3)
+const RETRY_GAP_LATE_MS = 4 * 60 * 60 * 1000; // 4 hours (attempts 4+)
+const LOOKBACK_HOURS = 24 * 7;
 const BATCH_SIZE = 10;
 
 interface ReconcileResult {
   scanned: number;
   reFired: number;
   throttled: number;
-  exhausted: string[]; // transfer numbers that hit MAX_ATTEMPTS
+  exhausted: string[]; // kept for response-shape compat; no longer used to stop retries
   errors: string[];
   duration_ms: number;
 }
@@ -110,12 +118,14 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
 }
 
 function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
-  if (row.fba_handoff_attempts >= MAX_ATTEMPTS) {
-    return { retry: false, reason: 'max_attempts' };
-  }
+  // No hard cap — re-fires are dedup-idempotent, so we keep trying with
+  // backoff until the fba_shipments row exists. A cap only converts a long
+  // outage into a permanent silent failure (see 2026-08-04..07 incident).
   if (row.last_fba_handoff_at) {
+    const gap =
+      row.fba_handoff_attempts >= 3 ? RETRY_GAP_LATE_MS : RETRY_GAP_EARLY_MS;
     const last = new Date(row.last_fba_handoff_at).getTime();
-    if (Date.now() - last < MIN_RETRY_GAP_MS) {
+    if (Date.now() - last < gap) {
       return { retry: false, reason: 'throttled' };
     }
   }
@@ -200,7 +210,7 @@ export async function reconcileFbaHandoffs(
 
       console.log(
         `[reconciler] Re-firing FBA handoff for ${row.cin7_transfer_number} ` +
-          `(attempt ${row.fba_handoff_attempts + 1}/${MAX_ATTEMPTS}, ${fbaItems.length} items)`
+          `(attempt ${row.fba_handoff_attempts + 1}, ${fbaItems.length} items)`
       );
 
       if (!options.dryRun) {
@@ -228,27 +238,24 @@ export async function reconcileFbaHandoffs(
 
       result.reFired++;
 
-      // Alert on the LAST attempt — let the team know we're giving up after this
-      if (row.fba_handoff_attempts + 1 >= MAX_ATTEMPTS) {
+      // Alert at attempt 3, then every 6th attempt after — retries never stop
+      // (dedup-idempotent), but a persistent failure must stay visible.
+      const attemptNum = row.fba_handoff_attempts + 1;
+      const shouldAlert =
+        attemptNum === ALERT_AT_ATTEMPT ||
+        (attemptNum > ALERT_AT_ATTEMPT &&
+          (attemptNum - ALERT_AT_ATTEMPT) % ALERT_EVERY_AFTER === 0);
+      if (shouldAlert) {
         await sendTelegramAlert(
-          `⚠️ *FBA reconciler: final retry for ${row.cin7_transfer_number}*\n\n` +
+          `⚠️ *FBA reconciler: ${row.cin7_transfer_number} still failing*\n\n` +
             `Bridge synced ${row.synced_at}, ShipHero order ${row.shiphero_order_number}. ` +
-            `Attempt ${MAX_ATTEMPTS}/${MAX_ATTEMPTS} firing now. ` +
-            `If this fails, manual intervention required.`
+            `Retry attempt ${attemptNum} firing now (retries continue every 4h). ` +
+            `Check last_fba_handoff_detail on the bridge row for the failure reason.`
         );
       }
     } catch (err: any) {
       result.errors.push(`${row.cin7_transfer_number}: ${err?.message || String(err)}`);
     }
-  }
-
-  // Alert on any exhausted transfers
-  if (result.exhausted.length > 0) {
-    await sendTelegramAlert(
-      `🚨 *FBA reconciler: ${result.exhausted.length} transfer(s) exhausted retries*\n\n` +
-        result.exhausted.map((t) => `• ${t}`).join('\n') +
-        `\n\nManual investigation required. Check fba_shipments for failures and Amazon SP-API status.`
-    );
   }
 
   result.duration_ms = Date.now() - startedAt;
