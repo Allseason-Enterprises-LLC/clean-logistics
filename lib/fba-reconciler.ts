@@ -56,6 +56,15 @@ function getSupabase(supabase?: SupabaseClient): SupabaseClient {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+// A draft row is considered FROZEN (crashed run residue) when it has no
+// amazon_shipment_ids and hasn't been touched for this long. Normal runs
+// update the row every few minutes (plan bind, shipment ids, labels), so
+// 30 min of silence on a shipment-less draft means the serverless run died
+// (e.g. 300s maxDuration hit mid-Amazon-workflow). Such rows permanently
+// block the (transfer,sku,lot) dedup index → the reconciler's re-fires all
+// report "skipped" and self-healing never happens (TR-00337/00338, 2026-08-14).
+const FROZEN_DRAFT_MS = 30 * 60 * 1000;
+
 async function fbaRecordExists(
   db: SupabaseClient,
   transferNumber: string
@@ -75,15 +84,55 @@ async function fbaRecordExists(
 
   const { data: byColumn, error: colErr } = await db
     .from('fba_shipments')
-    .select('id, status, cin7_transfer_number')
+    .select('id, status, cin7_transfer_number, cin7_sku, cin7_lot, amazon_shipment_ids, updated_at')
     .in('cin7_transfer_number', candidates)
-    .not('status', 'in', '("failed","voided","cancelled")')
-    .limit(1);
+    .not('status', 'in', '("failed","voided","cancelled")');
 
   if (colErr) {
     console.warn(`[reconciler] cin7_transfer_number lookup failed: ${colErr.message}`);
   } else if (byColumn && byColumn.length > 0) {
-    return true;
+    // Sweep frozen drafts: crashed runs leave status='draft' rows with no
+    // amazon_shipment_ids that never progress. They hold the dedup index
+    // hostage, so cancel them and treat them as non-existent (→ re-fire).
+    const now = Date.now();
+    const frozen = byColumn.filter(
+      (r: any) =>
+        r.status === 'draft' &&
+        !(r.amazon_shipment_ids as any[] | null)?.length &&
+        now - new Date(r.updated_at).getTime() > FROZEN_DRAFT_MS
+    );
+    const live = byColumn.filter((r: any) => !frozen.includes(r));
+    let sweptAny = false;
+
+    for (const f of frozen as any[]) {
+      const { error: cancelErr } = await db
+        .from('fba_shipments')
+        .update({
+          status: 'cancelled',
+          error_message: `frozen draft auto-swept by reconciler (no shipments, stale ${Math.round((now - new Date(f.updated_at).getTime()) / 60000)}min) — run likely died mid-workflow`,
+          error_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', f.id)
+        .eq('status', 'draft')
+        .is('amazon_shipment_ids', null);
+      if (cancelErr) {
+        console.warn(`[reconciler] failed to sweep frozen draft ${f.id}: ${cancelErr.message}`);
+        // Couldn't cancel → still blocking; treat as existing to avoid a
+        // guaranteed-skipped re-fire.
+        live.push(f);
+      } else {
+        sweptAny = true;
+        console.log(
+          `[reconciler] swept frozen draft ${f.id} (${f.cin7_transfer_number} ${f.cin7_sku} lot ${f.cin7_lot})`
+        );
+      }
+    }
+
+    // If we swept anything, re-fire even when other lots completed — the
+    // (transfer,sku,lot) dedup index makes finished lots a no-op skip.
+    if (sweptAny) return false;
+    if (live.length > 0) return true;
   }
 
   // Fallback: legacy rows didn't populate cin7_transfer_number.
