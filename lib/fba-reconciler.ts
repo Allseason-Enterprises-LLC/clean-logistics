@@ -60,9 +60,16 @@ function getSupabase(supabase?: SupabaseClient): SupabaseClient {
 // amazon_shipment_ids and hasn't been touched for this long. Normal runs
 // update the row every few minutes (plan bind, shipment ids, labels), so
 // 30 min of silence on a shipment-less draft means the serverless run died
-// (e.g. 300s maxDuration hit mid-Amazon-workflow). Such rows permanently
-// block the (transfer,sku,lot) dedup index → the reconciler's re-fires all
-// report "skipped" and self-healing never happens (TR-00337/00338, 2026-08-14).
+// (e.g. 300s maxDuration hit mid-Amazon-workflow). Such rows CANNOT be
+// blindly cancelled + re-fired: the crashed run may have already created
+// the Amazon plan/shipments/labels before dying (incident 2026-08-14/15:
+// TR-00336/337/338 → 20 duplicate shipments, extra UPS labels at warehouse).
+// Instead we mark them 'needs_review' — a status that still satisfies the
+// partial unique index (WHERE status NOT IN cancelled/failed/voided), so it
+// KEEPS holding the (transfer,sku,lot) dedup slot and permanently blocks
+// auto-re-fires until a human resolves it:
+//   - plan real on Amazon → update row with plan_id/shipment ids, status onward
+//   - plan dead/absent   → set status='cancelled', reconciler re-fires next tick
 const FROZEN_DRAFT_MS = 30 * 60 * 1000;
 
 async function fbaRecordExists(
@@ -108,8 +115,8 @@ async function fbaRecordExists(
       const { error: cancelErr } = await db
         .from('fba_shipments')
         .update({
-          status: 'cancelled',
-          error_message: `frozen draft auto-swept by reconciler (no shipments, stale ${Math.round((now - new Date(f.updated_at).getTime()) / 60000)}min) — run likely died mid-workflow`,
+          status: 'needs_review',
+          error_message: `frozen draft flagged by reconciler (no shipment ids persisted, stale ${Math.round((now - new Date(f.updated_at).getTime()) / 60000)}min) — run died mid-workflow. DO NOT auto-retry: the run may have already created Amazon shipments/labels. Check Seller Central; if a live shipment exists, bind its plan_id/ids to this row; if not, set status='cancelled' to let the reconciler re-fire.`,
           error_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         })
@@ -117,35 +124,35 @@ async function fbaRecordExists(
         .eq('status', 'draft')
         .is('amazon_shipment_ids', null);
       if (cancelErr) {
-        console.warn(`[reconciler] failed to sweep frozen draft ${f.id}: ${cancelErr.message}`);
-        // Couldn't cancel → still blocking; treat as existing to avoid a
-        // guaranteed-skipped re-fire.
-        live.push(f);
+        console.warn(`[reconciler] failed to flag frozen draft ${f.id}: ${cancelErr.message}`);
       } else {
         sweptAny = true;
         console.log(
-          `[reconciler] swept frozen draft ${f.id} (${f.cin7_transfer_number} ${f.cin7_sku} lot ${f.cin7_lot})`
+          `[reconciler] flagged frozen draft ${f.id} as needs_review (${f.cin7_transfer_number} ${f.cin7_sku} lot ${f.cin7_lot})`
         );
       }
+      // Either way the row still holds the dedup slot → treat as existing.
+      live.push(f);
     }
 
-    // If we swept anything, DO NOT auto-re-fire. A "frozen draft" can mean
+    // If we flagged anything, DO NOT auto-re-fire. A "frozen draft" can mean
     // the run died AFTER creating the Amazon plan/shipments/labels but BEFORE
     // persisting amazon_shipment_ids — auto-re-firing then creates a real
     // duplicate FBA shipment with extra partnered UPS labels at the warehouse.
     // (Incident 2026-08-14/15: TR-00336/337/338 got 2-4 duplicate shipments
-    // each from sweep→re-fire loops.) Instead alert for manual verification:
-    // a human must confirm on Amazon Seller Central / SP-API that no live plan
-    // exists before re-firing via /api/fba/auto-submit.
+    // each from sweep→re-fire loops.) The needs_review row keeps holding the
+    // dedup slot, so even future reconciler ticks can't re-fire until a human
+    // resolves it (bind real plan ids, or set cancelled to allow retry).
     if (sweptAny) {
       await sendTelegramAlert(
-        `🧊 *FBA reconciler: swept frozen draft(s) for ${transferNumber}*\n\n` +
+        `🧊 *FBA reconciler: frozen draft(s) flagged for ${transferNumber}*\n\n` +
           `Run died mid-workflow. NOT auto-retrying (duplicate-shipment risk — ` +
           `the crashed run may have already created Amazon shipments/labels).\n\n` +
-          `Manual step: check Seller Central for an existing shipment for this ` +
-          `transfer. If none exists, re-fire /api/fba/auto-submit manually.`
+          `Rows set to status=needs_review. Manual step: check Seller Central ` +
+          `for an existing shipment. If one exists, bind its plan/shipment ids ` +
+          `to the row; if not, set the row to cancelled and the reconciler ` +
+          `will re-fire automatically.`
       );
-      return true; // block auto-re-fire
     }
     if (live.length > 0) return true;
   }
