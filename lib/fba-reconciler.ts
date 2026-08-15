@@ -129,9 +129,24 @@ async function fbaRecordExists(
       }
     }
 
-    // If we swept anything, re-fire even when other lots completed — the
-    // (transfer,sku,lot) dedup index makes finished lots a no-op skip.
-    if (sweptAny) return false;
+    // If we swept anything, DO NOT auto-re-fire. A "frozen draft" can mean
+    // the run died AFTER creating the Amazon plan/shipments/labels but BEFORE
+    // persisting amazon_shipment_ids — auto-re-firing then creates a real
+    // duplicate FBA shipment with extra partnered UPS labels at the warehouse.
+    // (Incident 2026-08-14/15: TR-00336/337/338 got 2-4 duplicate shipments
+    // each from sweep→re-fire loops.) Instead alert for manual verification:
+    // a human must confirm on Amazon Seller Central / SP-API that no live plan
+    // exists before re-firing via /api/fba/auto-submit.
+    if (sweptAny) {
+      await sendTelegramAlert(
+        `🧊 *FBA reconciler: swept frozen draft(s) for ${transferNumber}*\n\n` +
+          `Run died mid-workflow. NOT auto-retrying (duplicate-shipment risk — ` +
+          `the crashed run may have already created Amazon shipments/labels).\n\n` +
+          `Manual step: check Seller Central for an existing shipment for this ` +
+          `transfer. If none exists, re-fire /api/fba/auto-submit manually.`
+      );
+      return true; // block auto-re-fire
+    }
     if (live.length > 0) return true;
   }
 
