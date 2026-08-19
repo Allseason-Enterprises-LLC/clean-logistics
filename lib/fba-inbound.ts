@@ -272,19 +272,56 @@ export async function runFbaInboundWorkflow(
     return null; // unknown constraint shape — fall through to default
   }
 
+  // Fetch an MSKU's prep details; shared by the loop below and the
+  // UNKNOWN-prep auto-remediation re-fetch.
+  const fetchPrepDetail = async (msku: string): Promise<any | undefined> => {
+    const prepRes = await callAmazonSpApi<any>({
+      method: 'GET',
+      region,
+      path: `${FBA_INBOUND_BASE}/items/prepDetails`,
+      query: {
+        marketplaceId: options.marketplaceId,
+        mskus: msku,
+      },
+    });
+    return (prepRes.data?.mskuPrepDetails ?? []).find((d: any) => d.msku === msku);
+  };
+
+  // New-SKU auto-remediation. Newly created listings have prepCategory=UNKNOWN
+  // (nobody set prep classification in Seller Central), and createInboundPlan
+  // hard-fails with FBA_INB_0182 (Prep classification missing) for such MSKUs.
+  // Fix it the way we fixed CN-POW-WMNSCREATISW-30SV (TR-00341, 2026-08-19):
+  // POST setPrepDetails with prepCategory=NONE. Amazon quirk: for category
+  // NONE it requires prepTypes=[ITEM_NO_PREP] EXACTLY (ITEM_LABELING is
+  // rejected with 400; Amazon adds ITEM_LABELING itself afterwards).
+  const fixUnknownPrep = async (msku: string): Promise<any | undefined> => {
+    console.warn(`[fba-inbound] ${msku}: prepCategory=UNKNOWN — auto-setting prep classification (NONE/ITEM_NO_PREP)`);
+    const setRes = await callAmazonSpApi<any>({
+      method: 'POST',
+      region,
+      path: `${FBA_INBOUND_BASE}/items/prepDetails`,
+      body: {
+        marketplaceId: options.marketplaceId,
+        mskuPrepDetails: [{ msku, prepCategory: 'NONE', prepTypes: ['ITEM_NO_PREP'] }],
+      },
+    });
+    const opId = setRes.data?.operationId;
+    if (opId) await pollUntilSuccess(region, opId);
+    const detail = await fetchPrepDetail(msku);
+    console.log(`[fba-inbound] ${msku}: prep classification set → ${JSON.stringify(detail ?? null)}`);
+    return detail;
+  };
+
   for (const item of options.items) {
     try {
-      const prepRes = await callAmazonSpApi<any>({
-        method: 'GET',
-        region,
-        path: `${FBA_INBOUND_BASE}/items/prepDetails`,
-        query: {
-          marketplaceId: options.marketplaceId,
-          mskus: item.sellerSku,
-        },
-      });
-      const mskuPrepDetail = (prepRes.data?.mskuPrepDetails ?? []);
-      const detail = mskuPrepDetail.find((d: any) => d.msku === item.sellerSku);
+      let detail = await fetchPrepDetail(item.sellerSku);
+      if (detail?.prepCategory === 'UNKNOWN') {
+        try {
+          detail = (await fixUnknownPrep(item.sellerSku)) ?? detail;
+        } catch (fixErr: unknown) {
+          console.warn(`[fba-inbound] ${item.sellerSku}: UNKNOWN-prep auto-fix failed (continuing; createInboundPlan may reject):`, fixErr);
+        }
+      }
       const prepCategory = detail?.prepCategory;
       const prepOwnerC = detail?.prepOwnerConstraint;
       const labelOwnerC = detail?.labelOwnerConstraint;
@@ -383,6 +420,39 @@ export async function runFbaInboundWorkflow(
         const errDetail2 = extractAmazonError(e2);
         console.error('[fba-inbound] Retry also failed:', errDetail2);
         throw new Error(`createInboundPlan failed: ${errDetail2}`);
+      }
+    } else if (/FBA_INB_0182/i.test(errStr) && /[Pp]rep classi/.test(errStr)) {
+      // Prep-classification safety net. The pre-flight UNKNOWN-prep fix above
+      // should normally prevent this, but if the prepDetails fetch failed (so
+      // we never saw UNKNOWN) Amazon still rejects the plan with FBA_INB_0182.
+      // Fix every item's prep classification and retry once.
+      console.warn('[fba-inbound] FBA_INB_0182 prep-classification error — auto-fixing prep for all items and retrying once...');
+      for (const item of options.items) {
+        try {
+          // Only overwrite prep for SKUs that are genuinely unclassified —
+          // never clobber a legit existing prep category.
+          const cur = await fetchPrepDetail(item.sellerSku).catch(() => undefined);
+          if (cur && cur.prepCategory && cur.prepCategory !== 'UNKNOWN') {
+            console.log(`[fba-inbound] ${item.sellerSku}: prepCategory=${cur.prepCategory} already set — skipping auto-fix`);
+            continue;
+          }
+          const d = await fixUnknownPrep(item.sellerSku);
+          const rp = constraintToOwner(d?.prepOwnerConstraint);
+          const rl = constraintToOwner(d?.labelOwnerConstraint);
+          if (rp) prepOwnerByMsku[item.sellerSku] = rp;
+          if (rl) labelOwnerByMsku[item.sellerSku] = rl;
+        } catch (fixErr: unknown) {
+          console.warn(`[fba-inbound] prep auto-fix failed for ${item.sellerSku}:`, fixErr);
+        }
+      }
+      try {
+        const res2 = await doCreatePlan();
+        createRes = res2.data;
+        console.log('[fba-inbound] createInboundPlan (post-prep-fix retry) response:', JSON.stringify(createRes));
+      } catch (e2: unknown) {
+        const errDetail2 = extractAmazonError(e2);
+        console.error('[fba-inbound] Post-prep-fix retry also failed:', errDetail2);
+        throw new Error(`createInboundPlan failed (after prep auto-fix): ${errDetail2}`);
       }
     } else {
       throw new Error(`createInboundPlan failed: ${errDetail}`);
