@@ -274,6 +274,15 @@ export async function getShipHeroProductData(
  * derived from warehouse_products → locations → expiration_lot (verified
  * against the live schema 2026-07-22). Locations with expiration_lot: null
  * (untracked stock) and inactive lots are excluded.
+ *
+ * PICKABLE (DTC) LOCATIONS ARE EXCLUDED (added 2026-08-20 per Weston):
+ * B-prefix pick bins (location.pickable=true) hold DTC fulfillment stock.
+ * FBA transfers must plan against BULK (non-pickable, A-prefix) stock only —
+ * otherwise the plan sizes itself against units the FEFO allocator (which
+ * already uses location_type: NON_PICKABLE) will never pick, and the
+ * warehouse would have to raid DTC pick bins and re-slot afterwards.
+ * Example: TR-00340 planned 370 boxes instead of 325 because 1,547 units of
+ * lot 6E0224 sat in pick bin B01-02-04-A-01.
  */
 export async function getLotBreakdown(
   shipheroToken: string,
@@ -289,6 +298,7 @@ export async function getLotBreakdown(
               edges {
                 node {
                   quantity
+                  location { name pickable }
                   expiration_lot { name expires_at is_active }
                 }
               }
@@ -313,11 +323,22 @@ export async function getLotBreakdown(
   }
 
   const byLot = new Map<string, LotAvailability>();
+  let pickableSkipped = 0;
   for (const we of json.data?.warehouse_products?.data?.edges || []) {
     for (const le of we.node?.locations?.edges || []) {
       const n = le.node;
       const lot = n?.expiration_lot;
       if (!lot?.name || !lot.is_active || !lot.expires_at) continue;
+      // Skip DTC pick bins — FBA plans against bulk stock only (see docblock).
+      if (n?.location?.pickable === true) {
+        if ((n.quantity || 0) > 0) {
+          pickableSkipped += n.quantity;
+          console.log(
+            `[lot-breakdown] ${sku}: skipping ${n.quantity}u of lot ${lot.name} in pickable DTC bin ${n.location?.name ?? '?'}`
+          );
+        }
+        continue;
+      }
       const cur = byLot.get(lot.name);
       if (cur) {
         cur.availableQty += n.quantity || 0;
@@ -329,6 +350,9 @@ export async function getLotBreakdown(
         });
       }
     }
+  }
+  if (pickableSkipped > 0) {
+    console.log(`[lot-breakdown] ${sku}: excluded ${pickableSkipped} units total in pickable DTC bins from FBA lot math`);
   }
   return Array.from(byLot.values());
 }
