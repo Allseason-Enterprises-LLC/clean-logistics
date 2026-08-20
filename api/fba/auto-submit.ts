@@ -168,7 +168,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // expiration (unchanged behavior).
       let lotPlan: LotAllocation[];
       if (!productData.isKit) {
-        const lots = await getLotBreakdown(shipheroToken, item.sku);
+        let lots = await getLotBreakdown(shipheroToken, item.sku);
+        // Optional explicit lot targeting (added 2026-08-20 for supplemental
+        // label runs like TR-00306/TR-00325): when the caller passes
+        // items[].lot, allocate ONLY from that lot instead of FEFO across all
+        // lots. Prevents dedup-skipped lots from silently shifting units onto
+        // lots the warehouse didn't stage.
+        if (item.lot) {
+          const target = lots.find((l) => l.name === item.lot);
+          if (!target) {
+            results.push({
+              sku: item.sku,
+              status: 'failed',
+              error: `Explicit lot ${item.lot} not found in ShipHero lot breakdown for ${item.sku} (available: ${lots.map((l) => l.name).join(', ') || 'none'})`,
+            });
+            continue;
+          }
+          console.log(`[fba-auto] ${item.sku}: explicit lot override → ${item.lot} (${target.availableQty}u available)`);
+          lots = [target];
+        }
         if (lots.length) {
           try {
             lotPlan = allocateFefoByLot(lots, item.quantity, unitsPerBox);
