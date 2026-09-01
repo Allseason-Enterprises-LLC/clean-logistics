@@ -128,15 +128,12 @@ async function fbaRecordExists(
             cin7_lot: f.cin7_lot,
           });
           if (rec.recovered) {
+            // Log only — NO Telegram alert. The FBA channel is for shipping
+            // notifications (label posts), not engineering chatter. The relabel
+            // step already posts the normal label message when it succeeds;
+            // recovery details live in the row's error_message + logs.
             console.log(
               `[reconciler] auto-recovered frozen draft ${f.id} (${f.cin7_transfer_number} lot ${f.cin7_lot}): ${rec.detail}`
-            );
-            await sendTelegramAlert(
-              `♻️ *FBA reconciler: auto-recovered ${f.cin7_transfer_number}* (lot ${f.cin7_lot ?? '—'})\n\n` +
-                `Crashed run left the plan without confirmed transportation. ` +
-                `Completed it in place — no new plan, no duplicates.\n` +
-                `Shipments: ${(rec.fbaIds ?? []).join(', ')}\n` +
-                `${rec.detail}`
             );
             live.push(f);
             continue; // recovered — do NOT flag needs_review

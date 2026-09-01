@@ -328,10 +328,10 @@ export async function attemptTransportRecovery(
   //    Telegram post. Self-HTTP like cin7-fba-handoff (relabel needs its own
   //    300s budget — cannot run inline in the reconciler's window).
   try {
-    const base =
-      process.env.VERCEL_URL && !process.env.VERCEL_URL.includes('localhost')
-        ? `https://${process.env.VERCEL_URL.replace(/\/+$/, '')}`
-        : 'https://shiphero-shipstation-bridge.vercel.app';
+    // Always use the canonical production URL. VERCEL_URL points at the
+    // deployment-specific *.vercel.app host, which is behind Vercel deployment
+    // protection → self-calls 401 (seen on TR-00368 recovery, 2026-08-31).
+    const base = 'https://shiphero-shipstation-bridge.vercel.app';
     const res = await fetch(`${base}/api/fba/relabel`, {
       method: 'POST',
       headers: {
