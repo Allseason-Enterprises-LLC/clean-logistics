@@ -10,7 +10,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { reconcileFbaHandoffs } from '../../lib/fba-reconciler';
 
-export const config = { maxDuration: 60 };
+// 300s: frozen-draft transport recovery (fba-transport-recovery.ts) polls
+// Amazon operations and can take a few minutes when quotes must regenerate.
+export const config = { maxDuration: 300 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const auth = req.headers.authorization?.replace('Bearer ', '');

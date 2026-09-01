@@ -20,6 +20,7 @@
  */
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
+import { attemptTransportRecovery } from './fba-transport-recovery';
 
 const ALERT_AT_ATTEMPT = 3; // first Telegram alert
 const ALERT_EVERY_AFTER = 6; // then every Nth attempt
@@ -91,7 +92,7 @@ async function fbaRecordExists(
 
   const { data: byColumn, error: colErr } = await db
     .from('fba_shipments')
-    .select('id, status, cin7_transfer_number, cin7_sku, cin7_lot, amazon_shipment_ids, updated_at')
+    .select('id, status, cin7_transfer_number, cin7_sku, cin7_lot, amazon_shipment_ids, updated_at, plan_id')
     .in('cin7_transfer_number', candidates)
     .not('status', 'in', '("failed","voided","cancelled")');
 
@@ -112,6 +113,44 @@ async function fbaRecordExists(
     let sweptAny = false;
 
     for (const f of frozen as any[]) {
+      // FIRST: attempt safe in-place recovery. The most common frozen-draft
+      // cause (TR-00370, 2026-08-31) is a run that died AFTER shipments were
+      // created but BEFORE confirmTransportationOptions — fully recoverable
+      // against the existing plan with zero duplicate risk (read-only checks +
+      // idempotent confirmations only; never creates or cancels plans).
+      if (f.plan_id) {
+        try {
+          const rec = await attemptTransportRecovery(db, {
+            id: f.id,
+            plan_id: f.plan_id,
+            cin7_transfer_number: f.cin7_transfer_number,
+            cin7_sku: f.cin7_sku,
+            cin7_lot: f.cin7_lot,
+          });
+          if (rec.recovered) {
+            console.log(
+              `[reconciler] auto-recovered frozen draft ${f.id} (${f.cin7_transfer_number} lot ${f.cin7_lot}): ${rec.detail}`
+            );
+            await sendTelegramAlert(
+              `♻️ *FBA reconciler: auto-recovered ${f.cin7_transfer_number}* (lot ${f.cin7_lot ?? '—'})\n\n` +
+                `Crashed run left the plan without confirmed transportation. ` +
+                `Completed it in place — no new plan, no duplicates.\n` +
+                `Shipments: ${(rec.fbaIds ?? []).join(', ')}\n` +
+                `${rec.detail}`
+            );
+            live.push(f);
+            continue; // recovered — do NOT flag needs_review
+          }
+          console.log(
+            `[reconciler] transport recovery not applicable for ${f.id}: ${rec.detail} — falling back to needs_review`
+          );
+        } catch (recErr: any) {
+          console.warn(
+            `[reconciler] transport recovery threw for ${f.id}: ${recErr?.message} — falling back to needs_review`
+          );
+        }
+      }
+
       const { error: cancelErr } = await db
         .from('fba_shipments')
         .update({
