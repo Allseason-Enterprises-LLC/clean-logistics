@@ -57,6 +57,8 @@ export interface PostProcessResult {
   placementFee: number;
   shipheroOrderId?: string;
   attachmentsCreated: number;
+  /** Re-attaches suppressed because the filename was already on the order. */
+  attachmentsSkipped: number;
   telegramSent: boolean;
   errors: string[];
 }
@@ -285,14 +287,67 @@ async function findShipheroOrder(
   return { orderId: node.id, accountId: node.account_id };
 }
 
+/**
+ * Filenames of label attachments already on the order.
+ *
+ * ShipHero's `order_add_attachment` does NOT dedupe on filename — every call
+ * appends a fresh attachment row. Post-process is re-run by
+ * `lib/fba-transport-recovery.ts` → `/api/fba/relabel` whenever a run dies
+ * after transport confirm, so without this check the recovery path silently
+ * doubles (or triples) every label set on the order. Storage looks clean
+ * because uploads upsert over the same object paths; only ShipHero grows.
+ *
+ * Incident 2026-09-03 (TR-00406): 10 label attachments for 5 destinations →
+ * warehouse saw 80 pages / 40 FBA + 40 UPS labels for a 20-box transfer.
+ * 19 recovered transfers back to TR-00365 were affected; TR-00368 hit 3×.
+ */
+async function listAttachedLabelFilenames(
+  token: string,
+  orderId: string
+): Promise<Set<string>> {
+  const query = `
+    query {
+      order(id: "${orderId}") {
+        data {
+          attachments(first: 100) {
+            edges { node { id filename } }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const data = await shGql(token, query);
+    const edges = data?.order?.data?.attachments?.edges ?? [];
+    return new Set<string>(
+      edges.map((e: any) => e?.node?.filename).filter((f: any): f is string => !!f)
+    );
+  } catch (err: any) {
+    // Fail OPEN on a read error: attaching a possible dupe is recoverable,
+    // shipping with no labels at all is not.
+    console.warn(
+      `[fba-post-process] could not list existing attachments for ${orderId} — proceeding without dedupe: ${err?.message}`
+    );
+    return new Set<string>();
+  }
+}
+
 async function attachToShipHero(
   token: string,
   orderId: string,
   accountId: string,
   url: string,
   description: string,
-  filename: string
-): Promise<string> {
+  filename: string,
+  existingFilenames?: Set<string>
+): Promise<{ attachmentId: string; skipped: boolean }> {
+  if (existingFilenames?.has(filename)) {
+    console.log(
+      `[fba-post-process] ${filename} already attached to ${orderId} — skipping re-attach (idempotent)`
+    );
+    return { attachmentId: '', skipped: true };
+  }
+
   const mutation = `
     mutation($d: OrderAddAttachmentInput!) {
       order_add_attachment(data: $d) {
@@ -311,7 +366,11 @@ async function attachToShipHero(
       file_type: 'application/pdf',
     },
   });
-  return data?.order_add_attachment?.attachment?.id ?? '';
+  const attachmentId = data?.order_add_attachment?.attachment?.id ?? '';
+  // Keep the in-memory set current so a repeated filename inside this same
+  // run (duplicate internalIds, retries) also short-circuits.
+  if (attachmentId) existingFilenames?.add(filename);
+  return { attachmentId, skipped: false };
 }
 
 async function updatePackingNote(token: string, orderId: string, note: string): Promise<void> {
@@ -362,6 +421,7 @@ export async function postProcessFbaShipment(
     labels: [],
     placementFee: 0,
     attachmentsCreated: 0,
+    attachmentsSkipped: 0,
     telegramSent: false,
     errors,
   };
@@ -409,6 +469,15 @@ export async function postProcessFbaShipment(
   }
   result.shipheroOrderId = shOrder.orderId;
 
+  // Snapshot existing label attachments ONCE before the loop so re-runs
+  // (transport-recovery → /api/fba/relabel) don't append duplicate sets.
+  const existingFilenames = await listAttachedLabelFilenames(shToken, shOrder.orderId);
+  if (existingFilenames.size > 0) {
+    console.log(
+      `[fba-post-process] order ${shOrder.orderId} already has ${existingFilenames.size} attachment(s) — dedupe active`
+    );
+  }
+
   let totalShippingCost = 0;
   let hasShippingCost = false;
 
@@ -427,8 +496,17 @@ export async function postProcessFbaShipment(
 
       // Attach to ShipHero
       const desc = `FBA Shipping Labels - ${det.fbaId} - ${det.destinationCity}, ${det.destinationState} - ${det.nBoxes} boxes (4x6 thermal)`;
-      const attId = await attachToShipHero(shToken, shOrder.orderId, shOrder.accountId, publicUrl, desc, filename);
-      if (attId) result.attachmentsCreated++;
+      const attId = await attachToShipHero(
+        shToken,
+        shOrder.orderId,
+        shOrder.accountId,
+        publicUrl,
+        desc,
+        filename,
+        existingFilenames
+      );
+      if (attId.attachmentId) result.attachmentsCreated++;
+      if (attId.skipped) result.attachmentsSkipped++;
 
       result.labels.push({
         fbaId: det.fbaId,
