@@ -208,6 +208,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         supabaseUrl: l.supabaseUrl,
       })),
       attachmentsCreated: result.attachmentsCreated,
+      attachmentsSkipped: result.attachmentsSkipped,
       telegramSent: result.telegramSent,
       errors: result.errors,
     });

@@ -594,7 +594,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           expiration: lot.expiresAt,
           lot: lot.name,
         });
-        console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments, telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
+        console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments (${postProcess.attachmentsSkipped} skipped as dupes), telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
 
         // Update fba_shipments status now that labels are attached and Telegram fired
         if (fbaRecordId) {
@@ -633,6 +633,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         placement_fee: postProcess?.placementFee,
         shiphero_order_id: postProcess?.shipheroOrderId,
         attachments_created: postProcess?.attachmentsCreated ?? 0,
+        attachments_skipped: postProcess?.attachmentsSkipped ?? 0,
         telegram_sent: postProcess?.telegramSent ?? false,
         post_process_errors: postProcess?.errors ?? [],
         prep: fbaResult.prepInstructions || fbaResult.prep_instructions,
