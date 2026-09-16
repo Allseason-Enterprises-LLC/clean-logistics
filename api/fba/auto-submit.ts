@@ -85,6 +85,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const { cin7_transfer_number, items } = req.body;
     const chainDepth = Number(req.body.chain_depth ?? 0);
+    // OVERRIDE: include DTC pickable-bin stock in FBA lot math. Off by default.
+    // Use only on an explicit operator decision (slow mover whose whole position
+    // is going to Amazon). Propagates through self-chained runs.
+    const includePickable = req.body.include_pickable === true;
 
     if (!cin7_transfer_number || !items?.length) {
       return res.status(400).json({
@@ -168,7 +172,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // expiration (unchanged behavior).
       let lotPlan: LotAllocation[];
       if (!productData.isKit) {
-        let lots = await getLotBreakdown(shipheroToken, item.sku);
+        let lots = await getLotBreakdown(shipheroToken, item.sku, { includePickable });
         // Optional explicit lot targeting (added 2026-08-20 for supplemental
         // label runs like TR-00306/TR-00325): when the caller passes
         // items[].lot, allocate ONLY from that lot instead of FEFO across all
@@ -668,7 +672,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               'Content-Type': 'application/json',
               Authorization: `Bearer ${process.env.CRON_SECRET}`,
             },
-            body: JSON.stringify({ cin7_transfer_number, items, chain_depth: chainDepth + 1 }),
+            body: JSON.stringify({ cin7_transfer_number, items, chain_depth: chainDepth + 1, ...(includePickable ? { include_pickable: true } : {}) }),
           }).then(
             (r) => console.log(`[fba-auto] Chained invocation returned ${r.status}`),
             (e) => console.warn(`[fba-auto] Chained invocation fetch error: ${e?.message}`)
