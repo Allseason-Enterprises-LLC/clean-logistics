@@ -287,6 +287,7 @@ export async function getShipHeroProductData(
 export async function getLotBreakdown(
   shipheroToken: string,
   sku: string,
+  opts: { includePickable?: boolean } = {},
 ): Promise<LotAvailability[]> {
   const query = `{
     warehouse_products(sku: "${sku}") {
@@ -330,7 +331,10 @@ export async function getLotBreakdown(
       const lot = n?.expiration_lot;
       if (!lot?.name || !lot.is_active || !lot.expires_at) continue;
       // Skip DTC pick bins — FBA plans against bulk stock only (see docblock).
-      if (n?.location?.pickable === true) {
+      // OVERRIDE (opts.includePickable): deliberate operator decision to raid
+      // DTC pick bins, e.g. a slow-moving SKU whose whole position is going to
+      // Amazon anyway. Never default this on.
+      if (n?.location?.pickable === true && !opts.includePickable) {
         if ((n.quantity || 0) > 0) {
           pickableSkipped += n.quantity;
           console.log(
@@ -338,6 +342,11 @@ export async function getLotBreakdown(
           );
         }
         continue;
+      }
+      if (n?.location?.pickable === true && opts.includePickable && (n.quantity || 0) > 0) {
+        console.log(
+          `[lot-breakdown] ${sku}: INCLUDING ${n.quantity}u of lot ${lot.name} from pickable DTC bin ${n.location?.name ?? '?'} (includePickable override)`
+        );
       }
       const cur = byLot.get(lot.name);
       if (cur) {
