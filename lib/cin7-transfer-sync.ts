@@ -8,10 +8,26 @@ import {
   ShipHeroTransferSyncSummary,
 } from './cin7-transfer-types';
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
-import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
+import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { createShipHeroPurchaseOrder } from './shiphero-inbound';
 
 const CIN7_BASE_URL = 'https://inventory.dearsystems.com/ExternalApi/v2';
+
+/**
+ * FBA handoff pacing (added 2026-09-21 after the SP-API batch-stall incident).
+ *
+ * `fireFbaAutoSubmit` blocks up to 30s per handoff before disconnecting, and the
+ * sync cron function has `maxDuration: 300`. So we cannot simply await an
+ * unbounded queue — 19 handoffs × ~30s would be ~570s and the function would be
+ * killed mid-drain.
+ *
+ * Instead: space the starts, and stop draining when the time budget is spent.
+ * Anything left over is NOT lost — the reconciler (every 15 min) re-fires
+ * transfers that still have no `fba_shipments` row, and it now lands on a quota
+ * that isn't saturated. Slower but complete beats fast and half-built.
+ */
+const FBA_HANDOFF_STAGGER_MS = 8_000;
+const FBA_HANDOFF_DRAIN_BUDGET_MS = 230_000;
 const CIN7_ACCOUNT_ID = process.env.CIN7_ACCOUNT_ID!;
 const CIN7_API_KEY = process.env.CIN7_API_KEY!;
 
@@ -535,6 +551,10 @@ export async function syncCIN7LasVegasTransferOrders(
   let eligible = 0;
   let created = 0;
   let skipped = 0;
+  // FBA handoffs are collected here and drained after the transfer loop so we
+  // don't stampede the Amazon SP-API quota (2026-09-21 incident — see the
+  // drain block below).
+  const pendingFbaHandoffs: FbaHandoffInput[] = [];
 
   try {
     const allowedStatuses = (options.allowedStatuses || [...CIN7_TRANSFER_ASSUMPTIONS.defaultEligibleStatuses]).map((s) => normalizeStatus(s));
@@ -701,10 +721,21 @@ export async function syncCIN7LasVegasTransferOrders(
             skipped++;
           }
 
-          // If FBA-bound and freshly created, fire the clean-logistics FBA pipeline
-          // immediately — eliminates the ~20-min delay to Amazon shipment creation.
+          // If FBA-bound and freshly created, queue the FBA handoff. We do NOT
+          // fire inside this loop any more.
+          //
+          // ⚠️ 2026-09-21 incident: this used to be a bare
+          // `void fireFbaAutoSubmit(...)` right here. On a backlog day 19
+          // transfers synced in a 24-second window, each kicking off the ~6-call
+          // Amazon inbound workflow concurrently. Amazon throttled us: 9 handoffs
+          // died with HTTP 429 / QuotaExceeded and 11 left half-built plans
+          // (ACTIVE, items present, ZERO shipments) that transport-recovery
+          // cannot resume and that cannot be re-fired without cancelling first.
+          // 11 transfers / 17,072 units had to be recovered by hand.
+          //
+          // Handoffs are now drained AFTER the loop, serially and spaced out.
           if (result.created && isFbaDestination(transfer.destinationName)) {
-            void fireFbaAutoSubmit({
+            pendingFbaHandoffs.push({
               cin7TransferNumber: transfer.transferNumber,
               items: transfer.lines.map((line) => ({
                 sku: line.sku,
@@ -716,6 +747,44 @@ export async function syncCIN7LasVegasTransferOrders(
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         errors.push(`Transfer ${transfer.transferNumber}: ${message}`);
+      }
+    }
+
+    // Drain the FBA handoff queue serially with spacing so we never stampede
+    // the Amazon SP-API quota (see the 2026-09-21 note above). Each handoff
+    // POSTs to /api/fba/auto-submit, which runs in its OWN Vercel invocation
+    // with maxDuration=300s; fireFbaAutoSubmit disconnects after 30s. Spacing
+    // the *starts* keeps concurrent Amazon workflows to roughly one or two
+    // rather than N. Deliberately awaited: the sync cron finishing early is
+    // worth less than handoffs that actually succeed.
+    if (pendingFbaHandoffs.length > 0) {
+      const drainStart = Date.now();
+      console.log(
+        `[CIN7 Transfer] Draining ${pendingFbaHandoffs.length} FBA handoff(s) ` +
+          `serially, ${FBA_HANDOFF_STAGGER_MS}ms apart`
+      );
+      for (let i = 0; i < pendingFbaHandoffs.length; i++) {
+        if (Date.now() - drainStart > FBA_HANDOFF_DRAIN_BUDGET_MS) {
+          const left = pendingFbaHandoffs.slice(i).map((h) => h.cin7TransferNumber);
+          console.warn(
+            `[CIN7 Transfer] Handoff drain budget spent — deferring ${left.length} ` +
+              `handoff(s) to the reconciler: ${left.join(', ')}`
+          );
+          break;
+        }
+        if (i > 0) {
+          await new Promise((r) => setTimeout(r, FBA_HANDOFF_STAGGER_MS));
+        }
+        try {
+          await fireFbaAutoSubmit(pendingFbaHandoffs[i]);
+        } catch (err: any) {
+          // fireFbaAutoSubmit already records dispatch_failed on the bridge row;
+          // never let one bad handoff abort the rest of the queue.
+          console.warn(
+            `[CIN7 Transfer] FBA handoff threw for ` +
+              `${pendingFbaHandoffs[i].cin7TransferNumber}: ${err?.message || err}`
+          );
+        }
       }
     }
 
