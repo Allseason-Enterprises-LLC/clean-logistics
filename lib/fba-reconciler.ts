@@ -27,7 +27,12 @@ const ALERT_EVERY_AFTER = 6; // then every Nth attempt
 const RETRY_GAP_EARLY_MS = 60 * 60 * 1000; // 1 hour (attempts 1-3)
 const RETRY_GAP_LATE_MS = 4 * 60 * 60 * 1000; // 4 hours (attempts 4+)
 const LOOKBACK_HOURS = 24 * 7;
-const BATCH_SIZE = 10;
+// Lowered from 10 on 2026-09-21: each re-fire runs the full ~6-call Amazon
+// inbound workflow. Ten of those per tick saturated the SP-API quota and left
+// half-built plans. Smaller batches + spacing; the cron runs every 15 min so
+// throughput is still ~16/hour, and nothing is dropped.
+const BATCH_SIZE = 4;
+const RE_FIRE_STAGGER_MS = 8_000;
 
 interface ReconcileResult {
   scanned: number;
@@ -321,11 +326,23 @@ export async function reconcileFbaHandoffs(
       );
 
       if (!options.dryRun) {
-        // fire-and-forget (fireFbaAutoSubmit is non-blocking, returns Promise<void>)
-        void fireFbaAutoSubmit({
-          cin7TransferNumber: row.cin7_transfer_number,
-          items: fbaItems,
-        });
+        // ⚠️ 2026-09-21: this was `void fireFbaAutoSubmit(...)` — up to
+        // BATCH_SIZE (10) concurrent Amazon inbound workflows per tick, which
+        // is the same stampede that stranded 11 transfers from the sync side.
+        // Await it and space the next one so the SP-API quota survives.
+        if (result.reFired > 0) {
+          await new Promise((r) => setTimeout(r, RE_FIRE_STAGGER_MS));
+        }
+        try {
+          await fireFbaAutoSubmit({
+            cin7TransferNumber: row.cin7_transfer_number,
+            items: fbaItems,
+          });
+        } catch (err: any) {
+          console.warn(
+            `[reconciler] handoff threw for ${row.cin7_transfer_number}: ${err?.message || err}`
+          );
+        }
 
         // Increment attempt counter immediately (the handoff is async, but we
         // need the throttle to take effect right now).

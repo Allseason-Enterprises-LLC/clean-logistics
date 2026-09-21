@@ -60,6 +60,8 @@ export class SpApiError extends Error {
     message: string,
     public status: number,
     public details?: unknown,
+    /** Amazon's `Retry-After` header (seconds) when present on 429/503. */
+    public retryAfter?: string | null,
   ) {
     super(message);
     this.name = 'SpApiError';
@@ -176,8 +178,69 @@ function buildUrl(baseUrl: string, path: string, query?: SpApiRequest['query']):
 /**
  * Call the Amazon SP-API directly. Returns { status, data } on 2xx, throws
  * SpApiError on auth failures / non-2xx Amazon responses / network errors.
+ *
+ * Rate limiting (added 2026-09-21 after the batch-stall incident):
+ *   Amazon throttles the FBA inbound endpoints aggressively and the 13-step
+ *   workflow makes ~6+ sequential calls per transfer. When several transfers
+ *   are handed off at once, calls return HTTP 429 (or a `QuotaExceeded`
+ *   operation problem) partway through and the run dies holding a half-built
+ *   plan — ACTIVE with items but zero shipments, which transport-recovery
+ *   cannot resume and which cannot be re-fired without cancelling first.
+ *   On 2026-09-21 that stranded 11 transfers / 17,072 units.
+ *
+ *   Every FBA call funnels through here, including `pollUntilSuccess`, so a
+ *   429 on a *poll* used to abort an otherwise-healthy run. Retrying here
+ *   fixes both cases at one choke point.
+ *
+ *   We honour `Retry-After` when Amazon sends it, else exponential backoff
+ *   with jitter. Only 429 and 5xx are retried; 4xx (bad request, auth, prep
+ *   errors) fail fast as before so real errors are not masked by delay.
  */
+const RATE_LIMIT_MAX_RETRIES = 5;
+const RATE_LIMIT_BASE_DELAY_MS = 1_000;
+const RATE_LIMIT_MAX_DELAY_MS = 20_000;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status === 503 || status === 500 || status === 502 || status === 504;
+}
+
+function retryDelayMs(attempt: number, retryAfterHeader: string | null): number {
+  const retryAfter = retryAfterHeader ? Number(retryAfterHeader) : NaN;
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, RATE_LIMIT_MAX_DELAY_MS);
+  }
+  const expo = Math.min(RATE_LIMIT_BASE_DELAY_MS * 2 ** attempt, RATE_LIMIT_MAX_DELAY_MS);
+  // Full jitter: avoids N parallel runs retrying in lockstep and re-throttling.
+  return Math.floor(expo / 2 + Math.random() * (expo / 2));
+}
+
 export async function callAmazonSpApi<T = any>(req: SpApiRequest): Promise<SpApiResponse<T>> {
+  let lastErr: SpApiError | null = null;
+
+  for (let attempt = 0; attempt <= RATE_LIMIT_MAX_RETRIES; attempt++) {
+    try {
+      return await callAmazonSpApiOnce<T>(req);
+    } catch (err: any) {
+      if (!(err instanceof SpApiError) || !isRetryableStatus(err.status)) throw err;
+      lastErr = err;
+      if (attempt === RATE_LIMIT_MAX_RETRIES) break;
+      const wait = retryDelayMs(attempt, err.retryAfter ?? null);
+      console.warn(
+        `[amazon-sp-api] HTTP ${err.status} on ${req.method} ${req.path} — ` +
+          `retry ${attempt + 1}/${RATE_LIMIT_MAX_RETRIES} in ${wait}ms`
+      );
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
+  console.error(
+    `[amazon-sp-api] Giving up on ${req.method} ${req.path} after ` +
+      `${RATE_LIMIT_MAX_RETRIES} retries (last status ${lastErr?.status})`
+  );
+  throw lastErr;
+}
+
+async function callAmazonSpApiOnce<T = any>(req: SpApiRequest): Promise<SpApiResponse<T>> {
   const region: Region = req.region ?? 'na';
   const baseUrl = SP_API_ENDPOINTS[region];
   if (!baseUrl) {
@@ -246,6 +309,7 @@ export async function callAmazonSpApi<T = any>(req: SpApiRequest): Promise<SpApi
       `Amazon SP-API error (HTTP ${amzRes.status})`,
       amzRes.status,
       respData,
+      amzRes.headers.get('retry-after'),
     );
   }
 
