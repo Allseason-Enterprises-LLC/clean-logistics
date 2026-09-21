@@ -10,6 +10,7 @@ import {
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { createShipHeroPurchaseOrder } from './shiphero-inbound';
+import { buildShipHeroOrderNumber } from './order-naming';
 
 const CIN7_BASE_URL = 'https://inventory.dearsystems.com/ExternalApi/v2';
 
@@ -447,7 +448,15 @@ function isEligibleTransferStatus(status: string, allowedStatuses: string[]): bo
 
 function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroTransferOrderInput {
   const externalOrderId = `cin7-transfer:${transfer.id}`;
-  const orderNumber = `CIN7-${transfer.transferNumber}`;
+  // Descriptive, warehouse-facing order number: AMZ_CN-CAP-SAFFRON-60CT_TR-00477.
+  // Derived from destination + line items; CIN7 `Reference` overrides it.
+  // See lib/order-naming.ts for why the TR suffix is mandatory.
+  const orderNumber = buildShipHeroOrderNumber({
+    transferNumber: transfer.transferNumber,
+    destinationName: transfer.destinationName,
+    skus: (transfer.lines || []).map((l) => l.sku),
+    reference: transfer.reference,
+  });
   const notes = [
     'CIN7 transfer order for Amazon kitting.',
     `Transfer #: ${transfer.transferNumber}`,

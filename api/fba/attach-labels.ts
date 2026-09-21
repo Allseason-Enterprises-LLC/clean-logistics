@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
+import { extractTransferNumber } from '../../lib/order-naming';
 
 export const config = { maxDuration: 60 };
 
@@ -68,12 +69,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     `);
 
     const edges = data?.orders?.data?.edges || [];
+    // Match on the embedded TR-XXXXX token, NOT a `CIN7-TR` prefix: order
+    // numbers are now descriptive (AMZ_<SKU>_TR-00477) and the old prefix
+    // check rejected every renamed order. (2026-09-21)
     const cin7Order = edges.find((e: any) =>
-      e.node.order_number?.startsWith('CIN7-TR') && e.node.fulfillment_status === 'pending'
+      extractTransferNumber(e.node.order_number) && e.node.fulfillment_status === 'pending'
     );
 
     if (!cin7Order) {
-      return res.json({ success: false, error: 'No CIN7-TR order found yet', searched: edges.length });
+      return res.json({ success: false, error: 'No CIN7 transfer order found yet', searched: edges.length });
     }
 
     const orderId = cin7Order.node.id;
