@@ -323,26 +323,62 @@ async function updatePackingNote(token: string, orderId: string, note: string): 
   await shGql(token, mutation, { d: { order_id: orderId, packing_note: note } });
 }
 
+/**
+ * Send the FBA shipment notification to the warehouse group.
+ *
+ * ⚠️ 2026-09-21: notifications had been silently dead since ~2026-09-18.
+ * TWO env-level faults, both of which this function used to swallow as a
+ * generic "send failed" line in the logs:
+ *   1. TELEGRAM_BOT_TOKEN was the old Jarvis bot, which has been REMOVED from
+ *      the group — every call returned 404 Not Found.
+ *   2. TELEGRAM_FBA_CHAT_ID was the pre-supergroup id (-5244576221). The group
+ *      was upgraded, so the live id is -1003528234475.
+ * Both values also carried a trailing newline, hence the .trim() on each.
+ *
+ * `parse_mode` is HTML, NOT Markdown: destination names and label filenames
+ * contain underscores (HAGERSTOWN_MD, FBA19QN44TW9-...-2boxes.pdf) which
+ * legacy Markdown reads as italic markers and rejects with a 400.
+ *
+ * Failures are logged LOUDLY with Amazon-visible context, because a silent
+ * notification failure means the warehouse never learns a shipment is ready.
+ */
 async function sendTelegram(text: string): Promise<boolean> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
   if (!botToken || !chatId) {
-    console.warn('[fba-post-process] Telegram env vars not set — skipping notification');
+    console.error(
+      '[fba-post-process] ⚠️ TELEGRAM NOTIFICATION SKIPPED — env vars missing ' +
+        `(token=${botToken ? 'set' : 'MISSING'}, chat_id=${chatId ? 'set' : 'MISSING'}). ` +
+        'The warehouse will NOT be notified for this shipment.'
+    );
     return false;
   }
-  const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true,
-    }),
-  });
+  let resp: Response;
+  try {
+    resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+  } catch (err: any) {
+    console.error(
+      `[fba-post-process] ⚠️ TELEGRAM NOTIFICATION FAILED (network): ${err?.message || err} — ` +
+        'the warehouse will NOT be notified for this shipment.'
+    );
+    return false;
+  }
   if (!resp.ok) {
-    const body = await resp.text();
-    console.error('[fba-post-process] Telegram send failed:', resp.status, body);
+    const body = await resp.text().catch(() => '');
+    console.error(
+      `[fba-post-process] ⚠️ TELEGRAM NOTIFICATION FAILED: HTTP ${resp.status} ${body.slice(0, 300)} — ` +
+        'the warehouse will NOT be notified for this shipment. ' +
+        '404 = bot not in the group or wrong token; 400 = chat_id stale or markup error.'
+    );
     return false;
   }
   return true;
@@ -484,53 +520,70 @@ export async function postProcessFbaShipment(
   return result;
 }
 
+function esc(s: unknown): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Build the warehouse notification.
+ *
+ * ⚠️ HTML, not Markdown (changed 2026-09-21 alongside sendTelegram). Every
+ * interpolated value goes through esc() because destination names, SKUs and
+ * label filenames contain characters Telegram's HTML parser would otherwise
+ * choke on. Underscores are the specific reason Markdown was abandoned:
+ * HAGERSTOWN_MD and FBA19QN44TW9-...-2boxes.pdf became unclosed italics → 400.
+ */
 function buildTelegramMessage(input: PostProcessInput, result: PostProcessResult): string {
   const lines: string[] = [];
   const name = input.product.productName || input.product.amazonSku;
-  lines.push(`📦 *FBA Shipment — ${name}*`);
+  const orderNo = input.shipheroOrderNumberOverride || input.cin7TransferNumber;
+  lines.push(`📦 <b>FBA Shipment — ${esc(name)}</b>`);
   lines.push('');
-  lines.push(`*Product:* ${name}`);
-  lines.push(`*CIN7 SKU:* \`${input.product.cin7Sku}\``);
-  lines.push(`*Amazon MSKU:* \`${input.product.amazonSku}\``);
+  lines.push(`<b>Product:</b> ${esc(name)}`);
+  lines.push(`<b>CIN7 SKU:</b> <code>${esc(input.product.cin7Sku)}</code>`);
+  lines.push(`<b>Amazon MSKU:</b> <code>${esc(input.product.amazonSku)}</code>`);
   if (input.product.fnsku || input.product.asin) {
     const bits: string[] = [];
-    if (input.product.fnsku) bits.push(`*FNSKU:* \`${input.product.fnsku}\``);
-    if (input.product.asin) bits.push(`*ASIN:* \`${input.product.asin}\``);
+    if (input.product.fnsku) bits.push(`<b>FNSKU:</b> <code>${esc(input.product.fnsku)}</code>`);
+    if (input.product.asin) bits.push(`<b>ASIN:</b> <code>${esc(input.product.asin)}</code>`);
     lines.push(bits.join(' · '));
   }
   lines.push('');
-  lines.push('*Shipment Details:*');
-  lines.push(`• Units: *${input.quantity.totalUnits.toLocaleString()}* (${input.quantity.boxes} cases × ${input.quantity.unitsPerBox}/case)`);
+  lines.push('<b>Shipment Details:</b>');
+  lines.push(`• Units: <b>${input.quantity.totalUnits.toLocaleString()}</b> (${input.quantity.boxes} cases × ${input.quantity.unitsPerBox}/case)`);
   lines.push(`• Case Pack: ${input.quantity.unitsPerBox} per case`);
   if (input.expiration) {
-    const lotSuffix = input.lot ? ` (Lot ${input.lot})` : '';
-    lines.push(`• Expiration: *${input.expiration}*${lotSuffix} — FEFO`);
+    const lotSuffix = input.lot ? ` (Lot ${esc(input.lot)})` : '';
+    lines.push(`• Expiration: <b>${esc(input.expiration)}</b>${lotSuffix} — FEFO`);
   }
   lines.push(`• Box Dims: ${input.box.length} × ${input.box.width} × ${input.box.height} inches, ${input.box.weightLbs} lbs/case`);
-  lines.push(`• Ship From: Clean Nutra, 6425 S Jones Blvd, Las Vegas NV 89118`);
+  lines.push('• Ship From: Clean Nutra, 6425 S Jones Blvd, Las Vegas NV 89118');
   lines.push('');
-  lines.push(`*ShipHero Order:* ${input.shipheroOrderNumberOverride || input.cin7TransferNumber}`);
-  lines.push(`*Inbound Plan:* \`${input.fbaResult.planId}\``);
+  lines.push(`<b>ShipHero Order:</b> ${esc(orderNo)}`);
+  lines.push(`<b>Inbound Plan:</b> <code>${esc(input.fbaResult.planId)}</code>`);
   lines.push('');
-  lines.push(`*Amazon Optimized Splits — ${result.labels.length} destination(s) (Partnered UPS Ground):*`);
+  lines.push(`<b>Amazon Optimized Splits — ${result.labels.length} destination(s) (Partnered UPS Ground):</b>`);
   for (const l of result.labels) {
-    lines.push(`• \`${l.fbaId}\` → ${l.destination} — ${l.boxes} boxes`);
+    lines.push(`• <code>${esc(l.fbaId)}</code> → ${esc(l.destination)} — ${l.boxes} boxes`);
   }
   lines.push('');
   if (typeof result.totalShippingCost === 'number') {
-    lines.push(`*Total shipping:* $${result.totalShippingCost.toFixed(2)} (UPS Partnered Carrier)`);
+    lines.push(`<b>Total shipping:</b> $${result.totalShippingCost.toFixed(2)} (UPS Partnered Carrier)`);
   }
-  lines.push(`*Placement fee:* $${result.placementFee} ${result.placementFee === 0 ? '(Amazon-optimized splits)' : ''}`);
+  lines.push(`<b>Placement fee:</b> $${result.placementFee} ${result.placementFee === 0 ? '(Amazon-optimized splits)' : ''}`);
   lines.push('');
-  lines.push(`📋 *Shipping Labels (4×6 Thermal — one PDF per destination):*`);
+  lines.push('📋 <b>Shipping Labels (4×6 Thermal — one PDF per destination):</b>');
   for (const l of result.labels) {
-    lines.push(`• [${l.destination} (${l.boxes})](${l.supabaseUrl})`);
+    lines.push(`• <a href="${esc(l.supabaseUrl)}">${esc(l.destination)} (${l.boxes})</a>`);
   }
   lines.push('');
-  lines.push(`(Labels also attached to ShipHero order \`${input.shipheroOrderNumberOverride || input.cin7TransferNumber}\` + in packing note)`);
+  lines.push(`(Labels also attached to ShipHero order <code>${esc(orderNo)}</code> + in packing note)`);
   lines.push('');
-  lines.push(`*Prep:* FNSKU labeling — apply one unique label per box · SELLER`);
+  lines.push('<b>Prep:</b> FNSKU labeling — apply one unique label per box · SELLER');
   lines.push('');
-  lines.push(`✅ Ready for warehouse processing`);
+  lines.push('✅ Ready for warehouse processing');
   return lines.join('\n');
 }
