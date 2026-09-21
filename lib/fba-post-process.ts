@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { callAmazonSpApi } from './amazon-sp-api-client';
+import { extractTransferNumber } from './order-naming';
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
 const SUPABASE_BUCKET = 'shipment-labels';
@@ -265,24 +266,76 @@ async function uploadToSupabase(
   return data.publicUrl;
 }
 
+/**
+ * Resolve the ShipHero order for a transfer.
+ *
+ * ⚠️ Must tolerate BOTH naming schemes (2026-09-21):
+ *   legacy: `CIN7-TR-00477`
+ *   new:    `AMZ_CN-CAP-SAFFRON-60CT_TR-00477`  (or a custom CIN7 Reference)
+ *
+ * `orders(order_number:)` is an EXACT match, so the old single-query approach
+ * silently returned null for renamed orders — which would mean labels never
+ * attach. Strategy:
+ *   1. exact match on whatever we were handed (fast path, both schemes)
+ *   2. fall back to scanning recent orders for one whose number contains the
+ *      same `TR-XXXXX` token
+ */
 async function findShipheroOrder(
   token: string,
   cin7TransferNumber: string
 ): Promise<{ orderId: string; accountId: string } | null> {
-  const query = `
+  const exact = async (orderNumber: string) => {
+    const query = `
+      query {
+        orders(order_number: "${orderNumber}") {
+          data(first: 3) {
+            edges { node { id order_number account_id } }
+          }
+        }
+      }
+    `;
+    const data = await shGql(token, query);
+    const node = (data?.orders?.data?.edges ?? [])[0]?.node;
+    return node ? { orderId: node.id, accountId: node.account_id } : null;
+  };
+
+  // 1) exact, as given
+  const direct = await exact(cin7TransferNumber);
+  if (direct) return direct;
+
+  const tr = extractTransferNumber(cin7TransferNumber);
+  if (!tr) return null;
+
+  // 2) legacy form, for callers that passed a bare/renamed value
+  const legacy = await exact(`CIN7-${tr}`);
+  if (legacy) return legacy;
+
+  // 3) scan recent orders for the TR token embedded in a descriptive name
+  const scan = `
     query {
-      orders(order_number: "${cin7TransferNumber}") {
-        data(first: 3) {
+      orders(sort: "-created_at") {
+        data(first: 100) {
           edges { node { id order_number account_id } }
         }
       }
     }
   `;
-  const data = await shGql(token, query);
-  const edges = data?.orders?.data?.edges ?? [];
-  const node = edges[0]?.node;
-  if (!node) return null;
-  return { orderId: node.id, accountId: node.account_id };
+  try {
+    const data = await shGql(token, scan);
+    const edges = data?.orders?.data?.edges ?? [];
+    const hit = edges.find(
+      (e: any) => extractTransferNumber(e?.node?.order_number) === tr
+    );
+    if (hit) {
+      console.log(
+        `[fba-post-process] resolved ${tr} to ShipHero order ${hit.node.order_number} by TR scan`
+      );
+      return { orderId: hit.node.id, accountId: hit.node.account_id };
+    }
+  } catch (err: any) {
+    console.warn(`[fba-post-process] TR scan failed for ${tr}: ${err?.message || err}`);
+  }
+  return null;
 }
 
 async function attachToShipHero(

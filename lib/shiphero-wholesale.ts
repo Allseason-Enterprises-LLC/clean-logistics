@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { extractTransferNumber } from './order-naming';
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
 
@@ -324,9 +325,10 @@ export async function findOrderByPartnerIdOrRecent(
     `);
     const edges = data?.orders?.data?.edges;
     if (edges && edges.length > 0) {
-      // Find the most recent pending order with CIN7-TR pattern
+      // Match the embedded TR-XXXXX token rather than a `CIN7-TR` prefix —
+      // order numbers are now descriptive (AMZ_<SKU>_TR-00477). (2026-09-21)
       const cin7Order = edges.find((e: any) =>
-        e.node.order_number?.startsWith('CIN7-TR') &&
+        extractTransferNumber(e.node.order_number) &&
         e.node.fulfillment_status === 'pending'
       );
       if (cin7Order) {
