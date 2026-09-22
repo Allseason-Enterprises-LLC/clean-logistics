@@ -267,6 +267,47 @@ function isPermanentConfigError(detail: string | null | undefined): boolean {
 /** Attempts allowed for a config error before we stop and escalate. */
 const CONFIG_ERROR_MAX_ATTEMPTS = 3;
 
+/**
+ * Third error class: RATE LIMIT / QUOTA (added 2026-09-22).
+ *
+ * ShipHero's GraphQL credit pool is shared with the live pipeline. A lot
+ * breakdown costs ~1006 credits against a 4004 ceiling, so roughly every
+ * fourth transfer in a burst fails with `code 30 … not enough credits`. The
+ * pool refills in minutes.
+ *
+ * Before this class existed these fell into the generic transient branch and
+ * waited the full RETRY_GAP_EARLY_MS (1 hour) — and because the backoff
+ * outlived the condition by ~55 minutes, a human had to null
+ * last_fba_handoff_at to release each one. On 2026-09-22 that happened SIX
+ * times in one night (TR-00460, 00464, 00465, 00472, 00477, 00462), every one
+ * self-resolving within minutes of the retry.
+ *
+ * These are safe to retry fast: the credit error happens BEFORE any Amazon
+ * plan is created (it kills the ShipHero lot breakdown), so there is nothing
+ * to duplicate — and the last-moment duplicate gate re-checks Amazon anyway.
+ */
+function isRateLimitError(detail: string | null | undefined): boolean {
+  const d = String(detail || '');
+  return (
+    d.includes('not enough credits') ||
+    d.includes('"code":30') ||
+    d.includes('rate limit') ||
+    d.includes('HTTP 429')
+  );
+}
+
+/** Backoff for rate-limit/quota errors — the pool refills in minutes. */
+const RATE_LIMIT_GAP_MS = 5 * 60 * 1000;
+
+/**
+ * The backoff window for a row, by error class. Single source of truth so the
+ * retry DECISION and the skipped[] ledger can never report different numbers.
+ */
+function retryGapFor(row: BridgeRow): number {
+  if (isRateLimitError(row.last_fba_handoff_detail)) return RATE_LIMIT_GAP_MS;
+  return row.fba_handoff_attempts >= 3 ? RETRY_GAP_LATE_MS : RETRY_GAP_EARLY_MS;
+}
+
 function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
   // Config errors (401/403) are NOT transient — cap them so a permanent
   // misconfiguration escalates to a human instead of looping forever.
@@ -281,8 +322,7 @@ function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
   // with backoff until the fba_shipments row exists. A cap only converts a long
   // outage into a permanent silent failure (see 2026-08-04..07 incident).
   if (row.last_fba_handoff_at) {
-    const gap =
-      row.fba_handoff_attempts >= 3 ? RETRY_GAP_LATE_MS : RETRY_GAP_EARLY_MS;
+    const gap = retryGapFor(row);
     const last = new Date(row.last_fba_handoff_at).getTime();
     if (Date.now() - last < gap) {
       return { retry: false, reason: 'throttled' };
@@ -433,16 +473,18 @@ export async function reconcileFbaHandoffs(
           });
         } else {
           result.throttled++;
-          const gap =
-            row.fba_handoff_attempts >= 3 ? RETRY_GAP_LATE_MS : RETRY_GAP_EARLY_MS;
+          const gap = retryGapFor(row);
           const waitedMs = row.last_fba_handoff_at
             ? Date.now() - new Date(row.last_fba_handoff_at).getTime()
             : 0;
           const remainingMin = Math.max(0, Math.ceil((gap - waitedMs) / 60000));
+          const cls = isRateLimitError(row.last_fba_handoff_detail)
+            ? 'rate_limit'
+            : 'transient';
           result.skipped.push({
             transfer: row.cin7_transfer_number,
             reason: 'backoff_throttled',
-            detail: `${remainingMin}min remaining (attempt ${row.fba_handoff_attempts}, gap ${Math.round(gap / 60000)}min, last_fba_handoff_at=${row.last_fba_handoff_at ?? 'null'})`,
+            detail: `${remainingMin}min remaining (class ${cls}, attempt ${row.fba_handoff_attempts}, gap ${Math.round(gap / 60000)}min, last_fba_handoff_at=${row.last_fba_handoff_at ?? 'null'})`,
           });
         }
         continue;
