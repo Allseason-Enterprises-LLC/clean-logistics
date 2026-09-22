@@ -21,6 +21,9 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { attemptTransportRecovery } from './fba-transport-recovery';
+import { callAmazonSpApi } from './amazon-sp-api-client';
+
+const FBA_INBOUND_BASE = '/inbound/fba/2024-03-20';
 
 const ALERT_AT_ATTEMPT = 3; // first Telegram alert
 const ALERT_EVERY_AFTER = 6; // then every Nth attempt
@@ -279,6 +282,64 @@ function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
   return { retry: true };
 }
 
+/**
+ * Duplicate-safety check for re-fires (TR-00464, 2026-09-22).
+ *
+ * We treat a `cancelled` fba_shipments row as "the previous attempt left
+ * nothing on Amazon". That is a SNAPSHOT and it can go stale: on TR-00464 the
+ * plan reported 0 shipments when inspected, then completed generateShipments
+ * moments later. The re-fire produced a second plan and Amazon held 2 x 1750
+ * units, one with a live IN_TRANSIT shipment.
+ *
+ * So before firing, re-read every plan referenced by this transfer's cancelled
+ * rows. If any now has live (non-CANCELLED) shipments, the earlier run actually
+ * succeeded and re-firing would duplicate real inbound inventory.
+ *
+ * Returns the offending plan, or null when it is genuinely safe to fire.
+ * Throws on verification failure so the caller can fail CLOSED.
+ */
+async function findLivePlanOnCancelledRows(
+  db: SupabaseClient,
+  transferNumber: string
+): Promise<{ planId: string; liveShipments: number } | null> {
+  const candidates = Array.from(
+    new Set([
+      transferNumber,
+      transferNumber.startsWith('CIN7-') ? transferNumber.slice(5) : `CIN7-${transferNumber}`,
+    ])
+  );
+
+  const { data, error } = await db
+    .from('fba_shipments')
+    .select('plan_id, status')
+    .in('cin7_transfer_number', candidates)
+    .not('plan_id', 'is', null);
+
+  if (error) throw new Error(`duplicate-gate query failed: ${error.message}`);
+
+  const planIds = Array.from(
+    new Set((data || []).map((r: any) => r.plan_id as string).filter(Boolean))
+  );
+  if (planIds.length === 0) return null;
+
+  for (const planId of planIds) {
+    const resp = await callAmazonSpApi<any>({
+      method: 'GET',
+      path: `${FBA_INBOUND_BASE}/inboundPlans/${planId}`,
+    });
+    const plan = resp?.data;
+    // A voided/cancelled PLAN commits nothing.
+    const planStatus = String(plan?.status || '').toUpperCase();
+    if (planStatus === 'VOIDED' || planStatus === 'CANCELLED') continue;
+
+    const live = (plan?.shipments || []).filter(
+      (s: any) => String(s?.status || '').toUpperCase() !== 'CANCELLED'
+    );
+    if (live.length > 0) return { planId, liveShipments: live.length };
+  }
+  return null;
+}
+
 async function sendTelegramAlert(message: string): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
@@ -352,6 +413,48 @@ export async function reconcileFbaHandoffs(
       }
 
       processed++;
+
+      // ⚠️ LAST-MOMENT DUPLICATE GATE (added 2026-09-22 after TR-00464).
+      //
+      // A cancelled `fba_shipments` row is our signal that the previous attempt
+      // left nothing on Amazon — but that snapshot can be STALE. On TR-00464
+      // the 06:00 plan had 0 shipments when it was inspected, then finished
+      // generateShipments moments later; the re-fire built a SECOND plan and
+      // Amazon ended up holding 2 x 1750 units with a live IN_TRANSIT shipment
+      // on the first. Cancelling a draft is therefore not proof of absence.
+      //
+      // Re-read the Amazon plan RIGHT BEFORE firing. If any cancelled row for
+      // this transfer points at a plan that now has live (non-CANCELLED)
+      // shipments, the previous run actually succeeded: rebind instead of
+      // re-firing, and escalate so a human confirms.
+      try {
+        const stale = await findLivePlanOnCancelledRows(db, row.cin7_transfer_number);
+        if (stale) {
+          const msg =
+            `🔴 FBA re-fire ABORTED — the previous attempt actually succeeded\n\n` +
+            `Transfer: ${row.cin7_transfer_number}\n` +
+            `Plan: ${stale.planId} now has ${stale.liveShipments} live shipment(s)\n\n` +
+            `A cancelled fba_shipments row said "nothing on Amazon", but the plan ` +
+            `completed after that check. Re-firing would create DUPLICATE inbound ` +
+            `shipments. Bind this plan's ids to the row instead.`;
+          console.error(`[reconciler] ${msg.replace(/\n/g, ' ')}`);
+          await sendTelegramAlert(msg);
+          result.errors.push(
+            `${row.cin7_transfer_number}: re-fire aborted — plan ${stale.planId} has ${stale.liveShipments} live shipments`
+          );
+          continue;
+        }
+      } catch (err: any) {
+        // Fail CLOSED: if we cannot verify, do NOT fire. A missed re-fire is
+        // recoverable next tick; a duplicate inbound shipment is not.
+        console.error(
+          `[reconciler] duplicate gate failed for ${row.cin7_transfer_number} (${err?.message || err}) — skipping this tick`
+        );
+        result.errors.push(
+          `${row.cin7_transfer_number}: duplicate gate unavailable — skipped (fail-closed)`
+        );
+        continue;
+      }
 
       // Extract items from the bridge's request_payload (partnerLineItems)
       const items = row.request_payload?.partnerLineItems;
