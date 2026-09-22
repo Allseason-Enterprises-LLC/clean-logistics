@@ -326,9 +326,17 @@ async function findShipheroOrder(
   // 2) scan recent orders for a LIVE order carrying this TR token. Runs BEFORE
   // the legacy `CIN7-<TR>` guess, because after a cancel+replace the legacy
   // name is precisely the dead order we must avoid.
+  //
+  // ⚠️ `Query.orders` has NO `sort` argument — passing one makes the whole
+  // query fail with "Unknown argument 'sort'" (found 2026-09-22 while
+  // recovering TR-00459). Use `created_from` to bound the window instead, and
+  // `fulfillment_status_not_in` to exclude dead orders server-side.
+  const createdFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 19);
   const scan = `
     query {
-      orders(sort: "-created_at") {
+      orders(created_from: "${createdFrom}", fulfillment_status_not_in: ["canceled", "cancelled"]) {
         data(first: 100) {
           edges { node { id order_number account_id fulfillment_status } }
         }
@@ -511,6 +519,47 @@ export async function postProcessFbaShipment(
     }
     shOrder = await findShipheroOrder(shToken, input.cin7TransferNumber);
     shOrderNumber = input.cin7TransferNumber;
+  }
+  if (!shOrder) {
+    // ⚠️ AUTHORITATIVE FALLBACK (2026-09-22, found recovering TR-00459).
+    //
+    // Two things break the name-based lookups above once an order has been
+    // cancelled and replaced:
+    //   - the per-lot child name (`CIN7-TR-00459-2510014A`) never exists under
+    //     the descriptive naming scheme, and
+    //   - the legacy `CIN7-<TR>` name resolves ONLY to the cancelled order,
+    //     which we now correctly refuse to attach to.
+    // Result: `relabel` threw "ShipHero order not found" even though a healthy
+    // replacement order was sitting right there.
+    //
+    // The bridge table records the real order for this transfer, so consult it
+    // rather than guessing at names.
+    const tr = extractTransferNumber(input.cin7TransferNumber);
+    if (tr) {
+      try {
+        const db = getSupabase();
+        const { data: bridge } = await db
+          .from('cin7_transfer_shiphero_orders')
+          .select('shiphero_order_number')
+          .eq('cin7_transfer_number', tr)
+          .not('shiphero_order_number', 'is', null)
+          .maybeSingle();
+        const bridgeName = (bridge as any)?.shiphero_order_number;
+        if (bridgeName) {
+          shOrder = await findShipheroOrder(shToken, bridgeName);
+          if (shOrder) {
+            shOrderNumber = bridgeName;
+            console.log(
+              `[fba-post-process] resolved ${tr} via the bridge table to ${bridgeName}`
+            );
+          }
+        }
+      } catch (err: any) {
+        console.warn(
+          `[fba-post-process] bridge-table order lookup failed for ${tr}: ${err?.message || err}`
+        );
+      }
+    }
   }
   if (!shOrder) {
     throw new Error(`ShipHero order not found for ${input.shipheroOrderNumberOverride || input.cin7TransferNumber}`);
