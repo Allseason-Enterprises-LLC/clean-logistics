@@ -55,7 +55,10 @@ eq(
     destinationName: 'TikTok Warehouse - FC02_ORD1',
     skus: ['CN-GUM-SHILAJITGU-60CT'],
   }),
-  'TIK_CN-GUM-SHILAJITGU-60CT_TR-00480'
+  // Was 'TIK_CN-GUM-SHILAJITGU-60CT_TR-00480' (35 chars) — ShipHero rejects
+  // anything over 32 ("Order number is limited to 32 characters"), so this
+  // assertion was encoding a bug. The `CN-` vendor prefix is trimmed first.
+  'TIK_GUM-SHILAJITGU-60CT_TR-00480'
 );
 
 console.log('\n--- COLLISION SAFETY (the reason the TR suffix exists) ---');

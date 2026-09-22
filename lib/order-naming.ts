@@ -124,6 +124,66 @@ export interface BuildOrderNumberInput {
  *   3. `<PLATFORM>_MULTI-<n>SKU_<TR>` when the transfer has several SKUs
  *   4. `<PLATFORM>_<TR>` when no SKU is known
  */
+/**
+ * ShipHero rejects any order number longer than this with
+ * `ShipHero GraphQL errors: Order number is limited to 32 characters`.
+ *
+ * ⚠️ 2026-09-22: this cap was missed when the naming scheme shipped
+ * (`5c13085`). The dry-run reported names up to 38 chars and I read that as
+ * fine. In production it silently killed the CIN7 sync for the affected
+ * transfers: the bridge row flipped to `status: 'failed'`, which EXCLUDES it
+ * from every future cron run — so the transfer stops being retried entirely.
+ *
+ * 12 of the 14 transfers in the 2026-09-21 recovery exceeded it; the 2 that
+ * worked (TR-00459, TR-00474) happened to land on exactly 32.
+ */
+export const SHIPHERO_ORDER_NUMBER_MAX = 32;
+
+/**
+ * Fit `<PLATFORM>_<SKU>_<TR>` into the 32-char limit by trimming ONLY the SKU
+ * segment — the platform code and the `TR-XXXXX` token must survive intact
+ * because every downstream lookup keys off the TR token
+ * (`extractTransferNumber`), and the platform prefix is what the floor reads.
+ */
+function fitOrderNumber(platform: string, sku: string, tr: string): string {
+  const full = `${platform}_${sku}_${tr}`;
+  if (full.length <= SHIPHERO_ORDER_NUMBER_MAX) return full;
+
+  // Budget left for the SKU once the mandatory parts are placed.
+  const fixed = `${platform}__${tr}`.length;
+  const budget = SHIPHERO_ORDER_NUMBER_MAX - fixed;
+  if (budget <= 0) {
+    // Pathological: even the platform + TR alone is too long. Keep the TR.
+    return `${platform}_${tr}`.slice(0, SHIPHERO_ORDER_NUMBER_MAX);
+  }
+
+  // Drop the least-identifying parts of the SKU first. Clean Nutra SKUs read
+  // `CN-CAP-PHYTOFRESH-60CT`: the vendor prefix (`CN`) and the form code
+  // (`CAP`/`DRP`/`GUM`) are far less distinguishing than the product name, so
+  // strip those before truncating the name itself.
+  //
+  // ⚠️ Never strip so far that the PRODUCT NAME is gone. Peeling blindly turned
+  // `CN-CAP-SUPERCALIFRAGILISTIC-EXPIALIDOCIOUS-240CT` into `AMZ_240CT_TR-00999`
+  // — a size code with no product, useless to the floor and prone to collisions.
+  // Keep the longest (most identifying) segment as the anchor.
+  const parts = sku.split('-');
+  const anchor = parts.reduce((a, b) => (b.length > a.length ? b : a), '');
+  let trimmed = sku;
+  while (trimmed.length > budget && parts.length > 1) {
+    // Stop peeling if the next removal would discard the anchor segment.
+    if (parts[0] === anchor && parts.length > 1) break;
+    parts.shift();
+    trimmed = parts.join('-');
+  }
+  if (trimmed.length > budget) {
+    // Still too long: prefer the anchor over a blind head-slice.
+    trimmed = (anchor.length <= budget ? anchor : anchor.slice(0, budget));
+  }
+  trimmed = trimmed.replace(/[-_.]+$/, '');
+
+  return `${platform}_${trimmed}_${tr}`;
+}
+
 export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {
   const tr = bareTransferNumber(input.transferNumber);
 
@@ -131,7 +191,15 @@ export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {
   if (ref) {
     // Guarantee the TR number is present so the order stays traceable and
     // every downstream lookup keeps working, even on a hand-typed reference.
-    return extractTransferNumber(ref) ? ref : `${ref}_${tr}`;
+    const withTr = extractTransferNumber(ref) ? ref : `${ref}_${tr}`;
+    // An ops-typed reference is still subject to ShipHero's hard limit.
+    return withTr.length <= SHIPHERO_ORDER_NUMBER_MAX
+      ? withTr
+      : fitOrderNumber(
+          'REF',
+          withTr.replace(new RegExp(`_?${tr}$`), ''),
+          tr
+        );
   }
 
   const platform = resolvePlatformCode(input.destinationName);
@@ -139,8 +207,10 @@ export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {
     new Set((input.skus ?? []).map((s) => sanitizeSegment(s ?? '')).filter(Boolean))
   );
 
-  if (distinct.length === 1) return `${platform}_${distinct[0]}_${tr}`;
-  if (distinct.length > 1) return `${platform}_MULTI-${distinct.length}SKU_${tr}`;
+  if (distinct.length === 1) return fitOrderNumber(platform, distinct[0], tr);
+  if (distinct.length > 1) {
+    return fitOrderNumber(platform, `MULTI-${distinct.length}SKU`, tr);
+  }
   return `${platform}_${tr}`;
 }
 
