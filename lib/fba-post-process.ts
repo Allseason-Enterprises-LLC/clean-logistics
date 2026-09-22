@@ -280,6 +280,16 @@ async function uploadToSupabase(
  *   2. fall back to scanning recent orders for one whose number contains the
  *      same `TR-XXXXX` token
  */
+/**
+ * ShipHero spells it "canceled" (one L) in `fulfillment_status`, but be liberal
+ * about both spellings and casing so a schema tweak can't silently re-open the
+ * TR-00474 bug (labels attached to a dead order).
+ */
+function isCancelledStatus(status: string | null | undefined): boolean {
+  const s = String(status || '').toLowerCase();
+  return s.includes('cancel') || s.includes('void');
+}
+
 async function findShipheroOrder(
   token: string,
   cin7TransferNumber: string
@@ -288,15 +298,22 @@ async function findShipheroOrder(
     const query = `
       query {
         orders(order_number: "${orderNumber}") {
-          data(first: 3) {
-            edges { node { id order_number account_id } }
+          data(first: 5) {
+            edges { node { id order_number account_id fulfillment_status } }
           }
         }
       }
     `;
     const data = await shGql(token, query);
-    const node = (data?.orders?.data?.edges ?? [])[0]?.node;
-    return node ? { orderId: node.id, accountId: node.account_id } : null;
+    const nodes = (data?.orders?.data?.edges ?? []).map((e: any) => e.node);
+    // ⚠️ NEVER attach to a cancelled order. Ops cancels a broken order and the
+    // pipeline then builds a REPLACEMENT; if we match the cancelled one the
+    // labels land where the warehouse will never look. Observed on TR-00474
+    // (2026-09-21): 5 label PDFs attached to canceled `CIN7-TR-00474` while the
+    // live replacement `AMZ_CN-CAP-VBIOTIC-90CT_TR-00474` had none.
+    const live = nodes.find((n: any) => !isCancelledStatus(n?.fulfillment_status));
+    if (!live) return null;
+    return { orderId: live.id, accountId: live.account_id };
   };
 
   // 1) exact, as given
@@ -306,16 +323,14 @@ async function findShipheroOrder(
   const tr = extractTransferNumber(cin7TransferNumber);
   if (!tr) return null;
 
-  // 2) legacy form, for callers that passed a bare/renamed value
-  const legacy = await exact(`CIN7-${tr}`);
-  if (legacy) return legacy;
-
-  // 3) scan recent orders for the TR token embedded in a descriptive name
+  // 2) scan recent orders for a LIVE order carrying this TR token. Runs BEFORE
+  // the legacy `CIN7-<TR>` guess, because after a cancel+replace the legacy
+  // name is precisely the dead order we must avoid.
   const scan = `
     query {
       orders(sort: "-created_at") {
         data(first: 100) {
-          edges { node { id order_number account_id } }
+          edges { node { id order_number account_id fulfillment_status } }
         }
       }
     }
@@ -324,18 +339,22 @@ async function findShipheroOrder(
     const data = await shGql(token, scan);
     const edges = data?.orders?.data?.edges ?? [];
     const hit = edges.find(
-      (e: any) => extractTransferNumber(e?.node?.order_number) === tr
+      (e: any) =>
+        extractTransferNumber(e?.node?.order_number) === tr &&
+        !isCancelledStatus(e?.node?.fulfillment_status)
     );
     if (hit) {
       console.log(
-        `[fba-post-process] resolved ${tr} to ShipHero order ${hit.node.order_number} by TR scan`
+        `[fba-post-process] resolved ${tr} to LIVE ShipHero order ${hit.node.order_number} by TR scan`
       );
       return { orderId: hit.node.id, accountId: hit.node.account_id };
     }
   } catch (err: any) {
     console.warn(`[fba-post-process] TR scan failed for ${tr}: ${err?.message || err}`);
   }
-  return null;
+
+  // 3) last resort: the legacy name (only reached if no live order was found)
+  return await exact(`CIN7-${tr}`);
 }
 
 async function attachToShipHero(
