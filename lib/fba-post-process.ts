@@ -365,6 +365,27 @@ async function findShipheroOrder(
   return await exact(`CIN7-${tr}`);
 }
 
+/**
+ * Attach a label PDF to a ShipHero order, skipping the write when a file of the
+ * same name is already there.
+ *
+ * ⚠️ IDEMPOTENCY IS MANDATORY — ShipHero has **no attachment-delete mutation**
+ * (verified by introspection 2026-09-22: only `order_add_attachment`,
+ * `purchase_order_add_attachment`, `return_add_attachment`). A duplicate
+ * attachment is therefore PERMANENT and has to be explained to the warehouse
+ * by hand.
+ *
+ * How it bit us (TR-00460): auto-submit built the plan and attached 5 labels at
+ * 04:03, then died on a ShipHero credit error before persisting the row. The
+ * recovery `POST /api/fba/relabel` re-attached the same 5 at 04:20 → 10
+ * attachments, 2 of every label, on a live order the floor picks from. Storage
+ * upserts by path, so storage looked perfectly clean — the double only shows on
+ * the ShipHero order.
+ *
+ * `relabel` is the documented recovery for "plan built but labels missing", so
+ * it WILL be pointed at orders that already hold some attachments. Dedupe here
+ * rather than asking every caller to remember.
+ */
 async function attachToShipHero(
   token: string,
   orderId: string,
@@ -373,6 +394,29 @@ async function attachToShipHero(
   description: string,
   filename: string
 ): Promise<string> {
+  // Pre-flight: is this filename already attached?
+  try {
+    const existing = await shGql(
+      token,
+      `query { order(id: "${orderId}") { data { attachments(first: 60) { edges { node { id filename } } } } } }`
+    );
+    const edges = existing?.order?.data?.attachments?.edges ?? [];
+    const hit = edges.find((e: any) => e?.node?.filename === filename);
+    if (hit) {
+      console.log(
+        `[fba-post-process] attachment "${filename}" already on order ${orderId} — skipping (ShipHero cannot delete duplicates)`
+      );
+      return hit.node.id ?? '';
+    }
+  } catch (err: any) {
+    // Fail OPEN: if the check itself fails we still attach, because a missing
+    // label is worse for the floor than a duplicate. But log it loudly.
+    console.warn(
+      `[fba-post-process] could not verify existing attachments on ${orderId} ` +
+        `(${err?.message || err}) — attaching "${filename}" anyway; check for duplicates`
+    );
+  }
+
   const mutation = `
     mutation($d: OrderAddAttachmentInput!) {
       order_add_attachment(data: $d) {
