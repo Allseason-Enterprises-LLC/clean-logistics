@@ -70,6 +70,14 @@ export interface ShipHeroTransferOrderInput {
   notes?: string;
   source?: string;
   reference?: string | null;
+  /**
+   * CIN7 destination name (e.g. "Amazon FBA Warehouse"). Carried through so the
+   * ShipHero order builder can tell an FBA-bound transfer from a regular one and
+   * route it to `wholesale_order_create`. Before this existed the builder had to
+   * guess from shippingAddress.company (always our own legal entity) and missed
+   * every time — see the 2026-09-22 Wholesale-flag incident.
+   */
+  cin7Destination?: string | null;
   rawTransfer?: any;
 }
 
