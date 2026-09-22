@@ -22,8 +22,18 @@ ok('ignores VOIDED/CANCELLED plans (they commit nothing)',
    src.includes("planStatus === 'VOIDED'") && src.includes("planStatus === 'CANCELLED'"));
 ok('ignores CANCELLED shipments inside a live plan',
    /String\(s\?\.status \|\| ''\)\.toUpperCase\(\) !== 'CANCELLED'/.test(src));
+// Assert the BEHAVIOUR, not a byte distance: the catch block around the gate
+// must end in `continue` (skip the row) and must never fall through to a fire.
+// (The original /...{0,300}continue;/ window broke when a skipped.push() was
+// added between the log and the continue — the behaviour was never broken.)
+const gateCatch = (() => {
+  const i = src.indexOf('duplicate gate failed');
+  const j = src.indexOf('continue;', i);
+  const k = src.indexOf('fireFbaAutoSubmit(', i);
+  return { hasContinue: i > -1 && j > -1, continueBeforeFire: j > -1 && (k === -1 || j < k) };
+})();
 ok('FAILS CLOSED on verification error (skips rather than fires)',
-   /duplicate gate failed[\s\S]{0,300}continue;/.test(src));
+   gateCatch.hasContinue && gateCatch.continueBeforeFire);
 ok('escalates to Telegram when it aborts', /re-fire ABORTED/.test(src));
 ok('cites the TR-00464 incident', src.includes('TR-00464'));
 
