@@ -100,10 +100,39 @@ export function bareTransferNumber(transferNumber: string): string {
  *
  * This is what keeps old and new names resolvable by the same lookup.
  */
+/**
+ * Recover the CIN7 transfer number from any order-number form we have ever
+ * emitted. Every label attachment and order lookup depends on this, so it must
+ * handle all three generations:
+ *
+ *   1. legacy            `CIN7-TR-00460`, `CIN7-TR-00459-2510014A`
+ *   2. descriptive + TR  `AMZ_CN-CAP-SAFFRON-60CT_TR-00459`
+ *   3. descriptive, bare `AMZ_CN-CAP-PHYTOFRESH-60CT_00460`  ← the 32-char fix
+ *
+ * Form 3 exists because ShipHero caps order numbers at 32 characters and the
+ * literal `TR-` is 3 of them. Dropping it FIRST keeps the product name readable
+ * (10 of the 14 transfers in the 2026-09-21 recovery kept their full SKU this
+ * way, vs 0 when the SKU was trimmed first).
+ *
+ * The bare-number rule is anchored to a trailing `_<digits>` because the
+ * transfer number is ALWAYS the last underscore-delimited segment. That anchor
+ * is what stops a SKU's own digits from being misread: `AMZ_CN-CAP-OMEGA3-1000`
+ * correctly yields null (the digits are dash-joined inside the SKU, not a
+ * trailing `_` segment).
+ */
 export function extractTransferNumber(orderNumber: string | null | undefined): string | null {
   if (!orderNumber) return null;
-  const m = String(orderNumber).match(/TR-\d{3,}/i);
-  return m ? m[0].toUpperCase() : null;
+  const s = String(orderNumber);
+
+  // Forms 1 and 2: an explicit TR token (tolerate a missing dash defensively).
+  const explicit = s.match(/TR-?(\d{3,})/i);
+  if (explicit) return `TR-${explicit[1]}`;
+
+  // Form 3: bare transfer number as the FINAL `_` segment.
+  const bare = s.match(/_(\d{3,6})$/);
+  if (bare) return `TR-${bare[1]}`;
+
+  return null;
 }
 
 export interface BuildOrderNumberInput {
@@ -140,48 +169,49 @@ export interface BuildOrderNumberInput {
 export const SHIPHERO_ORDER_NUMBER_MAX = 32;
 
 /**
- * Fit `<PLATFORM>_<SKU>_<TR>` into the 32-char limit by trimming ONLY the SKU
- * segment — the platform code and the `TR-XXXXX` token must survive intact
- * because every downstream lookup keys off the TR token
- * (`extractTransferNumber`), and the platform prefix is what the floor reads.
+ * Fit `<PLATFORM>_<SKU>_<TR>` into ShipHero's 32-char limit.
+ *
+ * Peel order is deliberate — **cheapest, least-informative parts first**:
+ *
+ *   1. full            `AMZ_CN-CAP-SAFFRON-60CT_TR-00459`   (32)
+ *   2. drop `TR-`      `AMZ_CN-CAP-PHYTOFRESH-60CT_00460`   (32)
+ *   3. drop `CN-` too  `AMZ_CAP-5IN1IMMUNE-120BG_00464`     (30)
+ *
+ * Both dropped tokens are **constant strings carrying zero information**: the
+ * literal `TR-` (the trailing number IS the transfer number) and the `CN-`
+ * vendor prefix (every Clean Nutra SKU has it). Dropping `TR-` first is what
+ * keeps the PRODUCT NAME readable — on the 2026-09-21 recovery set, 10 of 14
+ * transfers keep their complete SKU this way, versus 0 when the SKU was
+ * trimmed first.
+ *
+ * Stage 3 clears the whole live fleet, so the numeric truncation below is a
+ * defensive last resort only (a hypothetical SKU longer than any we stock).
  */
 function fitOrderNumber(platform: string, sku: string, tr: string): string {
-  const full = `${platform}_${sku}_${tr}`;
-  if (full.length <= SHIPHERO_ORDER_NUMBER_MAX) return full;
+  const bare = tr.replace(/^TR-?/i, '');
+  const noVendor = sku.replace(/^CN-/i, '');
 
-  // Budget left for the SKU once the mandatory parts are placed.
-  const fixed = `${platform}__${tr}`.length;
+  const candidates = [
+    `${platform}_${sku}_${tr}`, // 1. everything
+    `${platform}_${sku}_${bare}`, // 2. drop the constant "TR-"
+    `${platform}_${noVendor}_${bare}`, // 3. also drop the constant "CN-"
+  ];
+  for (const c of candidates) {
+    if (c.length <= SHIPHERO_ORDER_NUMBER_MAX) return c;
+  }
+
+  // Last resort: trim the SKU, never the platform code or the transfer number.
+  // Keep the longest (most identifying) SKU segment rather than head-slicing,
+  // so a long SKU can't collapse to a bare size code like "240CT".
+  const fixed = `${platform}__${bare}`.length;
   const budget = SHIPHERO_ORDER_NUMBER_MAX - fixed;
-  if (budget <= 0) {
-    // Pathological: even the platform + TR alone is too long. Keep the TR.
-    return `${platform}_${tr}`.slice(0, SHIPHERO_ORDER_NUMBER_MAX);
-  }
+  if (budget <= 0) return `${platform}_${bare}`.slice(0, SHIPHERO_ORDER_NUMBER_MAX);
 
-  // Drop the least-identifying parts of the SKU first. Clean Nutra SKUs read
-  // `CN-CAP-PHYTOFRESH-60CT`: the vendor prefix (`CN`) and the form code
-  // (`CAP`/`DRP`/`GUM`) are far less distinguishing than the product name, so
-  // strip those before truncating the name itself.
-  //
-  // ⚠️ Never strip so far that the PRODUCT NAME is gone. Peeling blindly turned
-  // `CN-CAP-SUPERCALIFRAGILISTIC-EXPIALIDOCIOUS-240CT` into `AMZ_240CT_TR-00999`
-  // — a size code with no product, useless to the floor and prone to collisions.
-  // Keep the longest (most identifying) segment as the anchor.
-  const parts = sku.split('-');
+  const parts = noVendor.split('-');
   const anchor = parts.reduce((a, b) => (b.length > a.length ? b : a), '');
-  let trimmed = sku;
-  while (trimmed.length > budget && parts.length > 1) {
-    // Stop peeling if the next removal would discard the anchor segment.
-    if (parts[0] === anchor && parts.length > 1) break;
-    parts.shift();
-    trimmed = parts.join('-');
-  }
-  if (trimmed.length > budget) {
-    // Still too long: prefer the anchor over a blind head-slice.
-    trimmed = (anchor.length <= budget ? anchor : anchor.slice(0, budget));
-  }
+  let trimmed = anchor.length <= budget ? anchor : anchor.slice(0, budget);
   trimmed = trimmed.replace(/[-_.]+$/, '');
-
-  return `${platform}_${trimmed}_${tr}`;
+  return `${platform}_${trimmed}_${bare}`;
 }
 
 export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {

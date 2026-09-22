@@ -63,13 +63,51 @@ for (const [label, input] of cases) {
   ok(`${label}: ${n} (len=${n.length})`, fits && keepsTr, `fits=${fits} keepsTr=${keepsTr}`);
 }
 
-// Regression: the two that previously worked must be UNCHANGED.
+// Regression: the two that already fit must be UNCHANGED (keep their TR-).
 ok('TR-00459 name unchanged',
    buildShipHeroOrderNumber({ transferNumber: 'TR-00459', destinationName: AMZ, skus: ['CN-CAP-SAFFRON-60CT'] })
      === 'AMZ_CN-CAP-SAFFRON-60CT_TR-00459');
 ok('TR-00474 name unchanged',
    buildShipHeroOrderNumber({ transferNumber: 'TR-00474', destinationName: AMZ, skus: ['CN-CAP-VBIOTIC-90CT'] })
      === 'AMZ_CN-CAP-VBIOTIC-90CT_TR-00474');
+
+console.log('\n--- peel order: TR- dropped BEFORE any SKU trimming');
+// Stage 2: dropping the constant "TR-" is enough, so the FULL SKU survives.
+ok('TR-00460 keeps its full SKU (TR- dropped)',
+   buildShipHeroOrderNumber({ transferNumber: 'TR-00460', destinationName: AMZ, skus: ['CN-CAP-PHYTOFRESH-60CT'] })
+     === 'AMZ_CN-CAP-PHYTOFRESH-60CT_00460');
+ok('TR-00463 keeps its full SKU (TR- dropped)',
+   buildShipHeroOrderNumber({ transferNumber: 'TR-00463', destinationName: AMZ, skus: ['CN-CAP-SLIPPERYEL-90CT'] })
+     === 'AMZ_CN-CAP-SLIPPERYEL-90CT_00463');
+// Stage 3: only when dropping TR- alone is still too long does CN- go too.
+ok('TR-00464 also drops CN- (still too long at stage 2)',
+   buildShipHeroOrderNumber({ transferNumber: 'TR-00464', destinationName: AMZ, skus: ['CN-CAP-5IN1IMMUNE-120BG'] })
+     === 'AMZ_CAP-5IN1IMMUNE-120BG_00464');
+// No SKU should ever need character-level truncation on the live fleet.
+const fullSkuKept = real.filter(([tr, sku]) =>
+  buildShipHeroOrderNumber({ transferNumber: tr, destinationName: AMZ, skus: [sku] }).includes(sku)
+).length;
+ok(`${fullSkuKept}/14 keep their COMPLETE SKU (expect 10)`, fullSkuKept === 10, String(fullSkuKept));
+
+console.log('\n--- extractTransferNumber must resolve ALL generations');
+const resolves: Array<[string, string | null]> = [
+  ['AMZ_CN-CAP-PHYTOFRESH-60CT_00460', 'TR-00460'],
+  ['AMZ_CAP-5IN1IMMUNE-120BG_00464', 'TR-00464'],
+  ['AMZ_CN-CAP-SAFFRON-60CT_TR-00459', 'TR-00459'],
+  ['CIN7-TR-00460', 'TR-00460'],
+  ['CIN7-TR-00459-2510014A', 'TR-00459'],
+  ['TIK_GUM-SHILAJITGU-60CT_TR-00480', 'TR-00480'],
+  ['AMZ_MULTI-3SKU_TR-00045', 'TR-00045'],
+  // must NOT be mistaken for a transfer number
+  ['FBA19QPCSL4C', null],
+  ['2510014A', null],
+  ['AMZ_CN-CAP-LUNGFLOW-90CT', null],
+  ['AMZ_CN-CAP-OMEGA3-1000', null],
+];
+for (const [input, expected] of resolves) {
+  const got = extractTransferNumber(input);
+  ok(`extract("${input}") -> ${got}`, got === expected, `expected ${expected}`);
+}
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);
 if (fails) process.exitCode = 1;
