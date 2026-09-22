@@ -18,11 +18,19 @@ ok('pre-flight query runs before the mutation',
    fn.indexOf('attachments(first: 60)') < fn.indexOf('order_add_attachment(data: $d)'));
 ok('uses order(id:) — a real Query field (verified by introspection)', fn.includes('order(id:'));
 ok('compares by filename', /e\?\.node\?\.filename === filename/.test(fn));
-ok('returns the EXISTING id instead of re-attaching', /return hit\.node\.id/.test(fn));
+ok('returns the EXISTING id instead of re-attaching', /return \{ id: hit\.node\.id/.test(fn));
+ok('skip path reports created:false', /return \{ id: hit\.node\.id \?\? '', created: false \}/.test(fn));
+ok('real attach reports created:true', /created: true \}/.test(fn));
+// The counter must not treat a skip as a creation — that was what made the
+// live re-run LOOK like the duplicate bug was still present.
+const full = fs.readFileSync(path.join(__dirname, '../lib/fba-post-process.ts'), 'utf8');
+ok('attachmentsCreated counts only NEW attachments', /att\.id && att\.created\) result\.attachmentsCreated\+\+/.test(full));
+ok('skips are counted separately', /att\.id && !att\.created\) result\.attachmentsSkipped\+\+/.test(full));
+ok('does NOT claim duplicates are undeletable (UI can delete)', !fn.includes('ShipHero cannot delete duplicates'));
 ok('logs the skip', fn.includes('already on order'));
 ok('fails OPEN if the check errors (missing label is worse than a dup)',
    /catch[\s\S]{0,400}attaching "\$\{filename\}" anyway/.test(fn) || fn.includes('attaching "${filename}" anyway'));
-ok('documents that ShipHero cannot delete attachments', fn.includes('no attachment-delete mutation'));
+ok('documents the public API has no delete mutation', fn.includes('no\n * attachment-delete mutation') || fn.includes('exposes no'));
 ok('cites the TR-00460 incident', fn.includes('TR-00460'));
 
 // Behavioural: replicate the dedupe decision.

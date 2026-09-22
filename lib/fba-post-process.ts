@@ -58,6 +58,8 @@ export interface PostProcessResult {
   placementFee: number;
   shipheroOrderId?: string;
   attachmentsCreated: number;
+  /** Attachments that were already present and deliberately NOT re-added. */
+  attachmentsSkipped: number;
   telegramSent: boolean;
   errors: string[];
 }
@@ -369,11 +371,13 @@ async function findShipheroOrder(
  * Attach a label PDF to a ShipHero order, skipping the write when a file of the
  * same name is already there.
  *
- * ⚠️ IDEMPOTENCY IS MANDATORY — ShipHero has **no attachment-delete mutation**
- * (verified by introspection 2026-09-22: only `order_add_attachment`,
- * `purchase_order_add_attachment`, `return_add_attachment`). A duplicate
- * attachment is therefore PERMANENT and has to be explained to the warehouse
- * by hand.
+ * ⚠️ IDEMPOTENCY IS MANDATORY — the ShipHero **public API** exposes no
+ * attachment-delete mutation (introspection 2026-09-22: of 130 mutations only
+ * `order_add_attachment`, `purchase_order_add_attachment` and
+ * `return_add_attachment` touch attachments; `order_delete_attachment`,
+ * `order_remove_attachment`, `attachment_delete` etc. were all probed live and
+ * rejected). Duplicates CAN be deleted in the ShipHero web UI, but not by this
+ * code — so a duplicate means manual cleanup for someone.
  *
  * How it bit us (TR-00460): auto-submit built the plan and attached 5 labels at
  * 04:03, then died on a ShipHero credit error before persisting the row. The
@@ -393,7 +397,7 @@ async function attachToShipHero(
   url: string,
   description: string,
   filename: string
-): Promise<string> {
+): Promise<{ id: string; created: boolean }> {
   // Pre-flight: is this filename already attached?
   try {
     const existing = await shGql(
@@ -404,9 +408,9 @@ async function attachToShipHero(
     const hit = edges.find((e: any) => e?.node?.filename === filename);
     if (hit) {
       console.log(
-        `[fba-post-process] attachment "${filename}" already on order ${orderId} — skipping (ShipHero cannot delete duplicates)`
+        `[fba-post-process] attachment "${filename}" already on order ${orderId} — skipping (no public delete API; duplicates must be removed by hand in the ShipHero UI)`
       );
-      return hit.node.id ?? '';
+      return { id: hit.node.id ?? '', created: false };
     }
   } catch (err: any) {
     // Fail OPEN: if the check itself fails we still attach, because a missing
@@ -435,7 +439,7 @@ async function attachToShipHero(
       file_type: 'application/pdf',
     },
   });
-  return data?.order_add_attachment?.attachment?.id ?? '';
+  return { id: data?.order_add_attachment?.attachment?.id ?? '', created: true };
 }
 
 async function updatePackingNote(token: string, orderId: string, note: string): Promise<void> {
@@ -522,6 +526,7 @@ export async function postProcessFbaShipment(
     labels: [],
     placementFee: 0,
     attachmentsCreated: 0,
+    attachmentsSkipped: 0,
     telegramSent: false,
     errors,
   };
@@ -628,8 +633,13 @@ export async function postProcessFbaShipment(
 
       // Attach to ShipHero
       const desc = `FBA Shipping Labels - ${det.fbaId} - ${det.destinationCity}, ${det.destinationState} - ${det.nBoxes} boxes (4x6 thermal)`;
-      const attId = await attachToShipHero(shToken, shOrder.orderId, shOrder.accountId, publicUrl, desc, filename);
-      if (attId) result.attachmentsCreated++;
+      const att = await attachToShipHero(shToken, shOrder.orderId, shOrder.accountId, publicUrl, desc, filename);
+      // Count only genuinely NEW attachments. Counting skips here made the
+      // response report `attachmentsCreated: 5` on a re-run that actually
+      // attached nothing — which reads exactly like the duplicate bug it was
+      // meant to prove was fixed (TR-00460, 2026-09-22).
+      if (att.id && att.created) result.attachmentsCreated++;
+      if (att.id && !att.created) result.attachmentsSkipped++;
 
       result.labels.push({
         fbaId: det.fbaId,
