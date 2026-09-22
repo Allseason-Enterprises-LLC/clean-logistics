@@ -494,6 +494,10 @@ function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroT
     notes,
     source: 'cin7-transfer-sync',
     reference: transfer.transferNumber,
+    // Drives the wholesale-vs-normal routing in lib/shiphero-orders.ts. The
+    // shippingAddress above is OUR OWN warehouse (Allseason Enterprises LLC),
+    // so it can never identify an FBA-bound transfer — the destination can.
+    cin7Destination: transfer.destinationName ?? null,
     rawTransfer: transfer.raw,
   };
 }

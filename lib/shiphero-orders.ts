@@ -97,11 +97,43 @@ async function upsertBridgeRecord(
 }
 
 async function createOrderViaGraphQL(credentials: ShipHeroCredentials, input: ShipHeroTransferOrderInput) {
-  // Determine if this is an FBA transfer (use wholesale order) or regular transfer
-  const isFbaTransfer = input.tags?.includes('FBA') ||
-    input.shippingAddress?.company?.toLowerCase().includes('amazon') ||
-    input.shippingAddress?.company?.toLowerCase().includes('fba') ||
-    input.orderNumber?.toLowerCase().includes('fba');
+  // Determine if this is an FBA transfer (use wholesale order) or regular transfer.
+  //
+  // ⚠️ 2026-09-22: every clause below was FALSE for real FBA transfers, so they
+  // silently took the plain `order_create` path and landed in ShipHero WITHOUT
+  // the Wholesale flag — the warehouse manager had to toggle all 14 by hand.
+  // Why each clause missed:
+  //   - tags:      the caller sends ['cin7-transfer','amazon-kit','las-vegas'],
+  //                never literal 'FBA'
+  //   - company:   shippingAddress.company is 'Allseason Enterprises LLC'
+  //                (our own legal entity), NOT 'Amazon' — the destination name
+  //                'Amazon FBA Warehouse' lives in cin7_destination, which this
+  //                function never looked at
+  //   - orderNumber: the old 'CIN7-TR-XXXXX' and the new 'AMZ_<SKU>_XXXXX'
+  //                both contain no 'fba'
+  //
+  // Authoritative signal is the CIN7 DESTINATION (that is what makes a transfer
+  // FBA-bound), with the order-number prefix and tags kept as fallbacks. This is
+  // the same `isFbaDestination` notion the handoff uses to decide to fire at all,
+  // so the two can no longer disagree.
+  const destination = (input.cin7Destination || '').toLowerCase();
+  const company = (input.shippingAddress?.company || '').toLowerCase();
+  const orderNo = (input.orderNumber || '').toLowerCase();
+  const isFbaTransfer =
+    destination.includes('fba') ||
+    destination.includes('amazon') ||
+    orderNo.startsWith('amz_') ||
+    orderNo.startsWith('ref_') ||
+    orderNo.includes('fba') ||
+    company.includes('amazon') ||
+    company.includes('fba') ||
+    !!input.tags?.some((t) => /^(fba|wholesale|amazon)$/i.test(t));
+
+  console.log(
+    `[shiphero-orders] ${input.orderNumber}: isFbaTransfer=${isFbaTransfer} ` +
+      `(destination="${input.cin7Destination ?? ''}", company="${input.shippingAddress?.company ?? ''}") ` +
+      `-> ${isFbaTransfer ? 'wholesale_order_create' : 'order_create'}`
+  );
 
   if (isFbaTransfer) {
     return createWholesaleOrderViaGraphQL(credentials, input);
