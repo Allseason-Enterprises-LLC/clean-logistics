@@ -12,7 +12,9 @@ const src = fs.readFileSync(path.join(__dirname, '../lib/fba-post-process.ts'), 
 
 ok('isCancelledStatus helper exists', src.includes('function isCancelledStatus'));
 ok('queries fulfillment_status in the exact lookup', /orders\(order_number[\s\S]{0,260}fulfillment_status/.test(src));
-ok('queries fulfillment_status in the scan', /orders\(sort[\s\S]{0,260}fulfillment_status/.test(src));
+ok('queries fulfillment_status in the scan', /orders\(created_from[\s\S]{0,300}fulfillment_status/.test(src));
+ok('scan does NOT use the invalid sort arg', !/orders\(sort:/.test(src));
+ok('scan filters dead orders server-side', src.includes('fulfillment_status_not_in'));
 ok('exact lookup filters out cancelled', /const live = nodes\.find\([\s\S]{0,120}!isCancelledStatus/.test(src));
 ok('scan filters out cancelled', /extractTransferNumber\(e\?\.node\?\.order_number\) === tr &&[\s\S]{0,80}!isCancelledStatus/.test(src));
 
