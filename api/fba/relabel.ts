@@ -208,6 +208,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         supabaseUrl: l.supabaseUrl,
       })),
       attachmentsCreated: result.attachmentsCreated,
+      // Distinguishes "already there, left alone" from "newly attached" — on a
+      // recovery re-run the healthy answer is created:0 / skipped:N.
+      attachmentsSkipped: result.attachmentsSkipped,
       telegramSent: result.telegramSent,
       errors: result.errors,
     });
