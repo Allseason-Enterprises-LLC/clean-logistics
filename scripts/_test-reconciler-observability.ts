@@ -21,6 +21,7 @@ for (const reason of [
   'backoff_throttled',
   'duplicate_gate_aborted',
   'duplicate_gate_unavailable',
+  'config_error_capped',
 ]) {
   ok(`records reason '${reason}'`, src.includes(`reason: '${reason}'`));
 }
@@ -46,6 +47,20 @@ ok('accounting adds up: 29 scanned = 1 fired + 28 named skips',
    consistent({ scanned: 29, reFired: 1, skipped: Array(28).fill({ reason: 'already_has_active_shipment_row' }) }));
 ok('TR-00464 shape is now visible, not silent',
    consistent({ scanned: 29, reFired: 0, skipped: Array(29).fill({ reason: 'backoff_throttled' }) }));
+
+// Regression: config-error rows used to appear ONLY in `exhausted`, leaving
+// scanned=29 vs reFired=0 + skipped=27 (2 unaccounted). Caught in prod.
+ok('config-error rows are in skipped[] too, so the ledger balances',
+   consistent({
+     scanned: 29,
+     reFired: 0,
+     skipped: [
+       ...Array(27).fill({ reason: 'already_has_active_shipment_row' }),
+       ...Array(2).fill({ reason: 'config_error_capped' }),
+     ],
+   }));
+ok('config_error_capped carries the attempt count and the cap',
+   src.includes('attempts (cap ${CONFIG_ERROR_MAX_ATTEMPTS})'));
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);
 if (fails) process.exitCode = 1;

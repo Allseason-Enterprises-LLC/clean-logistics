@@ -422,6 +422,15 @@ export async function reconcileFbaHandoffs(
             `Check FBA_SELF_BASE_URL / CRON_SECRET in the Vercel project env.`;
           console.error(`[reconciler] ${msg.replace(/\n/g, ' ')}`);
           await sendTelegramAlert(msg);
+          // Also record it in the unified ledger so `scanned` reconciles
+          // exactly: scanned == reFired + skipped.length. Before this, the two
+          // config-error rows appeared ONLY in `exhausted` and silently broke
+          // the accounting (29 scanned = 0 fired + 27 skipped, 2 missing).
+          result.skipped.push({
+            transfer: row.cin7_transfer_number,
+            reason: 'config_error_capped',
+            detail: `${row.fba_handoff_attempts} attempts (cap ${CONFIG_ERROR_MAX_ATTEMPTS}) — needs a human: ${String(row.last_fba_handoff_detail || '').slice(0, 80)}`,
+          });
         } else {
           result.throttled++;
           const gap =
