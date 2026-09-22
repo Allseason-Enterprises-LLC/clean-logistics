@@ -43,12 +43,25 @@ function getSelfBaseUrl(): string {
   if (process.env.FBA_SELF_BASE_URL) {
     return process.env.FBA_SELF_BASE_URL.replace(/\/+$/, '');
   }
-  if (process.env.VERCEL_ENV === 'production') {
-    return 'https://shiphero-shipstation-bridge.vercel.app';
-  }
-  if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL.replace(/\/+$/, '')}`;
-  }
+  // ⚠️ 2026-09-21: NEVER fall through to VERCEL_URL.
+  //
+  // `VERCEL_URL` is the per-deployment hostname, which sits behind Vercel
+  // Deployment Protection (SSO). That wall runs at the edge BEFORE our handler,
+  // so the self-POST gets a 401 HTML page no matter how valid the
+  // `Authorization: Bearer $CRON_SECRET` header is.
+  //
+  // This was the single largest failure class in the pipeline: 28 of 47 failed
+  // handoffs were `HTTP 401: {"error":"Unauthorized"}`, spanning 2026-08-14
+  // (TR-00326/330/334/335/336/337) through 2026-09-21 (TR-00462/474/475). The
+  // old code only forced the public alias when `VERCEL_ENV === 'production'`,
+  // so ANY invocation where that var was absent or set to 'preview' — e.g. a
+  // cron running against a preview//promoted deployment — silently 401'd.
+  //
+  // The reconciler then retried the same doomed URL forever (TR-00408 reached
+  // 77 attempts, TR-00352 70), because a 401 config error is not transient and
+  // no amount of retrying fixes it.
+  //
+  // The public alias is not protected, so it is ALWAYS the correct target.
   return 'https://shiphero-shipstation-bridge.vercel.app';
 }
 

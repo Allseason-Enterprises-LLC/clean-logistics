@@ -49,6 +49,8 @@ interface BridgeRow {
   cin7_destination: string;
   synced_at: string;
   last_fba_handoff_at: string | null;
+  /** Needed to classify permanent config errors (401/403) vs transient ones. */
+  last_fba_handoff_detail: string | null;
   fba_handoff_attempts: number;
   request_payload: any;
   shiphero_order_number: string | null;
@@ -215,7 +217,7 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
   const { data, error } = await db
     .from('cin7_transfer_shiphero_orders')
     .select(
-      'id, cin7_transfer_number, cin7_destination, synced_at, last_fba_handoff_at, fba_handoff_attempts, request_payload, shiphero_order_number'
+      'id, cin7_transfer_number, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number'
     )
     .eq('status', 'synced')
     .gte('synced_at', since)
@@ -229,9 +231,42 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
   return data.filter((row: any) => isFbaDestination(row.cin7_destination));
 }
 
+/**
+ * Detect failures that are CONFIGURATION errors, not transient outages.
+ *
+ * ⚠️ 2026-09-21: a 401 on the self-POST means the handoff is hitting a
+ * Deployment-Protection-walled URL or the secret doesn't match. No amount of
+ * retrying fixes that, yet the uncapped loop hammered it forever — TR-00408
+ * reached 77 attempts, TR-00352 70, two rows hit 99 — burning quota and
+ * drowning real signals. 28 of 47 failed handoffs were this one error.
+ *
+ * These need a HUMAN, so cap them and escalate loudly instead of retrying.
+ */
+function isPermanentConfigError(detail: string | null | undefined): boolean {
+  const d = String(detail || '');
+  return (
+    d.includes('HTTP 401') ||
+    d.includes('"Unauthorized"') ||
+    d.includes('CRON_SECRET not set') ||
+    d.includes('HTTP 403')
+  );
+}
+
+/** Attempts allowed for a config error before we stop and escalate. */
+const CONFIG_ERROR_MAX_ATTEMPTS = 3;
+
 function shouldRetryNow(row: BridgeRow): {retry: boolean; reason?: string} {
-  // No hard cap — re-fires are dedup-idempotent, so we keep trying with
-  // backoff until the fba_shipments row exists. A cap only converts a long
+  // Config errors (401/403) are NOT transient — cap them so a permanent
+  // misconfiguration escalates to a human instead of looping forever.
+  if (
+    isPermanentConfigError(row.last_fba_handoff_detail) &&
+    row.fba_handoff_attempts >= CONFIG_ERROR_MAX_ATTEMPTS
+  ) {
+    return { retry: false, reason: 'config_error' };
+  }
+
+  // Otherwise: no hard cap — re-fires are dedup-idempotent, so we keep trying
+  // with backoff until the fba_shipments row exists. A cap only converts a long
   // outage into a permanent silent failure (see 2026-08-04..07 incident).
   if (row.last_fba_handoff_at) {
     const gap =
@@ -296,8 +331,20 @@ export async function reconcileFbaHandoffs(
 
       const decision = shouldRetryNow(row);
       if (!decision.retry) {
-        if (decision.reason === 'max_attempts') {
+        if (decision.reason === 'config_error') {
+          // Permanent misconfiguration — stop retrying and make it VISIBLE.
+          // Silently giving up is how 28 of these went unnoticed for weeks.
           result.exhausted.push(row.cin7_transfer_number);
+          const msg =
+            `🔴 FBA handoff BLOCKED by a configuration error — needs a human\n\n` +
+            `Transfer: ${row.cin7_transfer_number}\n` +
+            `Attempts: ${row.fba_handoff_attempts} (capped at ${CONFIG_ERROR_MAX_ATTEMPTS})\n` +
+            `Error: ${String(row.last_fba_handoff_detail || '').slice(0, 200)}\n\n` +
+            `A 401/403 means the self-POST is hitting a Deployment-Protection-walled ` +
+            `URL or CRON_SECRET does not match. Retrying cannot fix it. ` +
+            `Check FBA_SELF_BASE_URL / CRON_SECRET in the Vercel project env.`;
+          console.error(`[reconciler] ${msg.replace(/\n/g, ' ')}`);
+          await sendTelegramAlert(msg);
         } else {
           result.throttled++;
         }
