@@ -44,6 +44,15 @@ interface ReconcileResult {
   exhausted: string[]; // kept for response-shape compat; no longer used to stop retries
   errors: string[];
   duration_ms: number;
+  /**
+   * Per-transfer disposition — why each candidate was NOT fired.
+   *
+   * ⚠️ 2026-09-22: `throttled: N` alone cost 40 minutes of debugging on
+   * TR-00464. The row was excluded every tick by the backoff window and
+   * NOTHING in the response named it, so the transfer looked simply ignored.
+   * Counts tell you something was skipped; only names tell you WHICH and WHY.
+   */
+  skipped: Array<{ transfer: string; reason: string; detail?: string }>;
 }
 
 interface BridgeRow {
@@ -367,6 +376,7 @@ export async function reconcileFbaHandoffs(
     exhausted: [],
     errors: [],
     duration_ms: 0,
+    skipped: [],
   };
 
   let candidates: BridgeRow[];
@@ -388,7 +398,13 @@ export async function reconcileFbaHandoffs(
     try {
       // Has an active fba_shipments row? If yes, skip — pipeline already ran.
       const exists = await fbaRecordExists(db, row.cin7_transfer_number);
-      if (exists) continue;
+      if (exists) {
+        result.skipped.push({
+          transfer: row.cin7_transfer_number,
+          reason: 'already_has_active_shipment_row',
+        });
+        continue;
+      }
 
       const decision = shouldRetryNow(row);
       if (!decision.retry) {
@@ -408,6 +424,17 @@ export async function reconcileFbaHandoffs(
           await sendTelegramAlert(msg);
         } else {
           result.throttled++;
+          const gap =
+            row.fba_handoff_attempts >= 3 ? RETRY_GAP_LATE_MS : RETRY_GAP_EARLY_MS;
+          const waitedMs = row.last_fba_handoff_at
+            ? Date.now() - new Date(row.last_fba_handoff_at).getTime()
+            : 0;
+          const remainingMin = Math.max(0, Math.ceil((gap - waitedMs) / 60000));
+          result.skipped.push({
+            transfer: row.cin7_transfer_number,
+            reason: 'backoff_throttled',
+            detail: `${remainingMin}min remaining (attempt ${row.fba_handoff_attempts}, gap ${Math.round(gap / 60000)}min, last_fba_handoff_at=${row.last_fba_handoff_at ?? 'null'})`,
+          });
         }
         continue;
       }
@@ -442,6 +469,11 @@ export async function reconcileFbaHandoffs(
           result.errors.push(
             `${row.cin7_transfer_number}: re-fire aborted — plan ${stale.planId} has ${stale.liveShipments} live shipments`
           );
+          result.skipped.push({
+            transfer: row.cin7_transfer_number,
+            reason: 'duplicate_gate_aborted',
+            detail: `plan ${stale.planId} has ${stale.liveShipments} live shipment(s) — bind, do not re-fire`,
+          });
           continue;
         }
       } catch (err: any) {
@@ -453,6 +485,11 @@ export async function reconcileFbaHandoffs(
         result.errors.push(
           `${row.cin7_transfer_number}: duplicate gate unavailable — skipped (fail-closed)`
         );
+        result.skipped.push({
+          transfer: row.cin7_transfer_number,
+          reason: 'duplicate_gate_unavailable',
+          detail: `fail-closed: ${err?.message || String(err)}`,
+        });
         continue;
       }
 
