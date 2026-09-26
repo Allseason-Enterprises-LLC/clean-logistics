@@ -1,0 +1,97 @@
+/**
+ * ShipHero work-order client + the poller decision table.
+ * Run: npx tsx scripts/_test-work-orders-client.ts
+ */
+import {
+  buildCreateWorkOrderData, createAssemblyWorkOrder, getWorkOrder, completeWorkOrder,
+  getNonPickableBulkUnits, decideWorkOrder,
+} from '../lib/shiphero-work-orders';
+
+let fails = 0;
+const ok = (l: string, c: boolean, x = '') => { if (!c) fails++; console.log(`${c ? 'PASS' : 'FAIL'}  ${l}${c ? '' : '  ' + x}`); };
+
+// a fetch double that records the request and returns a canned GraphQL body
+function fakeFetch(reply: any) {
+  const calls: any[] = [];
+  const f = async (_url: string, init: any) => { calls.push(JSON.parse(init.body)); return { json: async () => reply }; };
+  return { f, calls };
+}
+
+async function main() {
+  // ---------- payload shape ----------
+  const base = { warehouseId: 'W1', customerAccountId: '95145', sku: 'CN-BDL-CAP-GINSENG-60CT-3PK', quantity: 40,
+    name: 'TR-00500 · build 40 × CN-BDL-CAP-GINSENG-60CT-3PK', instructions: 'Build. Do NOT ship.', requestedDate: '2026-09-22T00:00:00Z' };
+  const d = buildCreateWorkOrderData(base);
+  ok('type is ASSEMBLY', d.type === 'ASSEMBLY');
+  ok('priority defaults to HIGH (Weston)', d.priority === 'HIGH');
+  ok('requested_date passed through', d.requested_date === '2026-09-22T00:00:00Z');
+  ok('assembly_sku carries sku+quantity', d.assembly_sku.sku === base.sku && d.assembly_sku.quantity === 40);
+  ok('lot_id OMITTED when not given (not null)', !('lot_id' in d.assembly_sku));
+  ok('lot_id included when given', (buildCreateWorkOrderData({ ...base, lotId: 'L9' }).assembly_sku as any).lot_id === 'L9');
+  ok('customer_account_id + warehouse_id set', d.customer_account_id === '95145' && d.warehouse_id === 'W1');
+  let threw = false; try { buildCreateWorkOrderData({ ...base, quantity: 0 }); } catch { threw = true; }
+  ok('quantity 0 rejected', threw);
+  threw = false; try { buildCreateWorkOrderData({ ...base, quantity: 2.5 }); } catch { threw = true; }
+  ok('fractional quantity rejected', threw);
+
+  // ---------- create ----------
+  const c1 = fakeFetch({ data: { work_order_create: { request_id: 'r', work_order: { id: 'V29ya09yZGVyOjEyMw==', legacy_id: 123, status: 'PENDING_APPROVAL' } } } });
+  const wo = await createAssemblyWorkOrder('tok', base, c1.f);
+  ok('create returns legacyId as a NUMBER (work_order(id:Int) needs it)', wo.legacyId === 123 && typeof wo.legacyId === 'number');
+  ok('create sends work_order_create mutation with $data', c1.calls[0].query.includes('work_order_create(data: $data)') && c1.calls[0].variables.data.type === 'ASSEMBLY');
+  const cErr = fakeFetch({ errors: [{ message: 'Token is expired' }] });
+  threw = false; try { await createAssemblyWorkOrder('tok', base, cErr.f); } catch (e: any) { threw = /Token is expired/.test(e.message); }
+  ok('GraphQL errors[] -> throws with the message', threw);
+  const cNone = fakeFetch({ data: { work_order_create: { request_id: 'r', work_order: null } } });
+  threw = false; try { await createAssemblyWorkOrder('tok', base, cNone.f); } catch { threw = true; }
+  ok('missing work_order in response -> throws (never silently "created")', threw);
+
+  // ---------- get ----------
+  const g = fakeFetch({ data: { work_order: { data: { id: 'x', legacy_id: 123, status: 'COMPLETED', completed_at: '2026-09-23T10:00:00Z' } } } });
+  const got = await getWorkOrder('tok', 123, g.f);
+  ok('get queries by INTEGER id', g.calls[0].variables.id === 123 && g.calls[0].query.includes('work_order(id: $id)'));
+  ok('get returns status + completed_at', got.status === 'COMPLETED' && got.completedAt === '2026-09-23T10:00:00Z');
+
+  // ---------- complete ----------
+  const cc = fakeFetch({ data: { work_order_complete: { request_id: 'r', work_order: { id: 'x', legacy_id: 123, status: 'COMPLETED' } } } });
+  await completeWorkOrder('tok', 123, 'auto-completed: 40 units in bulk', cc.f);
+  ok('complete sends work_order_id as STRING + message', cc.calls[0].variables.data.work_order_id === '123' && /40 units/.test(cc.calls[0].variables.data.message));
+
+  // ---------- bulk stock (the auto-complete guard) ----------
+  const stock = fakeFetch({ data: { item_locations: { data: { edges: [
+    { node: { quantity: 600, location: { pickable: false }, expiration_lot: { is_active: true } } },   // bulk ✓
+    { node: { quantity: 92,  location: { pickable: true  }, expiration_lot: { is_active: true } } },   // DTC ✗
+    { node: { quantity: 500, location: { pickable: false }, expiration_lot: { is_active: false } } },  // inactive lot ✗
+    { node: { quantity: 0,   location: { pickable: false }, expiration_lot: { is_active: true } } },
+  ] } } } });
+  const s = await getNonPickableBulkUnits('tok', 'CN-CAP-VBIOTIC-90CT', stock.f);
+  ok('bulk counts ONLY non-pickable + active (TR-00474 real shape: 600)', s.bulk === 600, `got ${s.bulk}`);
+  ok('pickable tracked separately (92), never added to bulk', s.pickable === 92);
+  ok('inactive-lot stock excluded', s.bulk !== 1100);
+
+  // ---------- decision table: the dangerous branch ----------
+  const D = decideWorkOrder;
+  ok('COMPLETED -> release', D({ status: 'COMPLETED', ageHours: 1, kitQty: 10 }).action === 'release');
+  ok('CANCELED -> failed', D({ status: 'CANCELED', ageHours: 1, kitQty: 10 }).action === 'failed');
+  ok('CLOSED -> failed', D({ status: 'CLOSED', ageHours: 100, kitQty: 10 }).action === 'failed');
+  ok('open, 1h -> wait', D({ status: 'IN_PROGRESS', ageHours: 1, kitQty: 10 }).action === 'wait');
+  ok('open, 24h, never nudged -> nudge', D({ status: 'IN_PROGRESS', ageHours: 24, kitQty: 10, lastNudgeAgeHours: null }).action === 'nudge');
+  ok('open, 30h, nudged 3h ago -> wait (no spam)', D({ status: 'IN_PROGRESS', ageHours: 30, kitQty: 10, lastNudgeAgeHours: 3 }).action === 'wait');
+  ok('open, 48h, bulk >= qty -> AUTO_COMPLETE (they forgot the button)',
+     D({ status: 'ASSEMBLY_IN_PROGRESS', ageHours: 48, kitQty: 10, bulkUnits: 10 }).action === 'auto_complete');
+  ok('open, 48h, bulk > qty -> auto_complete', D({ status: 'IN_PROGRESS', ageHours: 60, kitQty: 10, bulkUnits: 25 }).action === 'auto_complete');
+  const short = D({ status: 'IN_PROGRESS', ageHours: 48, kitQty: 10, bulkUnits: 8 });
+  ok('🔴 open, 48h, bulk < qty -> ESCALATE, NEVER auto_complete (phantom-inventory guard)', short.action === 'escalate' && (short as any).bulk === 8);
+  ok('open, 48h, bulk 0 -> escalate', D({ status: 'PENDING_APPROVAL', ageHours: 72, kitQty: 10, bulkUnits: 0 }).action === 'escalate');
+  ok('open, 72h, short, escalated 5h ago -> wait (re-escalate daily, not every tick)',
+     D({ status: 'IN_PROGRESS', ageHours: 72, kitQty: 10, bulkUnits: 8, lastNudgeAgeHours: 5 }).action === 'wait');
+  ok('open, 96h, short, escalated 26h ago -> escalate again',
+     D({ status: 'IN_PROGRESS', ageHours: 96, kitQty: 10, bulkUnits: 8, lastNudgeAgeHours: 26 }).action === 'escalate');
+  threw = false; try { D({ status: 'IN_PROGRESS', ageHours: 48, kitQty: 10 }); } catch { threw = true; }
+  ok('48h without a stock read -> THROWS (cannot decide blind)', threw);
+  ok('47.9h -> still the nudge path, no stock read needed', D({ status: 'IN_PROGRESS', ageHours: 47.9, kitQty: 10, lastNudgeAgeHours: 30 }).action === 'nudge');
+
+  console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);
+  if (fails) process.exitCode = 1;
+}
+main();
