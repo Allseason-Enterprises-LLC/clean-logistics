@@ -234,17 +234,25 @@ async function createOneWholesaleOrder(
     mutation WholesaleOrderCreate($data: CreateWholesaleOrderInput!) {
       wholesale_order_create(data: $data) {
         request_id
-        order {
+        wholesale_order {
           id
-          order_number
           legacy_id
-          wholesale_order {
+          status
+          order {
             id
+            order_number
+            legacy_id
           }
         }
       }
     }
   `;
+  // ⚠️ Response shape (introspected 2026-09-27): WholesaleOrderMutationOutput has
+  // { request_id, complexity, wholesale_order: WholesaleOrder } and the Order
+  // lives at wholesale_order.order. The previous selection asked for `order`
+  // directly on the output and ShipHero answered 400 "Cannot query field
+  // 'order'" — so every FBA transfer since the routing fix (e5a2f2d) failed
+  // to create its order. Caught by probing sync-cin7 after deploy 0db3f09.
 
   const response = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
     method: 'POST',
@@ -290,7 +298,8 @@ async function createOneWholesaleOrder(
     throw new Error(`ShipHero GraphQL errors: ${json.errors.map((e: any) => e.message || JSON.stringify(e)).join('; ')}`);
   }
 
-  const order = json?.data?.wholesale_order_create?.order;
+  const wholesale = json?.data?.wholesale_order_create?.wholesale_order;
+  const order = wholesale?.order;
   if (!order?.id) {
     throw new Error(`ShipHero wholesale_order_create returned no order id: ${JSON.stringify(json)}`);
   }
