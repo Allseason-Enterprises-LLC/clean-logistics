@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { buildPartnerLineItemId } from './order-naming';
+import { buildPartnerLineItemId, buildLotSplitChildNumber } from './order-naming';
 import { ShipHeroCredentials, ShipHeroOrderCreateResult, ShipHeroTransferOrderInput } from './cin7-transfer-types';
 import { getShipHeroProductData, getLotBreakdown } from './shiphero-product-data';
 import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from './lot-allocation';
@@ -454,7 +454,8 @@ async function createWholesaleOrderViaGraphQL(credentials: ShipHeroCredentials, 
 
   for (const { sku, lot } of lotPlan) {
     const lotSuffix = sanitizeLotName(lot.name);
-    const childNumber = `${input.orderNumber}-${lotSuffix}`;
+    // ≤32 chars with the lot kept visible — see buildLotSplitChildNumber.
+    const childNumber = buildLotSplitChildNumber(input.orderNumber, lot.name);
     const childPartnerId = `${input.externalOrderId}:${lotSuffix}`;
     const packingNote =
       `Lot ${lot.name} · Exp ${lot.expiresAt} · ${lot.qty} units (${lot.cases} cases) · SINGLE LOT — DO NOT MIX\n` +

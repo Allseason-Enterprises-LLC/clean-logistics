@@ -166,6 +166,8 @@ export interface BuildOrderNumberInput {
  * 12 of the 14 transfers in the 2026-09-21 recovery exceeded it; the 2 that
  * worked (TR-00459, TR-00474) happened to land on exactly 32.
  */
+import { sanitizeLotName } from './lot-allocation';
+
 export const SHIPHERO_ORDER_NUMBER_MAX = 32;
 
 /**
@@ -212,6 +214,44 @@ function fitOrderNumber(platform: string, sku: string, tr: string): string {
   let trimmed = anchor.length <= budget ? anchor : anchor.slice(0, budget);
   trimmed = trimmed.replace(/[-_.]+$/, '');
   return `${platform}_${trimmed}_${bare}`;
+}
+
+/**
+ * Lot-split CHILD order number, ≤ 32 chars, lot ALWAYS visible.
+ *
+ * The parent number is fitted to 32 by fitOrderNumber(); appending `-<lot>`
+ * to it overflowed by 7–9 chars on every lot-split transfer
+ * (`AMZ_CN-CAP-PROSTATE-120BG_00478-2607062A` = 40). ShipHero rejected the
+ * whole order: "order_number is limited to 32 characters". Caught 2026-09-27,
+ * the first day the wholesale path really ran (TR-00478/79/80/81/82/83).
+ *
+ * The LOT must survive — the child's packing note says "SINGLE LOT — DO NOT
+ * MIX", so the floor needs to see which lot on the order itself. The TR digits
+ * must survive for traceability. So we re-fit with the lot as part of the
+ * fixed tail and let the SKU absorb the squeeze, same peel order as the parent:
+ *   AMZ_CN-CAP-PROSTATE-120BG_00478-2607062A  (40) ✗
+ *   AMZ_CAP-PROSTATE-120BG_00478-2607062A     (37) ✗  drop CN-
+ *   AMZ_PROSTATE_00478-2607062A               (27) ✓  longest SKU segment
+ */
+export function buildLotSplitChildNumber(parentOrderNumber: string, lotName: string): string {
+  const lot = sanitizeLotName(lotName);
+  const full = `${parentOrderNumber}-${lot}`;
+  if (full.length <= SHIPHERO_ORDER_NUMBER_MAX) return full;
+
+  // Decompose the parent: <PLATFORM>_<SKU>_<TR digits>
+  const m = /^([A-Z]{3})_(.+)_(\d+)$/.exec(parentOrderNumber);
+  if (!m) return full.slice(0, SHIPHERO_ORDER_NUMBER_MAX); // unknown shape (Reference override): hard cut
+  const [, platform, sku, tr] = m;
+  const tail = `_${tr}-${lot}`;
+  const budget = SHIPHERO_ORDER_NUMBER_MAX - platform.length - 1 - tail.length; // for the SKU
+  if (budget <= 0) return `${platform}${tail}`.slice(0, SHIPHERO_ORDER_NUMBER_MAX);
+
+  const noVendor = sku.replace(/^CN-/i, '');
+  if (noVendor.length <= budget) return `${platform}_${noVendor}${tail}`;
+  const parts = noVendor.split('-');
+  const anchor = parts.reduce((a, b) => (b.length > a.length ? b : a), '');
+  const trimmed = (anchor.length <= budget ? anchor : anchor.slice(0, budget)).replace(/[-_.]+$/, '');
+  return `${platform}_${trimmed}${tail}`;
 }
 
 /**
