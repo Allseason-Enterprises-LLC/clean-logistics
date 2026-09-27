@@ -504,7 +504,7 @@ function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroT
   };
 }
 
-async function resolveShipHeroLasVegasWarehouse(
+export async function resolveShipHeroLasVegasWarehouse(
   supabase: SupabaseClient,
   explicitWarehouseId?: string
 ): Promise<ShipHeroTransferSyncSummary['shipHeroWarehouse']> {
