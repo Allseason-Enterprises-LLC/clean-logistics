@@ -16,6 +16,23 @@
  * ⚠️ `work_order(id:)` takes the INTEGER legacy_id, not the base64 `id`. We
  * store legacy_id as a string in bridge.work_order_ids and Number() it here.
  *
+ * ⚠️ WORK ORDER TYPE — verified live 2026-09-26 (canaries 171096/171097/171098):
+ *   • `type: ASSEMBLY` REJECTS any product ShipHero models as a kit
+ *     (`kit: true`) with "Invalid Product". 744 of our 773 multi-packs are
+ *     modelled that way (on_hand = component ÷ pack, zero units binned under
+ *     the pack SKU). Only 29 (CARDIOZEN, NMNSUPP, GLP1, LACTAT…) are real
+ *     products that ASSEMBLY accepts.
+ *   • `type: CUSTOM` ACCEPTS the very same kit SKU in `assembly_sku`.
+ *   SKU numbers are fixed (Weston), so we use CUSTOM for every gated transfer
+ *   and put the build spec in `name`/`instructions`/`assembly_details`. The
+ *   warehouse still gets a real work order to complete; the release signal
+ *   (status → COMPLETED) is identical for both types.
+ *
+ * ⚠️ `work_order_complete` via API is refused ("Invalid status transition")
+ *   for a WO that has not been worked on the floor. So the poller only READS
+ *   COMPLETED; the 48 h step is a nudge with the bulk-stock reading, never an
+ *   auto-complete.
+ *
  * `fetchImpl` is injectable so tests assert the exact mutation shape offline.
  */
 
@@ -38,6 +55,10 @@ export interface CreateAssemblyWorkOrderInput {
   customerAccountId: string;
   sku: string;
   quantity: number;
+  /** Pack count (3 for a 3-pack) — drives the human-readable build spec. */
+  packCount?: number | null;
+  /** Component single SKU + qty per kit, when known — goes in assembly_details. */
+  component?: { sku: string; perKit: number } | null;
   lotId?: string | null;
   name: string;
   instructions: string;
@@ -68,14 +89,19 @@ export function buildCreateWorkOrderData(input: CreateAssemblyWorkOrderInput) {
   if (!Number.isInteger(input.quantity) || input.quantity <= 0) {
     throw new Error(`work order: quantity must be a positive integer, got ${input.quantity}`);
   }
+  const spec = input.component
+    ? `${input.quantity} × ${input.sku} = ${input.quantity * input.component.perKit} × ${input.component.sku} (${input.component.perKit} per kit)`
+    : `${input.quantity} × ${input.sku}${input.packCount ? ` (${input.packCount}-pack)` : ''}`;
   return {
     warehouse_id: input.warehouseId,
     customer_account_id: input.customerAccountId,
     requested_date: input.requestedDate,
-    type: 'ASSEMBLY',
+    // CUSTOM, not ASSEMBLY — see header. ASSEMBLY rejects our kit-modelled SKUs.
+    type: 'CUSTOM',
     priority: input.priority ?? 'HIGH',
     name: input.name,
     instructions: input.instructions,
+    assembly_details: spec,
     assembly_sku: {
       sku: input.sku,
       quantity: input.quantity,

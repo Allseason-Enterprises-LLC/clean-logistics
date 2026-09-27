@@ -22,7 +22,10 @@ async function main() {
   const base = { warehouseId: 'W1', customerAccountId: '95145', sku: 'CN-BDL-CAP-GINSENG-60CT-3PK', quantity: 40,
     name: 'TR-00500 · build 40 × CN-BDL-CAP-GINSENG-60CT-3PK', instructions: 'Build. Do NOT ship.', requestedDate: '2026-09-22T00:00:00Z' };
   const d = buildCreateWorkOrderData(base);
-  ok('type is ASSEMBLY', d.type === 'ASSEMBLY');
+  ok('type is CUSTOM (ASSEMBLY rejects kit-modelled SKUs — verified live 171096 vs 171098)', d.type === 'CUSTOM');
+  ok('assembly_details carries a human build spec', /40 × CN-BDL-CAP-GINSENG-60CT-3PK/.test(d.assembly_details));
+  const withComp = buildCreateWorkOrderData({ ...base, packCount: 3, component: { sku: 'CN-CAP-GINSENG-60CT', perKit: 3 } });
+  ok('component spec: 40 kits = 120 singles (3 per kit)', /= 120 × CN-CAP-GINSENG-60CT \(3 per kit\)/.test(withComp.assembly_details));
   ok('priority defaults to HIGH (Weston)', d.priority === 'HIGH');
   ok('requested_date passed through', d.requested_date === '2026-09-22T00:00:00Z');
   ok('assembly_sku carries sku+quantity', d.assembly_sku.sku === base.sku && d.assembly_sku.quantity === 40);
@@ -38,7 +41,7 @@ async function main() {
   const c1 = fakeFetch({ data: { work_order_create: { request_id: 'r', work_order: { id: 'V29ya09yZGVyOjEyMw==', legacy_id: 123, status: 'PENDING_APPROVAL' } } } });
   const wo = await createAssemblyWorkOrder('tok', base, c1.f);
   ok('create returns legacyId as a NUMBER (work_order(id:Int) needs it)', wo.legacyId === 123 && typeof wo.legacyId === 'number');
-  ok('create sends work_order_create mutation with $data', c1.calls[0].query.includes('work_order_create(data: $data)') && c1.calls[0].variables.data.type === 'ASSEMBLY');
+  ok('create sends work_order_create mutation with $data', c1.calls[0].query.includes('work_order_create(data: $data)') && c1.calls[0].variables.data.type === 'CUSTOM');
   const cErr = fakeFetch({ errors: [{ message: 'Token is expired' }] });
   threw = false; try { await createAssemblyWorkOrder('tok', base, cErr.f); } catch (e: any) { threw = /Token is expired/.test(e.message); }
   ok('GraphQL errors[] -> throws with the message', threw);
