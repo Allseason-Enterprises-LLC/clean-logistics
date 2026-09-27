@@ -14,6 +14,7 @@ import { createClient } from '@supabase/supabase-js';
 import { pollWorkOrders } from '../../lib/work-order-poller';
 import { sendTelegram } from '../../lib/fba-post-process';
 import { resolveShipHeroLasVegasWarehouse } from '../../lib/cin7-transfer-sync';
+import { checkTelegramHealth } from '../../lib/telegram-health';
 
 export const config = { maxDuration: 120 };
 
@@ -35,12 +36,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const shipheroToken: string | undefined = wh?.credentials?.accessToken;
     if (!shipheroToken) throw new Error('no ShipHero access token on the LV warehouse row');
 
+    // Every tick: can we actually reach the floor? A dead channel means every
+    // nudge/release message below is silently lost — say so in the JSON.
+    const telegram = await checkTelegramHealth();
+    if (!telegram.ok) console.error(`[poll-work-orders] ⚠️ TELEGRAM DEAD: ${telegram.problem}`);
+
     const result = await pollWorkOrders({ supabase, shipheroToken, sendTelegram });
     const balanced =
       result.scanned ===
       result.released.length + result.failed.length + result.nudged.length +
       result.escalated.length + result.waiting.length + result.errors.length;
-    return res.status(result.errors.length > 0 ? 207 : 200).json({ ...result, balanced });
+    return res.status(result.errors.length > 0 || !telegram.ok ? 207 : 200).json({ ...result, balanced, telegram });
   } catch (err: any) {
     console.error('[poll-work-orders] Fatal:', err);
     return res.status(500).json({ error: err?.message || String(err), scanned: 0 });
