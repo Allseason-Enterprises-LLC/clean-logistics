@@ -9,7 +9,7 @@ import {
 } from './cin7-transfer-types';
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
-import { applyKitWorkOrderGate } from './kit-work-order-gate';
+import { applyKitWorkOrderGate, buildWorkOrdersDigestNotice, type WorkOrderState } from './kit-work-order-gate';
 import { sendTelegram } from './fba-post-process';
 import { resolveKitProductIdentity } from './kit-product-identity';
 import { attachKitBarcode } from './kit-barcode-attach';
@@ -570,6 +570,10 @@ export async function syncCIN7LasVegasTransferOrders(
   let created = 0;
   let skipped = 0;
   let workOrdersCreated = 0;
+  // Kit-gate notices are collected here and posted ONCE after the loop, so N
+  // work orders from one sync run become one consolidated message (Weston
+  // 2026-09-27). Fail-open: a Telegram failure never affects the rows.
+  const pendingWorkOrderNotices: Array<{ state: WorkOrderState; transferNumber: string }> = [];
   // FBA handoffs are collected here and drained after the transfer loop so we
   // don't stampede the Amazon SP-API quota (2026-09-21 incident — see the
   // drain block below).
@@ -769,6 +773,7 @@ export async function syncCIN7LasVegasTransferOrders(
                   shipheroToken: shipHeroWarehouse.credentials.accessToken,
                   resolveAmazonSku: async (sku: string) => (await lookupSkuMapping(sku))?.amz_sku ?? null,
                   sendTelegram,
+                  collectNotice: (item) => pendingWorkOrderNotices.push(item),
                   resolveIdentity: resolveKitProductIdentity,
                   attachBarcode: (a) => attachKitBarcode(shipHeroWarehouse.credentials.accessToken, a),
                 },
@@ -818,6 +823,15 @@ export async function syncCIN7LasVegasTransferOrders(
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         errors.push(`Transfer ${transfer.transferNumber}: ${message}`);
+      }
+    }
+
+    if (pendingWorkOrderNotices.length > 0) {
+      try {
+        const okSent = await sendTelegram(buildWorkOrdersDigestNotice(pendingWorkOrderNotices));
+        console.log(`[kit-gate] posted ${pendingWorkOrderNotices.length} work-order notice(s) as one message: ${okSent ? 'delivered' : 'NOT delivered'}`);
+      } catch (e) {
+        console.warn(`[kit-gate] work-order digest notice failed (non-fatal): ${e instanceof Error ? e.message : e}`);
       }
     }
 

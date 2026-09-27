@@ -46,7 +46,7 @@ async function main() {
     ok('notice is the formal "New Work Order Needed" format', /<b>New Work Order Needed — 3-Pack for Amazon FBA<\/b>/.test(sent[0]));
     ok('notice carries ORDER number + TR + WO id + build spec', /AMZ_CN-CAP-REJUVINOL-2OZ_00500/.test(sent[0]) && /\(TR-00500\)/.test(sent[0]) && /<code>171200<\/code>/.test(sent[0]) && /<b>40 × 3-Pack<\/b> \(120 units total\)/.test(sent[0]));
     ok('notice says labels are NOT created until Complete', /<b>not<\/b> created until the work order is marked Complete/.test(sent[0]));
-    ok('no identity resolver given -> Seller Central barcode instruction', /download it from Seller Central/.test(sent[0]));
+    ok('no identity resolver given -> "UPC or FNSKU … check Amazon" + Seller Central', /may differ, please check Amazon/.test(sent[0]) && /Download it from Seller Central/.test(sent[0]));
     ok('floor-facing: no engineering words', !/reconciler|jsonb|request_payload|bridge|gate/i.test(sent[0]));
     ok('exactly ONE work order created (one per transfer)', created.length === 1);
     ok('WO uses the ShipHero GRAPH warehouse id, not our UUID', created[0].warehouseId === SHIPHERO_LV_WAREHOUSE_GRAPH_ID && created[0].warehouseId === 'V2FyZWhvdXNlOjEzNTg3Mg==');
@@ -81,6 +81,19 @@ async function main() {
     ok('single (-1 msku) -> NOT gated', r.gated === false);
     ok('single -> no WO created, no row update', creates === 0 && updates.length === 0);
   }
+  // ---------- collector: sync consolidates → gate must NOT post inline ----------
+  {
+    const { db } = fakeDb(ROW);
+    const collected: any[] = []; let posted = 0;
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 7, status: 'IN_PROGRESS' }),
+      sendTelegram: async () => { posted++; return true; }, collectNotice: (i) => collected.push(i) }, TRANSFER);
+    ok('🔴 with collectNotice: gated, notice COLLECTED, nothing posted inline', r.gated && collected.length === 1 && collected[0].transferNumber === 'TR-00500' && collected[0].state.ids[0] === '7' && posted === 0);
+  }
+  const sync3 = fs.readFileSync(path.join(__dirname, '../lib/cin7-transfer-sync.ts'), 'utf8');
+  ok('sync collects notices and posts ONE digest after the loop', /collectNotice: \(item\) => pendingWorkOrderNotices\.push\(item\)/.test(sync3) && /buildWorkOrdersDigestNotice\(pendingWorkOrderNotices\)/.test(sync3));
+  ok('digest is posted BEFORE the FBA handoff drain (floor hears first)', sync3.indexOf('buildWorkOrdersDigestNotice(pendingWorkOrderNotices)') < sync3.indexOf('Draining ${pendingFbaHandoffs.length}'));
+
   // ---------- NOT GATED rows never post the notice ----------
   {
     const { db } = fakeDb(ROW);

@@ -72,6 +72,10 @@ export interface GateDeps {
   /** Posts the "work order created" notice to the FBA channel. Optional; a
    *  failure here never blocks the gate (fail OPEN on notifications). */
   sendTelegram?: (html: string) => Promise<boolean>;
+  /** If given, the gate DEFERS the notice: it pushes {state, transferNumber}
+   *  here instead of posting, so the caller can consolidate several work
+   *  orders from one sync run into a single digest (buildWorkOrdersDigestNotice). */
+  collectNotice?: (item: { state: WorkOrderState; transferNumber: string }) => void;
   /** Amazon identity (FNSKU/UPC/name). Optional + fail-open: a lookup failure
    *  produces the "download from Seller Central" instruction, never a stall. */
   resolveIdentity?: typeof resolveKitProductIdentity;
@@ -115,11 +119,14 @@ export function buildWorkOrderCreatedNotice(state: WorkOrderState, transferNumbe
   L.push('');
   L.push('<b>What to do:</b>');
   L.push(`1. Kit the ${pack.toLowerCase()}s as specified in the work order`);
+  // Weston 2026-09-27: always say "UPC or FNSKU (may differ — please check
+  // Amazon)". We show the one we found, but the floor must confirm in Seller
+  // Central which barcode Amazon actually requires for this ASIN.
   if (state.barcode_kind && (state.fnsku || state.upc)) {
     const code = state.fnsku || state.upc;
-    L.push(`2. Label each finished pack with the <b>${esc(state.barcode_kind)}</b> barcode <code>${esc(code!)}</code>${state.barcode_url ? ` — <a href="${state.barcode_url}">barcode PNG</a> (also attached to the ShipHero order)` : ''}`);
+    L.push(`2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b>. We found <b>${esc(state.barcode_kind)}</b> <code>${esc(code!)}</code>${state.barcode_url ? ` — <a href="${state.barcode_url}">barcode PNG</a> (also attached to the ShipHero order)` : ''}`);
   } else {
-    L.push(`2. Label each finished pack with the Amazon barcode for this ASIN — <b>download it from Seller Central</b> (Manage Inventory → Print item labels)`);
+    L.push(`2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b>. Download it from Seller Central (Manage Inventory → Print item labels)`);
   }
   L.push(`3. Apply the <b>Amazon Transparency</b> sticker to each pack (codes come from the Transparency program)`);
   L.push(`4. Put finished packs in a <b>non-pickable bulk bin</b>`);
@@ -146,7 +153,10 @@ export function buildWorkOrderText(args: {
     name: `${label} · build ${args.qty} × ${pack}`,
     instructions:
       `Order ${label} (CIN7 ${args.transferNumber}) → Amazon FBA${args.amazonMsku ? ` (MSKU ${args.amazonMsku})` : ''}.\n` +
-      `Build ${args.qty} × ${args.kitSku} (${pack}). Put the finished packs in a NON-pickable bulk bin.\n` +
+      `Build ${args.qty} × ${args.kitSku} (${pack}).\n` +
+      `Label each finished pack with the UPC or FNSKU barcode (may differ — please check Amazon / Seller Central for this ASIN). ` +
+      `Apply the Amazon Transparency sticker to each pack.\n` +
+      `Put the finished packs in a NON-pickable bulk bin.\n` +
       `Do NOT ship anything from this work order. When it is marked COMPLETED the FBA labels ` +
       `are generated automatically (usually within 15 min) and posted to the FBA Shipments channel.`,
   };
@@ -244,7 +254,9 @@ export async function applyKitWorkOrderGate(
 
   // Tell the floor NOW — not 24 h later. Notification failure is logged, never thrown:
   // the row is already parked and the WO already exists; the gate must not un-gate.
-  if (deps.sendTelegram) {
+  if (deps.collectNotice) {
+    deps.collectNotice({ state, transferNumber: transfer.transferNumber });
+  } else if (deps.sendTelegram) {
     try {
       const ok = await deps.sendTelegram(buildWorkOrderCreatedNotice(state, transfer.transferNumber));
       if (!ok) console.warn(`[kit-gate] ${transfer.transferNumber}: 'work order created' notice was not delivered`);
@@ -253,6 +265,40 @@ export async function applyKitWorkOrderGate(
     }
   }
   return { gated: true, verdict, workOrder: state };
+}
+
+/**
+ * CONSOLIDATED notice for several work orders created in the same sync run.
+ * Weston 2026-09-27: "if we put through multiple work orders in the same few
+ * minutes you can consolidate them into one notification". One header, one
+ * shared what-to-do, and a compact block per work order.
+ * For a single item this defers to the full single-item notice.
+ */
+export function buildWorkOrdersDigestNotice(items: Array<{ state: WorkOrderState; transferNumber: string }>): string {
+  if (items.length === 1) return buildWorkOrderCreatedNotice(items[0].state, items[0].transferNumber);
+  const L: string[] = [];
+  L.push(`🔧 <b>New Work Orders Needed — ${items.length} multi-packs for Amazon FBA</b>`);
+  L.push('');
+  items.forEach(({ state, transferNumber }, i) => {
+    const order = state.order_number ? esc(state.order_number) : esc(transferNumber);
+    const pack = state.pack_count ? `${state.pack_count}-Pack` : 'Multi-Pack';
+    const name = state.product_name ? esc(state.product_name.length > 70 ? state.product_name.slice(0, 67) + '…' : state.product_name) : esc(state.kit_sku);
+    const code = state.fnsku ? `FNSKU <code>${esc(state.fnsku)}</code>` : state.upc ? `UPC <code>${esc(state.upc)}</code>` : 'barcode: check Seller Central';
+    L.push(`<b>${i + 1}. Work Order <code>${esc(state.ids.join(', '))}</code></b> — ${order} (${esc(transferNumber)})`);
+    L.push(`   ${name}`);
+    L.push(`   <code>${esc(state.kit_sku)}</code>${state.asin ? ` · ASIN <code>${esc(state.asin)}</code>` : ''} · ${code}${state.barcode_url ? ` (<a href="${state.barcode_url}">PNG</a>)` : ''}`);
+    L.push(`   Build <b>${state.kit_qty.toLocaleString()} × ${pack}</b>${state.pack_count ? ` (${(state.kit_qty * state.pack_count).toLocaleString()} units)` : ''} · HIGH · needed within 1 business day`);
+    L.push('');
+  });
+  L.push('<b>For each work order:</b>');
+  L.push('1. Kit the packs as specified in the work order');
+  L.push('2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b> (barcodes above are also attached to each ShipHero order)');
+  L.push('3. Apply the <b>Amazon Transparency</b> sticker to each pack');
+  L.push('4. Put finished packs in a <b>non-pickable bulk bin</b>');
+  L.push('5. Mark the work order <b>Complete</b> in ShipHero');
+  L.push('');
+  L.push('⚠️ FBA shipments and shipping labels are <b>not</b> created until each work order is marked Complete. Once it is, labels post here automatically within ~15 min.');
+  return L.join('\n');
 }
 
 /** Merge work_order into request_payload without clobbering partnerLineItems etc. */
