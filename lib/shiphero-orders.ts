@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { buildPartnerLineItemId } from './order-naming';
 import { ShipHeroCredentials, ShipHeroOrderCreateResult, ShipHeroTransferOrderInput } from './cin7-transfer-types';
 import { getShipHeroProductData, getLotBreakdown } from './shiphero-product-data';
 import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from './lot-allocation';
@@ -172,7 +173,7 @@ async function createOrderViaGraphQL(credentials: ShipHeroCredentials, input: Sh
             sku: item.sku,
             quantity: item.quantity,
             price: '0.00',
-            partner_line_item_id: `${input.orderNumber}-line-${idx + 1}`,
+            partner_line_item_id: buildPartnerLineItemId(input.orderNumber, idx), // ≤45 chars
           })),
           shipping_address: input.shippingAddress,
           shipping_lines: {
@@ -278,7 +279,7 @@ async function createOneWholesaleOrder(
             sku: item.sku,
             quantity: item.quantity,
             price: '0.00',
-            partner_line_item_id: `${orderNumber}-line-${idx + 1}`,
+            partner_line_item_id: buildPartnerLineItemId(orderNumber, idx), // ≤45 chars
             warehouse_id: 'V2FyZWhvdXNlOjEzNTg3Mg==',
           })),
           tags: [...(input.tags || []), 'FBA', 'Wholesale'],

@@ -214,6 +214,29 @@ function fitOrderNumber(platform: string, sku: string, tr: string): string {
   return `${platform}_${trimmed}_${bare}`;
 }
 
+/**
+ * ShipHero `partner_line_item_id` — hard limit **45 chars** (ShipHero rejects
+ * the whole order otherwise: "Invalid value … Cannot be longer than 45 chars").
+ *
+ * The 2026-09-21 rename made order numbers long enough that
+ * `<orderNumber>-line-1` overflowed once a lot suffix is present:
+ *   AMZ_CN-CAP-PROSTATE-120BG_00478-2607062A-line-1  = 47 chars → 400.
+ * Caught 2026-09-27 on the first day the wholesale path actually ran.
+ *
+ * Only the ORDER number carries meaning for the floor; the line id just has
+ * to be unique within the order and deterministic (idempotent re-creates).
+ * Format: `<TR digits>[-<lot>]-L<idx>` e.g. `00478-2607062A-L1` (17 chars).
+ * Falls back to a truncated order number if no TR digits can be found.
+ */
+export function buildPartnerLineItemId(orderNumber: string, idx: number): string {
+  const s = String(orderNumber || '');
+  // Trailing "_<5+ digits>" is the TR number; anything after a following "-" is a lot suffix.
+  const m = /_(\d{4,})(?:-([A-Za-z0-9]+))?$/.exec(s);
+  const core = m ? (m[2] ? `${m[1]}-${m[2]}` : m[1]) : s.replace(/[^A-Za-z0-9_-]/g, '');
+  const tail = `-L${idx + 1}`;
+  return (core.slice(0, 45 - tail.length) + tail).slice(0, 45);
+}
+
 export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {
   const tr = bareTransferNumber(input.transferNumber);
 
