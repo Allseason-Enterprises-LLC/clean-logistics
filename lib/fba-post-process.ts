@@ -397,7 +397,8 @@ export async function attachToShipHero(
   accountId: string,
   url: string,
   description: string,
-  filename: string
+  filename: string,
+  fileType: string = 'application/pdf'
 ): Promise<{ id: string; created: boolean }> {
   // Pre-flight: is this filename already attached?
   try {
@@ -437,7 +438,7 @@ export async function attachToShipHero(
       url,
       description,
       filename,
-      file_type: 'application/pdf',
+      file_type: fileType,
     },
   });
   return { id: data?.order_add_attachment?.attachment?.id ?? '', created: true };
