@@ -23,6 +23,7 @@ function fakeDb(row: any) {
   return { db: q as any, updates };
 }
 const TRANSFER = { id: 'cin7-uuid-1', transferNumber: 'TR-00500', destinationName: 'Amazon FBA Warehouse',
+  shipheroOrderNumber: 'AMZ_CN-CAP-REJUVINOL-2OZ_00500',
   lines: [{ sku: 'CN-CAP-REJUVINOL-2OZ', quantity: 40 }] };
 const ROW = { id: 'row-1', request_payload: { partnerLineItems: [{ sku: 'CN-CAP-REJUVINOL-2OZ', quantity: 40 }], tags: ['x'] } };
 
@@ -43,6 +44,9 @@ async function main() {
     ok('WO qty = transfer line qty', created[0].quantity === 40 && created[0].sku === 'CN-CAP-REJUVINOL-2OZ');
     ok('WO requested_date = today (Weston), priority HIGH', created[0].requestedDate === '2026-09-26T00:00:00' && created[0].priority === 'HIGH');
     ok('WO packCount 3 flows into the spec', created[0].packCount === 3 && /3-pack/.test(created[0].name));
+    ok('🔴 WO NAME = the ShipHero ORDER number the floor sees (AMZ_<SKU>_<NNNNN>), not the TR', created[0].name.startsWith('AMZ_CN-CAP-REJUVINOL-2OZ_00500 ·') && !created[0].name.startsWith('TR-'));
+    ok('instructions still carry the TR for traceability', /CIN7 TR-00500/.test(created[0].instructions) && /AMZ_CN-CAP-REJUVINOL-2OZ_00500/.test(created[0].instructions));
+    ok('state records order_number', updates[0].request_payload.work_order.order_number === 'AMZ_CN-CAP-REJUVINOL-2OZ_00500');
     ok('instructions say do NOT ship + labels auto after COMPLETED', /Do NOT ship/.test(created[0].instructions) && /COMPLETED/.test(created[0].instructions));
     const u = updates[0];
     ok('row parked: request_payload.work_order written', !!u?.request_payload?.work_order);
@@ -112,6 +116,10 @@ async function main() {
   ok('gate failure path marks work_order_failed AND sets gated=true (no fire)', /work_order_failed[\s\S]{0,400}gated = true/.test(sync));
   ok('non-kit path pushes the SAME handoff shape as before', /pendingFbaHandoffs\.push\(\{\s*cin7TransferNumber: transfer\.transferNumber,\s*items: transfer\.lines\.map/.test(sync));
   ok('buildWorkOrderText is warehouse-facing (no engineering words)', !/reconciler|jsonb|PostgREST|bridge row/i.test(buildWorkOrderText({ transferNumber: 'TR-1', kitSku: 'S', qty: 1 }).instructions));
+  ok('no order number -> falls back to TR (never a blank name)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: null, kitSku: 'S', qty: 1 }).name.startsWith('TR-1 ·'));
+  ok('CIN7 Reference override flows through verbatim (order-naming escape hatch)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: 'AMZ_SPLIT-B_00001', kitSku: 'S', qty: 1 }).name.startsWith('AMZ_SPLIT-B_00001 ·'));
+  const sync2 = fs.readFileSync(path.join(__dirname, '../lib/cin7-transfer-sync.ts'), 'utf8');
+  ok('sync passes result.shipheroOrderNumber into the gate', /shipheroOrderNumber: result\.shipheroOrderNumber/.test(sync2));
   ok('readWorkOrderState(null payload) -> null', readWorkOrderState(null) === null && readWorkOrderState({}) === null);
 
   console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

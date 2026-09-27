@@ -14,7 +14,8 @@ const hoursAgo = (h: number) => new Date(NOW.getTime() - h * 36e5).toISOString()
 
 function wo(over: any = {}) {
   return { type: 'CUSTOM', ids: ['171200'], status: 'IN_PROGRESS', created_at: hoursAgo(1), completed_at: null,
-    last_nudge_at: null, kit_sku: 'CN-CAP-REJUVINOL-2OZ', kit_qty: 40, pack_count: 3, amazon_msku: 'CB-REJUVINOL-DRP-3', reason: 'amazon_msku:multipack_suffix', ...over };
+    last_nudge_at: null, kit_sku: 'CN-CAP-REJUVINOL-2OZ', kit_qty: 40, pack_count: 3, amazon_msku: 'CB-REJUVINOL-DRP-3', reason: 'amazon_msku:multipack_suffix',
+    order_number: 'AMZ_CN-CAP-REJUVINOL-2OZ_00500', ...over };
 }
 function fakeDb(rows: any[]) {
   const updates: Array<{ id: string; patch: any }> = [];
@@ -50,6 +51,7 @@ async function main() {
     ok('release sets last_fba_handoff_status=pending (reconciler-eligible, not fired here)', p.last_fba_handoff_status === 'pending');
     ok('release does NOT touch status column', !('status' in p));
     ok('release posts ✅ with 15-minute expectation', /✅/.test(sent[0]) && /15 minutes/.test(sent[0]) && /TR-00500/.test(sent[0]));
+    ok('🔴 floor messages LEAD with the order number they search (AMZ_…), TR in brackets', /<b>AMZ_CN-CAP-REJUVINOL-2OZ_00500 \(TR-00500\)<\/b>/.test(sent[0]));
   }
   // ── FAILED ──
   {

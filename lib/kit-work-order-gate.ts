@@ -40,6 +40,8 @@ export interface WorkOrderState {
   last_nudge_at?: string | null;
   kit_sku: string;
   kit_qty: number;
+  /** The ShipHero order number the WO is named after (what the floor searches). */
+  order_number?: string | null;
   pack_count?: number | null;
   amazon_msku?: string | null;
   /** which rule gated it — for the ledger / debugging */
@@ -61,14 +63,23 @@ export interface GateDeps {
   now?: () => Date;
 }
 
+/**
+ * WO name = the ShipHero ORDER number the floor already sees
+ * (`AMZ_<SKU>_<NNNNN>`, or the CIN7 Reference override — see order-naming.ts),
+ * so the work order and the order line up on the same screen. Weston
+ * 2026-09-27: "remember we started renaming transfer orders a different way".
+ * Falls back to the TR number only if no order number is available.
+ */
 export function buildWorkOrderText(args: {
-  transferNumber: string; kitSku: string; qty: number; packCount?: number | null; amazonMsku?: string | null;
+  transferNumber: string; orderNumber?: string | null; kitSku: string; qty: number;
+  packCount?: number | null; amazonMsku?: string | null;
 }) {
   const pack = args.packCount ? `${args.packCount}-pack` : 'multi-pack';
+  const label = (args.orderNumber || '').trim() || args.transferNumber;
   return {
-    name: `${args.transferNumber} · build ${args.qty} × ${args.kitSku} (${pack}) for Amazon FBA`,
+    name: `${label} · build ${args.qty} × ${pack}`,
     instructions:
-      `CIN7 ${args.transferNumber} → Amazon FBA${args.amazonMsku ? ` (MSKU ${args.amazonMsku})` : ''}.\n` +
+      `Order ${label} (CIN7 ${args.transferNumber}) → Amazon FBA${args.amazonMsku ? ` (MSKU ${args.amazonMsku})` : ''}.\n` +
       `Build ${args.qty} × ${args.kitSku} (${pack}). Put the finished packs in a NON-pickable bulk bin.\n` +
       `Do NOT ship anything from this work order. When it is marked COMPLETED the FBA labels ` +
       `are generated automatically (usually within 15 min) and posted to the FBA Shipments channel.`,
@@ -88,6 +99,8 @@ export async function applyKitWorkOrderGate(
     transferNumber: string;
     destinationName?: string | null;
     lines: Array<{ sku: string; quantity: number }>;
+    /** The ShipHero order number just created for this transfer (AMZ_<SKU>_<NNNNN>). */
+    shipheroOrderNumber?: string | null;
   }
 ): Promise<GateResult> {
   // Resolve Amazon MSKUs (suffix normally lives there). A failed lookup is
@@ -116,7 +129,7 @@ export async function applyKitWorkOrderGate(
   for (const line of enriched.filter((l) => verdict.kitSkus.includes(l.sku))) {
     const r = verdict.reasons[line.sku];
     const text = buildWorkOrderText({
-      transferNumber: transfer.transferNumber, kitSku: line.sku, qty: line.quantity,
+      transferNumber: transfer.transferNumber, orderNumber: transfer.shipheroOrderNumber, kitSku: line.sku, qty: line.quantity,
       packCount: r?.packCount ?? null, amazonMsku: line.amazonSku,
     });
     const wo = await create(deps.shipheroToken, {
@@ -132,7 +145,8 @@ export async function applyKitWorkOrderGate(
 
   const state: WorkOrderState = {
     type: 'CUSTOM', ids, status: 'IN_PROGRESS', created_at: nowIso, completed_at: null, last_nudge_at: null,
-    kit_sku: first!.sku, kit_qty: first!.qty, pack_count: first!.pack ?? null, amazon_msku: first!.msku ?? null, reason: first!.reason,
+    kit_sku: first!.sku, kit_qty: first!.qty, order_number: transfer.shipheroOrderNumber ?? null,
+    pack_count: first!.pack ?? null, amazon_msku: first!.msku ?? null, reason: first!.reason,
   };
 
   await parkRow(deps.supabase, transfer.id, transfer.destinationName || '', state);

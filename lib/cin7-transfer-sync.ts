@@ -766,7 +766,7 @@ export async function syncCIN7LasVegasTransferOrders(
                   shipheroToken: shipHeroWarehouse.credentials.accessToken,
                   resolveAmazonSku: async (sku: string) => (await lookupSkuMapping(sku))?.amz_sku ?? null,
                 },
-                transfer
+                { ...transfer, shipheroOrderNumber: result.shipheroOrderNumber ?? result.orderNumber ?? null }
               );
               gated = gate.gated;
               if (gated) {
