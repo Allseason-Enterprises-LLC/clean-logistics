@@ -9,6 +9,8 @@
  *
  * Never throws. Never logs the token. Returns a small verdict object.
  */
+import { resolveFbaChatId } from './fba-post-process';
+
 export interface TelegramHealth {
   ok: boolean;
   token_set: boolean;
@@ -22,13 +24,14 @@ export interface TelegramHealth {
 
 export async function checkTelegramHealth(fetchImpl: typeof fetch = fetch): Promise<TelegramHealth> {
   const token = process.env.TELEGRAM_BOT_TOKEN?.trim() || '';
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim() || '';
+  // Same resolution sendTelegram uses, so the health check reports the id that
+  // will actually be posted to — not whatever a stale env var says.
+  const chatId = resolveFbaChatId();
   const out: TelegramHealth = {
     ok: false, token_set: !!token, bot_id_prefix: token ? token.split(':')[0] : null,
     bot_username: null, chat_id: chatId || null, chat_title: null, problem: null,
   };
   if (!token) { out.problem = 'TELEGRAM_BOT_TOKEN missing'; return out; }
-  if (!chatId) { out.problem = 'TELEGRAM_FBA_CHAT_ID missing'; return out; }
   try {
     const me: any = await (await fetchImpl(`https://api.telegram.org/bot${token}/getMe`)).json();
     if (!me?.ok) { out.problem = `getMe failed: ${me?.description || 'unknown'} — token is dead/revoked (bot ${out.bot_id_prefix})`; return out; }

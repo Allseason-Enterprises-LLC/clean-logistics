@@ -470,9 +470,34 @@ async function updatePackingNote(token: string, orderId: string, note: string): 
  * Failures are logged LOUDLY with Amazon-visible context, because a silent
  * notification failure means the warehouse never learns a shipment is ready.
  */
+/**
+ * The Clean Nutra FBA Shipments group. This is a FIXED FACT about the system,
+ * like the ShipHero warehouse id — not a per-environment secret. It lived in an
+ * env var, drifted to the pre-supergroup id (-5244576221), and silently killed
+ * the kit gate's "work order created" notice for TR-00484 on 2026-09-27 even
+ * after two redeploys. Weston: "I don't know why we are even using an env var
+ * for this." Agreed. Hardcoded; the env var can only OVERRIDE it, and only if
+ * it looks like a real supergroup id, so a stale value can never win again.
+ */
+export const FBA_TELEGRAM_CHAT_ID = '-1003528234475';
+
+export function resolveFbaChatId(envValue: string | undefined = process.env.TELEGRAM_FBA_CHAT_ID): string {
+  const v = (envValue || '').trim();
+  // Only honour an override that is a modern supergroup id (-100…). The old
+  // pre-upgrade id resolves for reads (getChat) but sendMessage fails on it.
+  if (/^-100\d{6,}$/.test(v) && v !== FBA_TELEGRAM_CHAT_ID) {
+    console.warn(`[fba-post-process] TELEGRAM_FBA_CHAT_ID override in effect: ${v} (default ${FBA_TELEGRAM_CHAT_ID})`);
+    return v;
+  }
+  if (v && v !== FBA_TELEGRAM_CHAT_ID) {
+    console.warn(`[fba-post-process] ignoring TELEGRAM_FBA_CHAT_ID=${v} — not a supergroup id; using ${FBA_TELEGRAM_CHAT_ID}`);
+  }
+  return FBA_TELEGRAM_CHAT_ID;
+}
+
 export async function sendTelegram(text: string): Promise<boolean> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
+  const chatId = resolveFbaChatId();
   if (!botToken || !chatId) {
     console.error(
       '[fba-post-process] ⚠️ TELEGRAM NOTIFICATION SKIPPED — env vars missing ' +

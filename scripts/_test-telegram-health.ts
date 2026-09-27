@@ -13,7 +13,7 @@ async function main() {
   let h = await checkTelegramHealth(fake({ getMe: { ok: false, description: 'Not Found' } }));
   ok('dead token -> ok:false, names the bot id, says token is dead', !h.ok && h.bot_id_prefix === '8350576274' && /dead|revoked/.test(h.problem || ''));
   ok('never leaks the token secret', !JSON.stringify(h).includes('SECRETSECRET'));
-  ok('chat id is trimmed (trailing newline removed)', h.chat_id === '-5244576221');
+  ok('stale env chat id is REPLACED by the fixed group id', h.chat_id === '-1003528234475');
 
   h = await checkTelegramHealth(fake({ getMe: { ok: true, result: { username: 'freightaiagentbm_bot' } }, getChat: { ok: false, description: 'Bad Request: chat not found' } }));
   ok('good token, stale chat -> ok:false, names bot + chat', !h.ok && h.bot_username === 'freightaiagentbm_bot' && /chat not found/.test(h.problem || '') && /stale|not in that chat/.test(h.problem || ''));
@@ -24,6 +24,7 @@ async function main() {
   delete env.TELEGRAM_BOT_TOKEN;
   h = await checkTelegramHealth(fake({}));
   ok('missing token -> ok:false, no network call needed', !h.ok && /missing/.test(h.problem || '') && h.token_set === false);
+  ok('missing chat env is NOT a failure any more (fixed default)', h.chat_id === '-1003528234475');
 
   env.TELEGRAM_BOT_TOKEN = 'x:y';
   h = await checkTelegramHealth((async () => { throw new Error('ECONNRESET'); }) as any);
