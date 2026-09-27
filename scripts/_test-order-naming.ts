@@ -136,15 +136,27 @@ eq(
   }),
   'AMZ_CN-CAP-SAFFRON-60CT_TR-00477'
 );
+// 2026-09-27 (Weston, TR-00484): a prose Reference is a NOTE, not a rename.
+// Only an order-number-shaped value (XXX_…) overrides. See isReferenceAnOverride.
 eq(
-  'unsafe characters in reference are sanitized',
+  'prose reference is a NOTE -> ignored, name is derived',
   buildShipHeroOrderNumber({
     transferNumber: 'TR-00477',
     destinationName: 'Amazon FBA Warehouse',
     skus: ['X'],
     reference: 'AMZ Rush!! /special\\ order',
   }),
-  'AMZ-Rush-special-order_TR-00477'
+  'AMZ_X_TR-00477'
+);
+eq(
+  'unsafe characters in an order-shaped reference are sanitized',
+  buildShipHeroOrderNumber({
+    transferNumber: 'TR-00477',
+    destinationName: 'Amazon FBA Warehouse',
+    skus: ['X'],
+    reference: 'AMZ_Rush!! /special\\ order',
+  }),
+  'AMZ_Rush-special-order_TR-00477'
 );
 
 console.log('\n--- backward compatibility: resolving old AND new names ---');

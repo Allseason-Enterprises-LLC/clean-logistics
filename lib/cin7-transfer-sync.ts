@@ -11,6 +11,8 @@ import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { applyKitWorkOrderGate } from './kit-work-order-gate';
 import { sendTelegram } from './fba-post-process';
+import { resolveKitProductIdentity } from './kit-product-identity';
+import { attachKitBarcode } from './kit-barcode-attach';
 import { lookupSkuMapping } from './fba-orchestrator';
 import { createShipHeroPurchaseOrder } from './shiphero-inbound';
 import { buildShipHeroOrderNumber } from './order-naming';
@@ -767,8 +769,15 @@ export async function syncCIN7LasVegasTransferOrders(
                   shipheroToken: shipHeroWarehouse.credentials.accessToken,
                   resolveAmazonSku: async (sku: string) => (await lookupSkuMapping(sku))?.amz_sku ?? null,
                   sendTelegram,
+                  resolveIdentity: resolveKitProductIdentity,
+                  attachBarcode: (a) => attachKitBarcode(shipHeroWarehouse.credentials.accessToken, a),
                 },
-                { ...transfer, shipheroOrderNumber: result.shipheroOrderNumber ?? result.orderNumber ?? null }
+                {
+                  ...transfer,
+                  shipheroOrderNumber: result.shipheroOrderNumber ?? result.orderNumber ?? null,
+                  shipheroOrderId: result.shipheroOrderId ?? result.orderId ?? null,
+                  reference: (transfer.raw as any)?.Reference ?? null,
+                }
               );
               gated = gate.gated;
               if (gated) {

@@ -253,13 +253,14 @@ async function fetchLabelPdf(fbaId: string, nBoxes: number, boxIds: string[]): P
   return buf;
 }
 
-async function uploadToSupabase(
+export async function uploadToSupabase(
   objectPath: string,
-  pdfBytes: Buffer
+  pdfBytes: Buffer,
+  contentType: string = 'application/pdf'
 ): Promise<string> {
   const sb = getSupabase();
   const { error } = await sb.storage.from(SUPABASE_BUCKET).upload(objectPath, pdfBytes, {
-    contentType: 'application/pdf',
+    contentType,
     upsert: true,
     cacheControl: 'no-cache',
   });
@@ -292,7 +293,7 @@ function isCancelledStatus(status: string | null | undefined): boolean {
   return s.includes('cancel') || s.includes('void');
 }
 
-async function findShipheroOrder(
+export async function findShipheroOrder(
   token: string,
   cin7TransferNumber: string
 ): Promise<{ orderId: string; accountId: string } | null> {
@@ -390,7 +391,7 @@ async function findShipheroOrder(
  * it WILL be pointed at orders that already hold some attachments. Dedupe here
  * rather than asking every caller to remember.
  */
-async function attachToShipHero(
+export async function attachToShipHero(
   token: string,
   orderId: string,
   accountId: string,

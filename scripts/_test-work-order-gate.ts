@@ -43,10 +43,11 @@ async function main() {
     ok('gated when Amazon MSKU ends -3', r.gated === true);
     // ── the "work order created" notice (Weston 2026-09-27) ──
     ok('🔧 floor is told IMMEDIATELY that a work order was created', sent.length === 1 && /🔧/.test(sent[0]));
-    ok('notice leads with the ORDER number, TR in brackets', /<b>AMZ_CN-CAP-REJUVINOL-2OZ_00500 \(TR-00500\)<\/b>/.test(sent[0]));
-    ok('notice names the WO id + build spec', /171200/.test(sent[0]) && /40 × CN-CAP-REJUVINOL-2OZ/.test(sent[0]) && /3-pack/.test(sent[0]));
-    ok('notice says labels will NOT be created until Complete', /<b>not<\/b> be created/.test(sent[0]) && /Complete/.test(sent[0]));
-    ok('notice is short (floor-facing, no engineering words)', sent[0].length < 450 && !/reconciler|jsonb|request_payload|bridge/i.test(sent[0]));
+    ok('notice is the formal "New Work Order Needed" format', /<b>New Work Order Needed — 3-Pack for Amazon FBA<\/b>/.test(sent[0]));
+    ok('notice carries ORDER number + TR + WO id + build spec', /AMZ_CN-CAP-REJUVINOL-2OZ_00500/.test(sent[0]) && /\(TR-00500\)/.test(sent[0]) && /<code>171200<\/code>/.test(sent[0]) && /<b>40 × 3-Pack<\/b> \(120 units total\)/.test(sent[0]));
+    ok('notice says labels are NOT created until Complete', /<b>not<\/b> created until the work order is marked Complete/.test(sent[0]));
+    ok('no identity resolver given -> Seller Central barcode instruction', /download it from Seller Central/.test(sent[0]));
+    ok('floor-facing: no engineering words', !/reconciler|jsonb|request_payload|bridge|gate/i.test(sent[0]));
     ok('exactly ONE work order created (one per transfer)', created.length === 1);
     ok('WO uses the ShipHero GRAPH warehouse id, not our UUID', created[0].warehouseId === SHIPHERO_LV_WAREHOUSE_GRAPH_ID && created[0].warehouseId === 'V2FyZWhvdXNlOjEzNTg3Mg==');
     ok('WO qty = transfer line qty', created[0].quantity === 40 && created[0].sku === 'CN-CAP-REJUVINOL-2OZ');
@@ -151,7 +152,9 @@ async function main() {
   ok('CIN7 Reference override flows through verbatim (order-naming escape hatch)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: 'AMZ_SPLIT-B_00001', kitSku: 'S', qty: 1 }).name.startsWith('AMZ_SPLIT-B_00001 ·'));
   const sync2 = fs.readFileSync(path.join(__dirname, '../lib/cin7-transfer-sync.ts'), 'utf8');
   ok('sync passes result.shipheroOrderNumber into the gate', /shipheroOrderNumber: result\.shipheroOrderNumber/.test(sync2));
-  ok('sync wires the REAL sendTelegram into the gate', /sendTelegram,\s*\}/.test(sync2.slice(sync2.indexOf('applyKitWorkOrderGate('), sync2.indexOf('applyKitWorkOrderGate(') + 600)) && sync2.includes("import { sendTelegram } from './fba-post-process'"));
+  const gateCall = sync2.slice(sync2.indexOf('applyKitWorkOrderGate('), sync2.indexOf('applyKitWorkOrderGate(') + 900);
+  ok('sync wires the REAL sendTelegram into the gate', /sendTelegram,/.test(gateCall) && sync2.includes("import { sendTelegram } from './fba-post-process'"));
+  ok('sync wires identity resolution + barcode attach + CIN7 Reference into the gate', /resolveIdentity: resolveKitProductIdentity/.test(gateCall) && /attachBarcode:/.test(gateCall) && /reference: \(transfer\.raw as any\)\?\.Reference/.test(gateCall));
   ok('readWorkOrderState(null payload) -> null', readWorkOrderState(null) === null && readWorkOrderState({}) === null);
 
   console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

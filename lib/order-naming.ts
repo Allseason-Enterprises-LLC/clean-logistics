@@ -277,10 +277,29 @@ export function buildPartnerLineItemId(orderNumber: string, idx: number): string
   return (core.slice(0, 45 - tail.length) + tail).slice(0, 45);
 }
 
+/**
+ * Is this CIN7 Reference a deliberate RENAME, or just a NOTE?
+ *
+ * 2026-09-27, TR-00484: Weston typed `FBA B0HJN6KKVK - Cellnova 2PK bundle`
+ * into Reference as a description. The override read it as a rename and the
+ * floor got `REF_B0HJN6KKVK_00484` instead of `AMZ_CN-BDL-CAP-NMNSUPP-60CT-2PK_00484`.
+ * Weston's call: a Reference that starts with a platform word, an ASIN, or
+ * ordinary prose is a note — ignore it and derive the name. Only something
+ * that already LOOKS like an order number (`XXX_…` platform-code shape) is
+ * honoured as an override.
+ */
+export function isReferenceAnOverride(reference: string | null | undefined): boolean {
+  const raw = String(reference || '').trim();
+  if (!raw) return false;
+  // Deliberate override shape: three-letter platform code, underscore, then a
+  // segment — e.g. AMZ_BUNDLE-Q4_TR-00477, TIK_SPLIT-B. Nothing else qualifies.
+  return /^[A-Z]{3}_[A-Za-z0-9]/.test(raw);
+}
+
 export function buildShipHeroOrderNumber(input: BuildOrderNumberInput): string {
   const tr = bareTransferNumber(input.transferNumber);
 
-  const ref = sanitizeSegment(input.reference ?? '');
+  const ref = isReferenceAnOverride(input.reference) ? sanitizeSegment(input.reference ?? '') : '';
   if (ref) {
     // Guarantee the TR number is present so the order stays traceable and
     // every downstream lookup keeps working, even on a hand-typed reference.

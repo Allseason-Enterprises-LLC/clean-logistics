@@ -22,6 +22,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { isKitTransfer, type KitTransferVerdict } from './kit-detection';
 import { createAssemblyWorkOrder } from './shiphero-work-orders';
+import { resolveKitProductIdentity, renderBarcodePng, extractAsin, type KitProductIdentity } from './kit-product-identity';
 
 /** ShipHero GRAPH id for Clean Nutra LV (Warehouse:135872) — the UUID in
  *  SHIPHERO_WAREHOUSE_ID is OUR id and work_order_create rejects it. */
@@ -44,6 +45,14 @@ export interface WorkOrderState {
   order_number?: string | null;
   pack_count?: number | null;
   amazon_msku?: string | null;
+  /** Product identity for the kitting instructions (resolved from Amazon at gate time). */
+  asin?: string | null;
+  product_name?: string | null;
+  fnsku?: string | null;
+  upc?: string | null;
+  barcode_kind?: 'FNSKU' | 'UPC' | null;
+  /** public URL of the rendered barcode PNG, when we could generate one */
+  barcode_url?: string | null;
   /** which rule gated it — for the ledger / debugging */
   reason: string;
 }
@@ -63,6 +72,11 @@ export interface GateDeps {
   /** Posts the "work order created" notice to the FBA channel. Optional; a
    *  failure here never blocks the gate (fail OPEN on notifications). */
   sendTelegram?: (html: string) => Promise<boolean>;
+  /** Amazon identity (FNSKU/UPC/name). Optional + fail-open: a lookup failure
+   *  produces the "download from Seller Central" instruction, never a stall. */
+  resolveIdentity?: typeof resolveKitProductIdentity;
+  /** Render + upload + attach the barcode to the ShipHero order. Fail-open. */
+  attachBarcode?: (args: { identity: KitProductIdentity; orderNumber: string; transferNumber: string; shipheroOrderId?: string | null }) => Promise<string | null>;
   now?: () => Date;
 }
 
@@ -70,19 +84,49 @@ const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'
 
 /**
  * The floor's FIRST message about a kit transfer — posted the moment the row
- * parks, so nobody is left wondering why no labels appeared. Weston 2026-09-27:
- * "a quick message that a work order needs to be completed before the
- * shipment can go out". Short on purpose; the 24 h/48 h reminders carry detail.
+ * parks. Weston 2026-09-27: formal, "similar to the FBA shipment labels
+ * notification but shorter and sweeter": header, product block, work-order
+ * block, what-to-do, and the kitting/prep instructions — including WHICH
+ * barcode goes on the finished pack (FNSKU if Amazon assigned one, else UPC;
+ * if neither is known, download it from Seller Central) and Transparency
+ * stickers. Same HTML conventions as buildTelegramMessage in fba-post-process.
  */
 export function buildWorkOrderCreatedNotice(state: WorkOrderState, transferNumber: string): string {
-  const label = state.order_number ? `${esc(state.order_number)} (${esc(transferNumber)})` : esc(transferNumber);
-  const pack = state.pack_count ? `${state.pack_count}-pack` : 'multi-pack';
-  return (
-    `🔧 <b>${label}</b> — multi-pack, so a <b>Work Order</b> comes first.\n` +
-    `Work order <b>${esc(state.ids.join(', '))}</b>: build <b>${state.kit_qty} × ${esc(state.kit_sku)}</b> (${pack}).\n` +
-    `The FBA shipment and labels will <b>not</b> be created until this work order is marked <b>Complete</b> in ShipHero. ` +
-    `Once it is, labels post here automatically within ~15 min.`
-  );
+  const order = state.order_number ? esc(state.order_number) : esc(transferNumber);
+  const pack = state.pack_count ? `${state.pack_count}-Pack` : 'Multi-Pack';
+  const name = state.product_name ? esc(state.product_name) : `${esc(state.kit_sku)}`;
+  const woIds = esc(state.ids.join(', '));
+  const L: string[] = [];
+
+  L.push(`🔧 <b>New Work Order Needed — ${pack} for Amazon FBA</b>`);
+  L.push('');
+  L.push(`<b>Product:</b> ${name}`);
+  L.push(`<b>CIN7 SKU:</b> <code>${esc(state.kit_sku)}</code>`);
+  if (state.amazon_msku) L.push(`<b>Amazon MSKU:</b> <code>${esc(state.amazon_msku)}</code>`);
+  const ids: string[] = [];
+  if (state.asin) ids.push(`<b>ASIN:</b> <code>${esc(state.asin)}</code>`);
+  if (state.fnsku) ids.push(`<b>FNSKU:</b> <code>${esc(state.fnsku)}</code>`);
+  if (!state.fnsku && state.upc) ids.push(`<b>UPC:</b> <code>${esc(state.upc)}</code>`);
+  if (ids.length) L.push(ids.join(' · '));
+  L.push('');
+  L.push(`<b>Work Order:</b> <code>${woIds}</code> — <b>${order}</b> (${esc(transferNumber)})`);
+  L.push(`• Build: <b>${state.kit_qty.toLocaleString()} × ${pack}</b>${state.pack_count ? ` (${(state.kit_qty * state.pack_count).toLocaleString()} units total)` : ''}`);
+  L.push(`• Priority: <b>HIGH</b> — requested today, needed within 1 business day`);
+  L.push('');
+  L.push('<b>What to do:</b>');
+  L.push(`1. Kit the ${pack.toLowerCase()}s as specified in the work order`);
+  if (state.barcode_kind && (state.fnsku || state.upc)) {
+    const code = state.fnsku || state.upc;
+    L.push(`2. Label each finished pack with the <b>${esc(state.barcode_kind)}</b> barcode <code>${esc(code!)}</code>${state.barcode_url ? ` — <a href="${state.barcode_url}">barcode PNG</a> (also attached to the ShipHero order)` : ''}`);
+  } else {
+    L.push(`2. Label each finished pack with the Amazon barcode for this ASIN — <b>download it from Seller Central</b> (Manage Inventory → Print item labels)`);
+  }
+  L.push(`3. Apply the <b>Amazon Transparency</b> sticker to each pack (codes come from the Transparency program)`);
+  L.push(`4. Put finished packs in a <b>non-pickable bulk bin</b>`);
+  L.push(`5. Mark work order <code>${woIds}</code> <b>Complete</b> in ShipHero`);
+  L.push('');
+  L.push(`⚠️ The FBA shipment and shipping labels are <b>not</b> created until the work order is marked Complete. Once it is, labels post here automatically within ~15 min.`);
+  return L.join('\n');
 }
 
 /**
@@ -123,6 +167,9 @@ export async function applyKitWorkOrderGate(
     lines: Array<{ sku: string; quantity: number }>;
     /** The ShipHero order number just created for this transfer (AMZ_<SKU>_<NNNNN>). */
     shipheroOrderNumber?: string | null;
+    shipheroOrderId?: string | null;
+    /** CIN7 Reference free text — may carry the ASIN ("FBA B0HJN6KKVK - …"). */
+    reference?: string | null;
   }
 ): Promise<GateResult> {
   // Resolve Amazon MSKUs (suffix normally lives there). A failed lookup is
@@ -170,6 +217,28 @@ export async function applyKitWorkOrderGate(
     kit_sku: first!.sku, kit_qty: first!.qty, order_number: transfer.shipheroOrderNumber ?? null,
     pack_count: first!.pack ?? null, amazon_msku: first!.msku ?? null, reason: first!.reason,
   };
+
+  // Product identity + barcode for the kitting instructions. FAIL-OPEN: any
+  // failure here degrades to "download the barcode from Seller Central" in
+  // the notice — it must never block the work order or the row parking.
+  if (deps.resolveIdentity) {
+    try {
+      const identity = await deps.resolveIdentity({
+        cin7Sku: first!.sku, amazonMsku: first!.msku ?? null, asin: extractAsin(transfer.reference),
+      });
+      state.asin = identity.asin; state.product_name = identity.productName;
+      state.fnsku = identity.fnsku; state.upc = identity.upc; state.barcode_kind = identity.barcode?.kind ?? null;
+      if (identity.barcode && deps.attachBarcode) {
+        try {
+          state.barcode_url = await deps.attachBarcode({
+            identity, orderNumber: transfer.shipheroOrderNumber || transfer.transferNumber,
+            transferNumber: transfer.transferNumber, shipheroOrderId: transfer.shipheroOrderId ?? null,
+          });
+        } catch (e: any) { console.warn(`[kit-gate] ${transfer.transferNumber}: barcode attach failed (non-fatal): ${e?.message || e}`); }
+      }
+      for (const n of identity.notes) console.log(`[kit-gate] ${transfer.transferNumber}: ${n}`);
+    } catch (e: any) { console.warn(`[kit-gate] ${transfer.transferNumber}: identity lookup failed (non-fatal): ${e?.message || e}`); }
+  }
 
   await parkRow(deps.supabase, transfer.id, transfer.destinationName || '', state);
 

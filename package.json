@@ -13,6 +13,7 @@
     "@sp-api-sdk/fulfillment-inbound-api-2024-03-20": "^3.3.9",
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.15.2",
+    "bwip-js": "^4.11.4",
     "node-fetch": "^3.3.2",
     "undici": "^6.19.0"
   },
