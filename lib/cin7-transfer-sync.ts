@@ -9,6 +9,8 @@ import {
 } from './cin7-transfer-types';
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
+import { applyKitWorkOrderGate } from './kit-work-order-gate';
+import { lookupSkuMapping } from './fba-orchestrator';
 import { createShipHeroPurchaseOrder } from './shiphero-inbound';
 import { buildShipHeroOrderNumber } from './order-naming';
 
@@ -502,7 +504,7 @@ function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroT
   };
 }
 
-async function resolveShipHeroLasVegasWarehouse(
+export async function resolveShipHeroLasVegasWarehouse(
   supabase: SupabaseClient,
   explicitWarehouseId?: string
 ): Promise<ShipHeroTransferSyncSummary['shipHeroWarehouse']> {
@@ -564,6 +566,7 @@ export async function syncCIN7LasVegasTransferOrders(
   let eligible = 0;
   let created = 0;
   let skipped = 0;
+  let workOrdersCreated = 0;
   // FBA handoffs are collected here and drained after the transfer loop so we
   // don't stampede the Amazon SP-API quota (2026-09-21 incident — see the
   // drain block below).
@@ -748,13 +751,57 @@ export async function syncCIN7LasVegasTransferOrders(
           //
           // Handoffs are now drained AFTER the loop, serially and spaced out.
           if (result.created && isFbaDestination(transfer.destinationName)) {
-            pendingFbaHandoffs.push({
-              cin7TransferNumber: transfer.transferNumber,
-              items: transfer.lines.map((line) => ({
-                sku: line.sku,
-                quantity: line.quantity,
-              })),
-            });
+            // ── KIT / MULTI-PACK WORK-ORDER GATE (2026-09-26) ──────────────
+            // -2..-6 / -3PK multi-packs must be BUILT before Amazon gets a plan
+            // (a plan against unbuilt kits cannot be cancelled with the
+            // warehouse). -R<n> retries skip the gate. Gated rows keep
+            // status='synced' but carry request_payload.work_order; the
+            // reconciler refuses to fire them until the WO is COMPLETED and
+            // api/cron/poll-work-orders flips that flag. One fire path.
+            let gated = false;
+            try {
+              const gate = await applyKitWorkOrderGate(
+                {
+                  supabase,
+                  shipheroToken: shipHeroWarehouse.credentials.accessToken,
+                  resolveAmazonSku: async (sku: string) => (await lookupSkuMapping(sku))?.amz_sku ?? null,
+                },
+                transfer
+              );
+              gated = gate.gated;
+              if (gated) {
+                workOrdersCreated++;
+                console.log(
+                  `[kit-gate] ${transfer.transferNumber}: parked behind work order ${gate.workOrder!.ids.join(',')} ` +
+                    `(${gate.workOrder!.kit_qty} × ${gate.workOrder!.kit_sku}, ${gate.workOrder!.reason}) — FBA handoff NOT queued`
+                );
+              }
+            } catch (gateErr) {
+              // Loud, not silent: a failed WO creation must not quietly fall
+              // through to an ungated shipment. Record it on the row and skip
+              // the handoff; the reconciler ledger will show the transfer.
+              const msg = gateErr instanceof Error ? gateErr.message : String(gateErr);
+              errors.push(`Transfer ${transfer.transferNumber}: kit work-order gate failed — ${msg}`);
+              await supabase
+                .from('cin7_transfer_shiphero_orders')
+                .update({
+                  last_fba_handoff_status: 'work_order_failed',
+                  last_fba_handoff_detail: `${new Date().toISOString().slice(0, 16)}: kit gate could not create the ShipHero work order — ${msg}`.slice(0, 500),
+                })
+                .eq('cin7_transfer_id', transfer.id)
+                .eq('cin7_destination', transfer.destinationName || '');
+              gated = true; // treat as gated: do NOT fire
+            }
+
+            if (!gated) {
+              pendingFbaHandoffs.push({
+                cin7TransferNumber: transfer.transferNumber,
+                items: transfer.lines.map((line) => ({
+                  sku: line.sku,
+                  quantity: line.quantity,
+                })),
+              });
+            }
           }
         }
       } catch (error) {

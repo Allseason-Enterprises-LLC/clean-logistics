@@ -20,6 +20,7 @@
  */
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
+import { readWorkOrderState } from './kit-work-order-gate';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
 
@@ -436,6 +437,24 @@ export async function reconcileFbaHandoffs(
     if (processed >= BATCH_SIZE) break;
 
     try {
+      // ── KIT WORK-ORDER GATE (2026-09-26) — checked FIRST, before any retry
+      // logic. A multi-pack transfer parks here (status stays 'synced', the
+      // status column is CHECK-constrained) until the warehouse marks its
+      // ShipHero work order COMPLETED and api/cron/poll-work-orders flips
+      // request_payload.work_order.status. Firing before that would create an
+      // Amazon plan against kits that do not physically exist yet — a plan we
+      // cannot cancel with the warehouse. Costs zero I/O: it reads the row.
+      const wo = readWorkOrderState(row.request_payload);
+      if (wo && wo.status !== 'COMPLETED') {
+        const ageH = Math.round((Date.now() - new Date(wo.created_at).getTime()) / 36e5);
+        result.skipped.push({
+          transfer: row.cin7_transfer_number,
+          reason: wo.status === 'CANCELED' || wo.status === 'CLOSED' ? 'work_order_failed' : 'awaiting_work_order',
+          detail: `work order ${wo.ids.join(',')} is ${wo.status} (${ageH}h old) — ${wo.kit_qty} × ${wo.kit_sku}; fires automatically once COMPLETED`,
+        });
+        continue;
+      }
+
       // Has an active fba_shipments row? If yes, skip — pipeline already ran.
       const exists = await fbaRecordExists(db, row.cin7_transfer_number);
       if (exists) {

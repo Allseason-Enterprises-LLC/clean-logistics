@@ -470,7 +470,7 @@ async function updatePackingNote(token: string, orderId: string, note: string): 
  * Failures are logged LOUDLY with Amazon-visible context, because a silent
  * notification failure means the warehouse never learns a shipment is ready.
  */
-async function sendTelegram(text: string): Promise<boolean> {
+export async function sendTelegram(text: string): Promise<boolean> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
   if (!botToken || !chatId) {

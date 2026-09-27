@@ -116,6 +116,27 @@ function pickEarliestActiveLot(
  * back with expirationDate=null and the FBA workflow silently fails at the
  * setPackingInformation step — see TR-00146 (2026-06-12).
  */
+/**
+ * Cheap, single-purpose read of ShipHero's `kit` flag for one SKU. Used by the
+ * work-order gate (lib/kit-detection.ts) as the authoritative "is this a kit?"
+ * signal. Returns false for an unknown SKU; throws on transport/GraphQL errors
+ * so the caller can decide (kit-detection treats a throw as "unknown").
+ */
+export async function getProductKitFlag(shipheroToken: string, sku: string): Promise<boolean> {
+  const query = `{ products(sku: "${sku}") { data(first: 1) { edges { node { sku kit } } } } }`;
+  const response = await fetch(SHIPHERO_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${shipheroToken}` },
+    body: JSON.stringify({ query }),
+  });
+  const json: any = await response.json();
+  if (json.errors) {
+    throw new Error(`ShipHero kit-flag query error: ${JSON.stringify(json.errors)}`);
+  }
+  const node = json.data?.products?.data?.edges?.[0]?.node;
+  return node?.kit === true || node?.kit === 'true';
+}
+
 export async function getShipHeroProductData(
   shipheroToken: string,
   sku: string
