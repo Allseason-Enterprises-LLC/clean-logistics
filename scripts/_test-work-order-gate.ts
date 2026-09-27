@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { applyKitWorkOrderGate, isBlockedByWorkOrder, readWorkOrderState, buildWorkOrderText,
-  SHIPHERO_LV_WAREHOUSE_GRAPH_ID } from '../lib/kit-work-order-gate';
+  buildWorkOrderCreatedNotice, SHIPHERO_LV_WAREHOUSE_GRAPH_ID } from '../lib/kit-work-order-gate';
 
 let fails = 0;
 const ok = (l: string, c: boolean, x = '') => { if (!c) fails++; console.log(`${c ? 'PASS' : 'FAIL'}  ${l}${c ? '' : '  ' + x}`); };
@@ -32,13 +32,21 @@ async function main() {
   {
     const { db, updates } = fakeDb(ROW);
     const created: any[] = [];
+    const sent: string[] = [];
     const r = await applyKitWorkOrderGate({
       supabase: db, shipheroToken: 'tok',
       resolveAmazonSku: async () => 'CB-REJUVINOL-DRP-3',
       createWorkOrder: async (_t, input) => { created.push(input); return { id: 'g', legacyId: 171200, status: 'IN_PROGRESS' }; },
+      sendTelegram: async (m) => { sent.push(m); return true; },
       now: () => new Date('2026-09-26T15:00:00Z'),
     }, TRANSFER);
     ok('gated when Amazon MSKU ends -3', r.gated === true);
+    // ── the "work order created" notice (Weston 2026-09-27) ──
+    ok('🔧 floor is told IMMEDIATELY that a work order was created', sent.length === 1 && /🔧/.test(sent[0]));
+    ok('notice leads with the ORDER number, TR in brackets', /<b>AMZ_CN-CAP-REJUVINOL-2OZ_00500 \(TR-00500\)<\/b>/.test(sent[0]));
+    ok('notice names the WO id + build spec', /171200/.test(sent[0]) && /40 × CN-CAP-REJUVINOL-2OZ/.test(sent[0]) && /3-pack/.test(sent[0]));
+    ok('notice says labels will NOT be created until Complete', /<b>not<\/b> be created/.test(sent[0]) && /Complete/.test(sent[0]));
+    ok('notice is short (floor-facing, no engineering words)', sent[0].length < 450 && !/reconciler|jsonb|request_payload|bridge/i.test(sent[0]));
     ok('exactly ONE work order created (one per transfer)', created.length === 1);
     ok('WO uses the ShipHero GRAPH warehouse id, not our UUID', created[0].warehouseId === SHIPHERO_LV_WAREHOUSE_GRAPH_ID && created[0].warehouseId === 'V2FyZWhvdXNlOjEzNTg3Mg==');
     ok('WO qty = transfer line qty', created[0].quantity === 40 && created[0].sku === 'CN-CAP-REJUVINOL-2OZ');
@@ -71,6 +79,29 @@ async function main() {
       { ...TRANSFER, lines: [{ sku: 'CN-CAP-VBIOTIC-90CT', quantity: 600 }] });
     ok('single (-1 msku) -> NOT gated', r.gated === false);
     ok('single -> no WO created, no row update', creates === 0 && updates.length === 0);
+  }
+  // ---------- NOT GATED rows never post the notice ----------
+  {
+    const { db } = fakeDb(ROW);
+    let posts = 0;
+    await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-1',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 1, status: 'IN_PROGRESS' }), sendTelegram: async () => { posts++; return true; } },
+      { ...TRANSFER, lines: [{ sku: 'CN-CAP-VBIOTIC-90CT', quantity: 600 }] });
+    ok('single -> NO telegram notice (channel stays quiet for normal transfers)', posts === 0);
+  }
+  // ---------- notice failure must never un-gate ----------
+  {
+    const { db, updates } = fakeDb(ROW);
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }),
+      sendTelegram: async () => { throw new Error('telegram down'); } }, TRANSFER);
+    ok('🔴 telegram throwing -> still gated, row still parked (fail OPEN on notifications)', r.gated === true && updates.length === 1);
+    const r2 = await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }), sendTelegram: async () => false }, TRANSFER);
+    ok('telegram returning false -> still gated', r2.gated === true);
+    ok('no sendTelegram provided (poller/tests) -> gate works without it', (await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }) }, TRANSFER)).gated === true);
+    ok('buildWorkOrderCreatedNotice falls back to TR when no order number', /<b>TR-9<\/b>/.test(buildWorkOrderCreatedNotice({ type: 'CUSTOM', ids: ['1'], status: 'IN_PROGRESS', created_at: 'x', kit_sku: 'S', kit_qty: 1, reason: 'r' } as any, 'TR-9')));
     ok('isBlockedByWorkOrder(no work_order) -> false (all existing rows keep firing)', !isBlockedByWorkOrder(ROW.request_payload));
   }
 
@@ -120,6 +151,7 @@ async function main() {
   ok('CIN7 Reference override flows through verbatim (order-naming escape hatch)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: 'AMZ_SPLIT-B_00001', kitSku: 'S', qty: 1 }).name.startsWith('AMZ_SPLIT-B_00001 ·'));
   const sync2 = fs.readFileSync(path.join(__dirname, '../lib/cin7-transfer-sync.ts'), 'utf8');
   ok('sync passes result.shipheroOrderNumber into the gate', /shipheroOrderNumber: result\.shipheroOrderNumber/.test(sync2));
+  ok('sync wires the REAL sendTelegram into the gate', /sendTelegram,\s*\}/.test(sync2.slice(sync2.indexOf('applyKitWorkOrderGate('), sync2.indexOf('applyKitWorkOrderGate(') + 600)) && sync2.includes("import { sendTelegram } from './fba-post-process'"));
   ok('readWorkOrderState(null payload) -> null', readWorkOrderState(null) === null && readWorkOrderState({}) === null);
 
   console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

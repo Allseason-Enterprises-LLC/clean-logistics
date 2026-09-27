@@ -10,6 +10,7 @@ import {
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { applyKitWorkOrderGate } from './kit-work-order-gate';
+import { sendTelegram } from './fba-post-process';
 import { lookupSkuMapping } from './fba-orchestrator';
 import { createShipHeroPurchaseOrder } from './shiphero-inbound';
 import { buildShipHeroOrderNumber } from './order-naming';
@@ -765,6 +766,7 @@ export async function syncCIN7LasVegasTransferOrders(
                   supabase,
                   shipheroToken: shipHeroWarehouse.credentials.accessToken,
                   resolveAmazonSku: async (sku: string) => (await lookupSkuMapping(sku))?.amz_sku ?? null,
+                  sendTelegram,
                 },
                 { ...transfer, shipheroOrderNumber: result.shipheroOrderNumber ?? result.orderNumber ?? null }
               );

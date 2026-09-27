@@ -60,7 +60,29 @@ export interface GateDeps {
   /** cin7 sku -> amazon msku (sku_master). Injected so tests are offline. */
   resolveAmazonSku: (cin7Sku: string) => Promise<string | null>;
   createWorkOrder?: typeof createAssemblyWorkOrder;
+  /** Posts the "work order created" notice to the FBA channel. Optional; a
+   *  failure here never blocks the gate (fail OPEN on notifications). */
+  sendTelegram?: (html: string) => Promise<boolean>;
   now?: () => Date;
+}
+
+const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * The floor's FIRST message about a kit transfer — posted the moment the row
+ * parks, so nobody is left wondering why no labels appeared. Weston 2026-09-27:
+ * "a quick message that a work order needs to be completed before the
+ * shipment can go out". Short on purpose; the 24 h/48 h reminders carry detail.
+ */
+export function buildWorkOrderCreatedNotice(state: WorkOrderState, transferNumber: string): string {
+  const label = state.order_number ? `${esc(state.order_number)} (${esc(transferNumber)})` : esc(transferNumber);
+  const pack = state.pack_count ? `${state.pack_count}-pack` : 'multi-pack';
+  return (
+    `🔧 <b>${label}</b> — multi-pack, so a <b>Work Order</b> comes first.\n` +
+    `Work order <b>${esc(state.ids.join(', '))}</b>: build <b>${state.kit_qty} × ${esc(state.kit_sku)}</b> (${pack}).\n` +
+    `The FBA shipment and labels will <b>not</b> be created until this work order is marked <b>Complete</b> in ShipHero. ` +
+    `Once it is, labels post here automatically within ~15 min.`
+  );
 }
 
 /**
@@ -150,6 +172,17 @@ export async function applyKitWorkOrderGate(
   };
 
   await parkRow(deps.supabase, transfer.id, transfer.destinationName || '', state);
+
+  // Tell the floor NOW — not 24 h later. Notification failure is logged, never thrown:
+  // the row is already parked and the WO already exists; the gate must not un-gate.
+  if (deps.sendTelegram) {
+    try {
+      const ok = await deps.sendTelegram(buildWorkOrderCreatedNotice(state, transfer.transferNumber));
+      if (!ok) console.warn(`[kit-gate] ${transfer.transferNumber}: 'work order created' notice was not delivered`);
+    } catch (e: any) {
+      console.warn(`[kit-gate] ${transfer.transferNumber}: 'work order created' notice failed: ${e?.message || e}`);
+    }
+  }
   return { gated: true, verdict, workOrder: state };
 }
 
