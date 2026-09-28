@@ -243,21 +243,15 @@ export function decideWorkOrder(args: {
   bulkUnits?: number;
   lastNudgeAgeHours?: number | null;
 }): WorkOrderDecision {
-  const { status, ageHours, kitQty, bulkUnits, lastNudgeAgeHours } = args;
+  const { status, ageHours } = args;
   if (status === 'COMPLETED') return { action: 'release' };
   if (WO_TERMINAL_FAILED.has(status)) return { action: 'failed', status };
 
-  if (ageHours >= 48) {
-    if (bulkUnits === undefined) throw new Error('decideWorkOrder: bulkUnits required at >= 48h');
-    // STOCK-GATED. Never complete a work order whose kits are not on the shelf —
-    // that would fire an Amazon plan against phantom inventory.
-    if (bulkUnits >= kitQty) return { action: 'auto_complete', bulk: bulkUnits };
-    const recentlyEscalated = lastNudgeAgeHours != null && lastNudgeAgeHours < 24;
-    return recentlyEscalated ? { action: 'wait', ageHours } : { action: 'escalate', bulk: bulkUnits, ageHours };
-  }
-  if (ageHours >= 24) {
-    const nudgedRecently = lastNudgeAgeHours != null && lastNudgeAgeHours < 24;
-    return nudgedRecently ? { action: 'wait', ageHours } : { action: 'nudge', ageHours };
-  }
+  // Weston 2026-09-28: "you don't need to send reminders that work orders are
+  // due in the chat. You just need to send it one time." The single notice at
+  // creation is the only floor message for an OPEN work order. No 24 h nudge,
+  // no 48 h escalation, and never an auto-complete — an open WO is simply
+  // waited on, however old, until the floor marks it COMPLETED (→ release) or
+  // CANCELED (→ failed alert, which is a state change, not a reminder).
   return { action: 'wait', ageHours };
 }

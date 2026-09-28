@@ -91,21 +91,20 @@ async function main() {
   ok('CANCELED -> failed', D({ status: 'CANCELED', ageHours: 1, kitQty: 10 }).action === 'failed');
   ok('CLOSED -> failed', D({ status: 'CLOSED', ageHours: 100, kitQty: 10 }).action === 'failed');
   ok('open, 1h -> wait', D({ status: 'IN_PROGRESS', ageHours: 1, kitQty: 10 }).action === 'wait');
-  ok('open, 24h, never nudged -> nudge', D({ status: 'IN_PROGRESS', ageHours: 24, kitQty: 10, lastNudgeAgeHours: null }).action === 'nudge');
-  ok('open, 30h, nudged 3h ago -> wait (no spam)', D({ status: 'IN_PROGRESS', ageHours: 30, kitQty: 10, lastNudgeAgeHours: 3 }).action === 'wait');
-  ok('open, 48h, bulk >= qty -> AUTO_COMPLETE (they forgot the button)',
-     D({ status: 'ASSEMBLY_IN_PROGRESS', ageHours: 48, kitQty: 10, bulkUnits: 10 }).action === 'auto_complete');
-  ok('open, 48h, bulk > qty -> auto_complete', D({ status: 'IN_PROGRESS', ageHours: 60, kitQty: 10, bulkUnits: 25 }).action === 'auto_complete');
-  const short = D({ status: 'IN_PROGRESS', ageHours: 48, kitQty: 10, bulkUnits: 8 });
-  ok('🔴 open, 48h, bulk < qty -> ESCALATE, NEVER auto_complete (phantom-inventory guard)', short.action === 'escalate' && (short as any).bulk === 8);
-  ok('open, 48h, bulk 0 -> escalate', D({ status: 'PENDING_APPROVAL', ageHours: 72, kitQty: 10, bulkUnits: 0 }).action === 'escalate');
-  ok('open, 72h, short, escalated 5h ago -> wait (re-escalate daily, not every tick)',
-     D({ status: 'IN_PROGRESS', ageHours: 72, kitQty: 10, bulkUnits: 8, lastNudgeAgeHours: 5 }).action === 'wait');
-  ok('open, 96h, short, escalated 26h ago -> escalate again',
-     D({ status: 'IN_PROGRESS', ageHours: 96, kitQty: 10, bulkUnits: 8, lastNudgeAgeHours: 26 }).action === 'escalate');
+  // Weston 2026-09-28: ONE notice at creation, no reminders. An open WO is
+  // waited on at ANY age; the only floor messages are state changes.
+  for (const age of [24, 30, 47.9, 48, 60, 72, 96, 500]) {
+    ok(`🔴 open, ${age}h -> wait (NO nudge / escalate / auto_complete, ever)`,
+       D({ status: 'IN_PROGRESS', ageHours: age, kitQty: 10 }).action === 'wait');
+  }
+  ok('open, 48h, bulk >= qty -> STILL wait (never auto-complete on the floor\'s behalf)',
+     D({ status: 'ASSEMBLY_IN_PROGRESS', ageHours: 48, kitQty: 10, bulkUnits: 10 }).action === 'wait');
+  ok('open, 96h, bulk 0 -> STILL wait (no escalation message)', D({ status: 'PENDING_APPROVAL', ageHours: 96, kitQty: 10, bulkUnits: 0 }).action === 'wait');
+  ok('legacy lastNudgeAgeHours is ignored, not an error', D({ status: 'IN_PROGRESS', ageHours: 30, kitQty: 10, lastNudgeAgeHours: 3 }).action === 'wait');
   threw = false; try { D({ status: 'IN_PROGRESS', ageHours: 48, kitQty: 10 }); } catch { threw = true; }
-  ok('48h without a stock read -> THROWS (cannot decide blind)', threw);
-  ok('47.9h -> still the nudge path, no stock read needed', D({ status: 'IN_PROGRESS', ageHours: 47.9, kitQty: 10, lastNudgeAgeHours: 30 }).action === 'nudge');
+  ok('48h without a stock read does NOT throw any more (no decision depends on stock)', !threw);
+  ok('COMPLETED at 500h -> release (age never blocks release)', D({ status: 'COMPLETED', ageHours: 500, kitQty: 10 }).action === 'release');
+  ok('CANCELED -> failed is a STATE CHANGE, still reported', D({ status: 'CANCELED', ageHours: 30, kitQty: 10 }).action === 'failed');
 
   console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);
   if (fails) process.exitCode = 1;

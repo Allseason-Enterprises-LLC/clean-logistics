@@ -84,15 +84,10 @@ export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
           ?? statuses[0];
 
       const ageHours = (now.getTime() - new Date(wo.created_at).getTime()) / 36e5;
-      const lastNudgeAgeHours = wo.last_nudge_at ? (now.getTime() - new Date(wo.last_nudge_at).getTime()) / 36e5 : null;
 
-      // Stock read only when the decision needs it (>= 48h) — one query per stuck row per tick.
-      let bulkUnits: number | undefined;
-      if (liveStatus !== 'COMPLETED' && !['CANCELED', 'CLOSED'].includes(liveStatus) && ageHours >= 48) {
-        bulkUnits = (await getBulk(deps.shipheroToken, wo.kit_sku)).bulk;
-      }
-
-      const d = decideWorkOrder({ status: liveStatus, ageHours, kitQty: wo.kit_qty, bulkUnits, lastNudgeAgeHours });
+      // No reminders (Weston 2026-09-28): the creation notice is the only floor
+      // message for an open WO, so no stock read is needed here any more.
+      const d = decideWorkOrder({ status: liveStatus, ageHours, kitQty: wo.kit_qty });
       const patch = (next: Partial<WorkOrderState>, handoff?: { status: string; detail: string }) =>
         deps.supabase.from('cin7_transfer_shiphero_orders')
           .update({

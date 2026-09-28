@@ -70,30 +70,21 @@ async function main() {
     const { updates } = await run([wo({ created_at: hoursAgo(5), status: 'IN_PROGRESS' })], 'READY_TO_PICK');
     ok('waiting DOES mirror a changed live status (IN_PROGRESS -> READY_TO_PICK)', updates[0]?.patch.request_payload.work_order.status === 'READY_TO_PICK');
   }
-  // ── NUDGE (24h) ──
-  {
-    const { r, updates, sent } = await run([wo({ created_at: hoursAgo(26) })], 'IN_PROGRESS');
-    ok('26h open, never nudged -> nudge', r.nudged[0] === 'TR-00500' && /⏳/.test(sent[0]) && /due today/.test(sent[0]));
-    ok('nudge stamps last_nudge_at', updates[0].patch.request_payload.work_order.last_nudge_at === NOW.toISOString());
+  // ── NO REMINDERS (Weston 2026-09-28: "you just need to send it one time") ──
+  for (const [age, bulk] of [[26, 0], [30, 0], [50, 12], [50, 40], [70, 0], [500, 40]] as Array<[number, number]>) {
+    const { r, sent, updates } = await run([wo({ created_at: hoursAgo(age) })], 'IN_PROGRESS', bulk);
+    ok(`🔴 open ${age}h (bulk ${bulk}/40) -> wait, ZERO messages`, r.waiting.length === 1 && r.nudged.length === 0 && r.escalated.length === 0 && sent.length === 0);
+    if (age === 50 && bulk === 40) ok('row status stays IN_PROGRESS (never pretend it completed)', updates[0]?.patch.request_payload.work_order.status === 'IN_PROGRESS' || updates.length === 0);
   }
+  ok('🔴 no work_order_complete call path exists in the poller', !fs.readFileSync(path.join(__dirname, '../lib/work-order-poller.ts'), 'utf8').includes('completeWorkOrder('));
   {
-    const { r, sent } = await run([wo({ created_at: hoursAgo(30), last_nudge_at: hoursAgo(4) })], 'IN_PROGRESS');
-    ok('30h open, nudged 4h ago -> wait (once a day, no spam)', r.waiting.length === 1 && sent.length === 0);
-  }
-  // ── 48h: stock-informed ESCALATION, never auto-complete ──
-  {
-    const { r, sent } = await run([wo({ created_at: hoursAgo(50) })], 'IN_PROGRESS', 12);
-    ok('50h, bulk 12/40 -> escalate 🚨 with the shortfall', r.escalated[0] === 'TR-00500' && /🚨/.test(sent[0]) && /12 of 40/.test(sent[0]) && /28 short/.test(sent[0]));
-  }
-  {
-    const { r, sent, updates } = await run([wo({ created_at: hoursAgo(50) })], 'IN_PROGRESS', 40);
-    ok('50h, bulk 40/40 -> 🔔 "just mark it Complete" (NOT auto-completed)', r.escalated[0] === 'TR-00500' && /🔔/.test(sent[0]) && /mark it <b>Complete<\/b>/.test(sent[0]));
-    ok('🔴 no work_order_complete call path exists in the poller', !fs.readFileSync(path.join(__dirname, '../lib/work-order-poller.ts'), 'utf8').includes('completeWorkOrder('));
-    ok('row status stays IN_PROGRESS (we did not pretend it completed)', updates[0].patch.request_payload.work_order.status === 'IN_PROGRESS');
-  }
-  {
-    const { r, sent } = await run([wo({ created_at: hoursAgo(70), last_nudge_at: hoursAgo(3) })], 'IN_PROGRESS', 0);
-    ok('70h, escalated 3h ago -> wait (re-escalate daily)', r.waiting.length === 1 && sent.length === 0);
+    let bulkReads = 0;
+    const rows = [{ id: 'row-0', cin7_transfer_number: 'TR-00500', request_payload: { work_order: wo({ created_at: hoursAgo(60) }) } }];
+    const { db } = fakeDb(rows);
+    await pollWorkOrders({ supabase: db, shipheroToken: 'tok', sendTelegram: async () => true,
+      getWorkOrder: async (_t, id) => ({ id: 'g', legacyId: id, status: 'IN_PROGRESS', completedAt: null }),
+      getBulk: async () => { bulkReads++; return { bulk: 0, pickable: 0, rows: 1 }; }, now: () => NOW });
+    ok('no stock read is issued for a 60h-open row (nothing to decide with it)', bulkReads === 0);
   }
   // ── multi-id: ALL must be COMPLETED ──
   {
