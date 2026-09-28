@@ -22,7 +22,8 @@ async function main() {
   const base = { warehouseId: 'W1', customerAccountId: '95145', sku: 'CN-BDL-CAP-GINSENG-60CT-3PK', quantity: 40,
     name: 'TR-00500 · build 40 × CN-BDL-CAP-GINSENG-60CT-3PK', instructions: 'Build. Do NOT ship.', requestedDate: '2026-09-22T00:00:00Z' };
   const d = buildCreateWorkOrderData(base);
-  ok('type is CUSTOM (ASSEMBLY rejects kit-modelled SKUs — verified live 171096 vs 171098)', d.type === 'CUSTOM');
+  ok('🔴 type defaults to ASSEMBLY (warehouse mgr 2026-09-28: Assembly builds stock; CUSTOM does not)', d.type === 'ASSEMBLY');
+  ok('type CUSTOM only when explicitly asked (the fallback path)', buildCreateWorkOrderData(base, 'CUSTOM').type === 'CUSTOM');
   ok('assembly_details carries a human build spec', /40 × CN-BDL-CAP-GINSENG-60CT-3PK/.test(d.assembly_details));
   const withComp = buildCreateWorkOrderData({ ...base, packCount: 3, component: { sku: 'CN-CAP-GINSENG-60CT', perKit: 3 } });
   ok('component spec: 40 kits = 120 singles (3 per kit)', /= 120 × CN-CAP-GINSENG-60CT \(3 per kit\)/.test(withComp.assembly_details));
@@ -41,10 +42,22 @@ async function main() {
   const c1 = fakeFetch({ data: { work_order_create: { request_id: 'r', work_order: { id: 'V29ya09yZGVyOjEyMw==', legacy_id: 123, status: 'PENDING_APPROVAL' } } } });
   const wo = await createAssemblyWorkOrder('tok', base, c1.f);
   ok('create returns legacyId as a NUMBER (work_order(id:Int) needs it)', wo.legacyId === 123 && typeof wo.legacyId === 'number');
-  ok('create sends work_order_create mutation with $data', c1.calls[0].query.includes('work_order_create(data: $data)') && c1.calls[0].variables.data.type === 'CUSTOM');
+  ok('create sends ASSEMBLY first, ONE call when accepted', c1.calls.length === 1 && c1.calls[0].query.includes('work_order_create(data: $data)') && c1.calls[0].variables.data.type === 'ASSEMBLY');
+  ok('returned type = ASSEMBLY when ShipHero accepted it', wo.type === 'ASSEMBLY' || wo.type === undefined);
+  // ---------- ASSEMBLY rejected -> CUSTOM fallback ----------
+  {
+    let n = 0; const calls: any[] = [];
+    const f = (async (_u: string, init: any) => { const body = JSON.parse(init.body); calls.push(body.variables.data); n++;
+      if (n === 1) return { json: async () => ({ errors: [{ message: 'Invalid Product' }] }) };
+      return { json: async () => ({ data: { work_order_create: { request_id: 'r', work_order: { id: 'g', legacy_id: 555, status: 'IN_PROGRESS', type: 'CUSTOM' } } } }) }; }) as any;
+    const fb = await createAssemblyWorkOrder('tok', base, f);
+    ok('🔴 "Invalid Product" on ASSEMBLY -> retries as CUSTOM (2 calls: ASSEMBLY then CUSTOM)', calls.length === 2 && calls[0].type === 'ASSEMBLY' && calls[1].type === 'CUSTOM');
+    ok('fallback returns the CUSTOM WO and REPORTS type CUSTOM so the floor can be warned', fb.legacyId === 555 && fb.type === 'CUSTOM');
+    ok('fallback payload identical apart from type', JSON.stringify({ ...calls[0], type: null }) === JSON.stringify({ ...calls[1], type: null }));
+  }
   const cErr = fakeFetch({ errors: [{ message: 'Token is expired' }] });
   threw = false; try { await createAssemblyWorkOrder('tok', base, cErr.f); } catch (e: any) { threw = /Token is expired/.test(e.message); }
-  ok('GraphQL errors[] -> throws with the message', threw);
+  ok('non-"Invalid Product" errors (expired token) -> throw, NO silent CUSTOM fallback', threw && cErr.calls.length === 1);
   const cNone = fakeFetch({ data: { work_order_create: { request_id: 'r', work_order: null } } });
   threw = false; try { await createAssemblyWorkOrder('tok', base, cNone.f); } catch { threw = true; }
   ok('missing work_order in response -> throws (never silently "created")', threw);

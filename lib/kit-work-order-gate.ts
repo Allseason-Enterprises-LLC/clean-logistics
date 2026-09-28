@@ -31,7 +31,8 @@ export const SHIPHERO_CUSTOMER_ACCOUNT_ID = '95145';
 
 /** The per-row state object stored at request_payload.work_order. */
 export interface WorkOrderState {
-  type: 'CUSTOM';
+  /** ASSEMBLY builds stock of the finished pack on completion; CUSTOM does not. */
+  type: 'ASSEMBLY' | 'CUSTOM';
   /** ShipHero legacy_id(s) as strings; work_order(id:Int) wants Number(). */
   ids: string[];
   status: string;               // mirrors ShipHero WorkOrderStatus, or 'CANCELED'
@@ -113,8 +114,11 @@ export function buildWorkOrderCreatedNotice(state: WorkOrderState, transferNumbe
   if (!state.fnsku && state.upc) ids.push(`<b>UPC:</b> <code>${esc(state.upc)}</code>`);
   if (ids.length) L.push(ids.join(' · '));
   L.push('');
-  L.push(`<b>Work Order:</b> <code>${woIds}</code> — <b>${order}</b> (${esc(transferNumber)})`);
+  L.push(`<b>Work Order:</b> <code>${woIds}</code> (${esc(state.type === 'CUSTOM' ? 'Custom' : 'Assembly')}) — <b>${order}</b> (${esc(transferNumber)})`);
   L.push(`• Build: <b>${state.kit_qty.toLocaleString()} × ${pack}</b>${state.pack_count ? ` (${(state.kit_qty * state.pack_count).toLocaleString()} units total)` : ''}`);
+  if (state.type === 'CUSTOM') {
+    L.push(`• ⚠️ ShipHero would not allow an Assembly work order for this SKU, so this is a <b>Custom</b> one — completing it will <b>not</b> build stock by itself. Please receive the finished packs into the bulk bin manually.`);
+  }
   L.push(`• Priority: <b>HIGH</b> — requested today, needed within 1 business day`);
   L.push('');
   L.push('<b>What to do:</b>');
@@ -203,6 +207,7 @@ export async function applyKitWorkOrderGate(
   const today = nowIso.slice(0, 10) + 'T00:00:00';
   const create = deps.createWorkOrder ?? createAssemblyWorkOrder;
   const ids: string[] = [];
+  const woTypes: Array<'ASSEMBLY' | 'CUSTOM'> = [];
   let first: { sku: string; qty: number; pack?: number | null; msku?: string | null; reason: string } | null = null;
 
   for (const line of enriched.filter((l) => verdict.kitSkus.includes(l.sku))) {
@@ -219,11 +224,16 @@ export async function applyKitWorkOrderGate(
       requestedDate: today, priority: 'HIGH',
     });
     ids.push(String(wo.legacyId));
+    if (wo.type) woTypes.push(wo.type);
     if (!first) first = { sku: line.sku, qty: line.quantity, pack: r?.packCount ?? null, msku: line.amazonSku, reason: `${r?.via}:${r?.reason}` };
   }
 
+  // Type that actually got created. If ANY line fell back to CUSTOM, record
+  // CUSTOM so the floor is warned that stock will not build on its own.
+  const createdType: 'ASSEMBLY' | 'CUSTOM' = woTypes.length === 0 ? 'ASSEMBLY' : woTypes.includes('CUSTOM') ? 'CUSTOM' : 'ASSEMBLY';
+
   const state: WorkOrderState = {
-    type: 'CUSTOM', ids, status: 'IN_PROGRESS', created_at: nowIso, completed_at: null, last_nudge_at: null,
+    type: createdType, ids, status: 'IN_PROGRESS', created_at: nowIso, completed_at: null, last_nudge_at: null,
     kit_sku: first!.sku, kit_qty: first!.qty, order_number: transfer.shipheroOrderNumber ?? null,
     pack_count: first!.pack ?? null, amazon_msku: first!.msku ?? null, reason: first!.reason,
   };

@@ -48,6 +48,8 @@ export interface WorkOrderRef {
   id: string;          // base64 graph id
   legacyId: number;    // what work_order(id:) wants
   status: WorkOrderStatus | string;
+  /** which type ShipHero actually created (ASSEMBLY builds stock; CUSTOM does not) */
+  type?: WorkOrderType;
 }
 
 export interface CreateAssemblyWorkOrderInput {
@@ -83,8 +85,19 @@ async function gql(token: string, query: string, variables: any, fetchImpl: Fetc
   return json?.data;
 }
 
+export type WorkOrderType = 'ASSEMBLY' | 'CUSTOM';
+
+/**
+ * Does this ShipHero error mean "ASSEMBLY is not allowed for this product"?
+ * Observed 2026-09-22 on kit:true SKUs: `{"message":"Invalid Product"}`.
+ */
+export function isAssemblyRejected(err: unknown): boolean {
+  const m = err instanceof Error ? err.message : String(err);
+  return /invalid product/i.test(m);
+}
+
 /** Build the exact `data` payload (exported so the test can assert it byte-for-byte). */
-export function buildCreateWorkOrderData(input: CreateAssemblyWorkOrderInput) {
+export function buildCreateWorkOrderData(input: CreateAssemblyWorkOrderInput, type: WorkOrderType = 'ASSEMBLY') {
   if (!input.sku) throw new Error('work order: sku is required');
   if (!Number.isInteger(input.quantity) || input.quantity <= 0) {
     throw new Error(`work order: quantity must be a positive integer, got ${input.quantity}`);
@@ -96,8 +109,12 @@ export function buildCreateWorkOrderData(input: CreateAssemblyWorkOrderInput) {
     warehouse_id: input.warehouseId,
     customer_account_id: input.customerAccountId,
     requested_date: input.requestedDate,
-    // CUSTOM, not ASSEMBLY — see header. ASSEMBLY rejects our kit-modelled SKUs.
-    type: 'CUSTOM',
+    // ASSEMBLY by default — it is the type that BUILDS STOCK of the finished
+    // pack when completed (warehouse manager, 2026-09-28: "the work order
+    // needs to be created as an assembly work order so I can build the
+    // stock"). CUSTOM is the fallback only when ShipHero refuses ASSEMBLY for
+    // a product it models as a virtual kit (kit:true → "Invalid Product").
+    type,
     priority: input.priority ?? 'HIGH',
     name: input.name,
     instructions: input.instructions,
@@ -110,23 +127,41 @@ export function buildCreateWorkOrderData(input: CreateAssemblyWorkOrderInput) {
   };
 }
 
+const CREATE_MUTATION = `mutation CreateWO($data: CreateWorkOrderInput!) {
+  work_order_create(data: $data) {
+    request_id
+    work_order { id legacy_id status type }
+  }
+}`;
+
+async function createWorkOrderOfType(token: string, input: CreateAssemblyWorkOrderInput, type: WorkOrderType, fetchImpl: FetchLike): Promise<WorkOrderRef> {
+  const data = await gql(token, CREATE_MUTATION, { data: buildCreateWorkOrderData(input, type) }, fetchImpl);
+  const wo = data?.work_order_create?.work_order;
+  if (!wo?.id) {
+    throw new Error(`work_order_create returned no work order: ${JSON.stringify(data)}`);
+  }
+  return { id: wo.id, legacyId: Number(wo.legacy_id), status: wo.status, type: (wo.type as WorkOrderType) ?? type };
+}
+
+/**
+ * Create the kitting work order: **ASSEMBLY first** (builds stock of the
+ * finished pack on completion), **CUSTOM as fallback** only if ShipHero
+ * rejects ASSEMBLY for this product ("Invalid Product" — virtual kits).
+ * The returned `type` tells the caller which one actually got created so the
+ * floor can be told when a CUSTOM WO will NOT build stock by itself.
+ */
 export async function createAssemblyWorkOrder(
   token: string,
   input: CreateAssemblyWorkOrderInput,
   fetchImpl: FetchLike = fetch as any
 ): Promise<WorkOrderRef> {
-  const mutation = `mutation CreateWO($data: CreateWorkOrderInput!) {
-    work_order_create(data: $data) {
-      request_id
-      work_order { id legacy_id status }
-    }
-  }`;
-  const data = await gql(token, mutation, { data: buildCreateWorkOrderData(input) }, fetchImpl);
-  const wo = data?.work_order_create?.work_order;
-  if (!wo?.id) {
-    throw new Error(`work_order_create returned no work order: ${JSON.stringify(data)}`);
+  try {
+    return await createWorkOrderOfType(token, input, 'ASSEMBLY', fetchImpl);
+  } catch (err) {
+    if (!isAssemblyRejected(err)) throw err;
+    console.warn(`[work-orders] ASSEMBLY rejected for ${input.sku} (${err instanceof Error ? err.message : err}) — falling back to CUSTOM. This WO will NOT build stock automatically.`);
+    return await createWorkOrderOfType(token, input, 'CUSTOM', fetchImpl);
   }
-  return { id: wo.id, legacyId: Number(wo.legacy_id), status: wo.status };
 }
 
 export async function getWorkOrder(

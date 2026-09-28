@@ -61,7 +61,7 @@ async function main() {
     ok('row parked: request_payload.work_order written', !!u?.request_payload?.work_order);
     ok('partnerLineItems + tags PRESERVED (merge, not clobber)', u.request_payload.partnerLineItems?.length === 1 && u.request_payload.tags?.[0] === 'x');
     const wo = u.request_payload.work_order;
-    ok('state: ids=[legacy id as string], status IN_PROGRESS, type CUSTOM', wo.ids[0] === '171200' && wo.status === 'IN_PROGRESS' && wo.type === 'CUSTOM');
+    ok('state: ids=[legacy id as string], status IN_PROGRESS, type defaults ASSEMBLY when creator reports none', wo.ids[0] === '171200' && wo.status === 'IN_PROGRESS' && wo.type === 'ASSEMBLY');
     ok('state: kit_sku/kit_qty/pack_count/amazon_msku recorded', wo.kit_sku === 'CN-CAP-REJUVINOL-2OZ' && wo.kit_qty === 40 && wo.pack_count === 3 && wo.amazon_msku === 'CB-REJUVINOL-DRP-3');
     ok('state: reason names the rule (amazon_msku:multipack_suffix)', wo.reason === 'amazon_msku:multipack_suffix');
     ok('row: last_fba_handoff_status = awaiting_work_order (ledger-visible)', u.last_fba_handoff_status === 'awaiting_work_order' && /171200/.test(u.last_fba_handoff_detail));
@@ -81,6 +81,21 @@ async function main() {
     ok('single (-1 msku) -> NOT gated', r.gated === false);
     ok('single -> no WO created, no row update', creates === 0 && updates.length === 0);
   }
+  // ---------- creator fell back to CUSTOM -> state + notice warn the floor ----------
+  {
+    const { db, updates } = fakeDb(ROW); const sent: string[] = [];
+    await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 8, status: 'IN_PROGRESS', type: 'CUSTOM' }),
+      sendTelegram: async (m) => { sent.push(m); return true; } }, TRANSFER);
+    ok('creator reports CUSTOM -> state.type CUSTOM', updates[0].request_payload.work_order.type === 'CUSTOM');
+    ok('🔴 notice warns: Custom WO will NOT build stock, receive manually', /\(Custom\)/.test(sent[0]) && /will <b>not<\/b> build stock by itself/.test(sent[0]) && /manually/.test(sent[0]));
+    const { db: db2 } = fakeDb(ROW); const sent2: string[] = [];
+    await applyKitWorkOrderGate({ supabase: db2, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS', type: 'ASSEMBLY' }),
+      sendTelegram: async (m) => { sent2.push(m); return true; } }, TRANSFER);
+    ok('ASSEMBLY -> notice says (Assembly), no stock warning', /\(Assembly\)/.test(sent2[0]) && !/not<\/b> build stock/.test(sent2[0]));
+  }
+
   // ---------- collector: sync consolidates → gate must NOT post inline ----------
   {
     const { db } = fakeDb(ROW);
