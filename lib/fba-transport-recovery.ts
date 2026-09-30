@@ -352,7 +352,7 @@ export async function attemptTransportRecovery(
           updated_at: new Date().toISOString(),
         })
         .eq('id', row.id);
-      trail.push(`relabel ok (${(body.labels ?? []).length} PDFs, telegram=${body.telegramSent})`);
+      trail.push(`relabel ok (${(body.labels ?? []).length} PDFs, telegram=${body.telegramSent}${body.telegramSkippedAlreadyNotified ? ' skipped:already-notified' : ''})`);
     } else {
       trail.push(
         `relabel incomplete (HTTP ${res.status}, errors=${JSON.stringify(body?.errors ?? []).slice(0, 200)}) — ids are bound; run relabel manually`

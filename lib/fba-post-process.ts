@@ -58,6 +58,14 @@ export interface PostProcessResult {
   placementFee: number;
   shipheroOrderId?: string;
   attachmentsCreated: number;
+  /**
+   * Telegram post suppressed because every label PDF was ALREADY attached to
+   * the ShipHero order — the floor was told the first time. 2026-09-30
+   * TR-00502: the original auto-submit run finished (the bridge's "aborted
+   * after 30s" is only the handoff's own timeout) and the reconciler's
+   * transport-recovery re-ran relabel 65 min later → identical second post.
+   */
+  telegramSkippedAlreadyNotified: boolean;
   /** Attachments that were already present and deliberately NOT re-added. */
   attachmentsSkipped: number;
   telegramSent: boolean;
@@ -497,6 +505,15 @@ export function resolveFbaChatId(envValue: string | undefined = process.env.TELE
   return FBA_TELEGRAM_CHAT_ID;
 }
 
+/**
+ * Pure: the label notification is for NEW labels. Skip it only when we are
+ * certain the floor has already seen these exact labels — every PDF existed
+ * on the order before this run and this run created none.
+ */
+export function shouldSkipTelegramAsAlreadyNotified(r: { attachmentsCreated: number; attachmentsSkipped: number; labels: unknown[] }): boolean {
+  return r.labels.length > 0 && r.attachmentsCreated === 0 && r.attachmentsSkipped >= r.labels.length;
+}
+
 export async function sendTelegram(text: string): Promise<boolean> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = resolveFbaChatId();
@@ -554,6 +571,7 @@ export async function postProcessFbaShipment(
     placementFee: 0,
     attachmentsCreated: 0,
     attachmentsSkipped: 0,
+    telegramSkippedAlreadyNotified: false,
     telegramSent: false,
     errors,
   };
@@ -711,12 +729,23 @@ export async function postProcessFbaShipment(
     errors.push(`packing_note update: ${err?.message}`);
   }
 
-  // Send single consolidated Telegram message
-  try {
-    const tg = buildTelegramMessage(input, result);
-    result.telegramSent = await sendTelegram(tg);
-  } catch (err: any) {
-    errors.push(`telegram: ${err?.message}`);
+  // Send single consolidated Telegram message — ONCE per set of labels.
+  // If every PDF was already on the order (created:0 / skipped:N) this is a
+  // re-run over work a previous run completed and announced. Posting again
+  // gives the floor two identical messages and makes them ask "duplicate
+  // shipment?". Fail OPEN on the unknown: if nothing was attached at all
+  // (0/0 — e.g. order not found) we still post, because then nobody has
+  // been told anything.
+  if (shouldSkipTelegramAsAlreadyNotified(result)) {
+    result.telegramSkippedAlreadyNotified = true;
+    console.log(`[fba-post-process] ${input.cin7TransferNumber}: all ${result.attachmentsSkipped} label(s) already attached — floor already notified, skipping Telegram`);
+  } else {
+    try {
+      const tg = buildTelegramMessage(input, result);
+      result.telegramSent = await sendTelegram(tg);
+    } catch (err: any) {
+      errors.push(`telegram: ${err?.message}`);
+    }
   }
 
   return result;

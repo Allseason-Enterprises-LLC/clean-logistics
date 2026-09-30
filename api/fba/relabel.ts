@@ -212,6 +212,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       // recovery re-run the healthy answer is created:0 / skipped:N.
       attachmentsSkipped: result.attachmentsSkipped,
       telegramSent: result.telegramSent,
+      telegramSkippedAlreadyNotified: result.telegramSkippedAlreadyNotified,
       errors: result.errors,
     });
   } catch (err: any) {
