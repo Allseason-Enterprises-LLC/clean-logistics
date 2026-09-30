@@ -37,6 +37,10 @@
     {
       "path": "/api/cron/poll-work-orders",
       "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/cron/sync-fba-amazon-status",
+      "schedule": "7,37 * * * *"
     }
   ],
   "functions": {
