@@ -23,6 +23,42 @@ import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { readWorkOrderState } from './kit-work-order-gate';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
+import { fetchCIN7TransferDetail } from './cin7-transfer-sync';
+
+/**
+ * CIN7 statuses a transfer must be in for the reconciler to (re)fire it.
+ * Mirrors the sync's defaultEligibleStatuses. Anything else — DRAFT, VOIDED,
+ * COMPLETED, RECEIVED — means the source of truth has moved on and firing
+ * would create an Amazon plan CIN7 no longer stands behind.
+ *
+ * 2026-09-30 incident: TR-00479 was edited back to DRAFT in CIN7 while its
+ * bridge row stayed `synced`. When the old shipment was cancelled (freeing the
+ * dedup slot) the reconciler re-fired it from a DRAFT — 2,040 units Amazon
+ * expected and CIN7 did not authorise. The reconciler trusted a status it
+ * had cached days earlier. Now it asks CIN7 at the moment of firing.
+ */
+export const CIN7_FIREABLE_STATUSES = new Set(['AUTHORISED', 'AUTHORIZED', 'ORDERED', 'PICKING', 'PACKED', 'IN TRANSIT', 'NOT RECEIVED']);
+
+/** Pure: is this CIN7 status one the reconciler may fire from? */
+export function isCin7StatusFireable(status: string | null | undefined): boolean {
+  return CIN7_FIREABLE_STATUSES.has(String(status || '').trim().toUpperCase());
+}
+
+/**
+ * Live CIN7 status for a bridge row, or null if it cannot be read.
+ * Injected for tests via `deps`. Fail CLOSED: null → do not fire.
+ */
+export async function readLiveCin7Status(row: { request_payload?: any; cin7_transfer_id?: string | null }, fetchDetail = fetchCIN7TransferDetail): Promise<string | null> {
+  const taskId = row?.request_payload?.rawTransfer?.TaskID || row?.cin7_transfer_id;
+  if (!taskId) return null;
+  try {
+    const d = await fetchDetail(String(taskId));
+    const s = d?.Status ?? d?.status ?? null;
+    return s ? String(s) : null;
+  } catch {
+    return null;
+  }
+}
 
 const FBA_INBOUND_BASE = '/inbound/fba/2024-03-20';
 
@@ -230,7 +266,7 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
   const { data, error } = await db
     .from('cin7_transfer_shiphero_orders')
     .select(
-      'id, cin7_transfer_number, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number'
+      'id, cin7_transfer_number, cin7_transfer_id, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number'
     )
     .eq('status', 'synced')
     .gte('synced_at', since)
@@ -406,10 +442,11 @@ async function sendTelegramAlert(message: string): Promise<void> {
 }
 
 export async function reconcileFbaHandoffs(
-  options: { supabase?: SupabaseClient; dryRun?: boolean } = {}
+  options: { supabase?: SupabaseClient; dryRun?: boolean; readCin7Status?: (row: any) => Promise<string | null> } = {}
 ): Promise<ReconcileResult> {
   const startedAt = Date.now();
   const db = getSupabase(options.supabase);
+  const deps = { readCin7Status: options.readCin7Status };
   const result: ReconcileResult = {
     scanned: 0,
     reFired: 0,
@@ -461,6 +498,19 @@ export async function reconcileFbaHandoffs(
         result.skipped.push({
           transfer: row.cin7_transfer_number,
           reason: 'already_has_active_shipment_row',
+        });
+        continue;
+      }
+
+      // ── CIN7 STATUS GATE — re-read the source of truth AT the fire decision.
+      // Cached `synced` rows lie: a transfer can be pulled back to DRAFT or
+      // VOIDED after we synced it. Fail CLOSED on an unreadable status.
+      const liveCin7 = await (deps?.readCin7Status ?? readLiveCin7Status)(row);
+      if (!isCin7StatusFireable(liveCin7)) {
+        result.skipped.push({
+          transfer: row.cin7_transfer_number,
+          reason: 'cin7_status_not_fireable',
+          detail: `CIN7 says ${liveCin7 ?? 'UNREADABLE'} — only ${[...CIN7_FIREABLE_STATUSES].join('/')} may fire. Not touching Amazon.`,
         });
         continue;
       }
