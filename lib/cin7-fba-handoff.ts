@@ -86,6 +86,38 @@ export function isFbaDestination(destinationName: string | null | undefined): bo
  * Vercel routes the POST and the auto-submit container starts, it runs
  * independently for up to its own maxDuration=300s.
  */
+/**
+ * Pure: turn auto-submit's HTTP-200 body into a handoff status the reconciler
+ * can act on. Only a body that actually created something is 'dispatched'.
+ *
+ *   successful ≥ 1                → dispatched
+ *   deferred ≥ 1 and failed == 0  → dispatched (auto-submit self-chained)
+ *   every item failed             → handoff_failed, first error named
+ *   no ledger in body             → dispatched (legacy shape; unknown ≠ bad)
+ *
+ * 2026-09-30/10-01: TR-00497..00501 returned 200 six times each with
+ * `successful: 0, failed: 1, "No Amazon SKU mapping"` and the bridge logged
+ * "dispatched — auto-submit returned 200" every time. Nobody was told; the
+ * floor asked a day later.
+ */
+export function classifyAutoSubmitResponse(json: any): { status: 'dispatched' | 'handoff_failed'; detail: string } {
+  if (!json || typeof json !== 'object' || typeof json.processed !== 'number') {
+    return { status: 'dispatched', detail: 'auto-submit returned 200' };
+  }
+  const ok = Number(json.successful) || 0;
+  const deferred = Number(json.deferred) || 0;
+  const failed = Number(json.failed) || 0;
+  if (ok > 0 || (deferred > 0 && failed === 0)) {
+    return { status: 'dispatched', detail: `auto-submit 200: ${ok} created, ${deferred} deferred, ${failed} failed` };
+  }
+  if (failed > 0) {
+    const first = (Array.isArray(json.results) ? json.results : []).find((r: any) => r?.status === 'failed');
+    const err = String(first?.error || 'unknown error').slice(0, 160);
+    return { status: 'handoff_failed', detail: `auto-submit 200 but ${failed}/${json.processed} item(s) FAILED: ${err}` };
+  }
+  return { status: 'dispatched', detail: `auto-submit 200: nothing processed (${json.processed})` };
+}
+
 export function fireFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
   return triggerFbaAutoSubmit(input).catch((err) => {
     console.error(
@@ -97,7 +129,7 @@ export function fireFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
 
 async function recordHandoffDispatch(
   cin7TransferNumber: string,
-  status: 'dispatched' | 'dispatch_failed',
+  status: 'dispatched' | 'dispatch_failed' | 'handoff_failed',
   details?: string
 ): Promise<void> {
   const url = process.env.SUPABASE_URL;
@@ -195,7 +227,13 @@ async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
     console.log(
       `[cin7-fba-handoff] FBA handoff accepted for ${payload.cin7_transfer_number}: ${JSON.stringify(json)?.slice(0, 300)}`
     );
-    await recordHandoffDispatch(input.cin7TransferNumber, 'dispatched', 'auto-submit returned 200');
+    // HTTP 200 is NOT success. auto-submit returns 200 with a per-item ledger
+    // (successful / failed / deferred). 2026-09-30: TR-00497..00501 came back
+    // 200 six times each with `successful: 0, failed: 1, "No Amazon SKU
+    // mapping"` and the bridge recorded "dispatched — auto-submit returned
+    // 200" every time. Nobody was told; the floor asked a day later.
+    const verdict = classifyAutoSubmitResponse(json);
+    await recordHandoffDispatch(input.cin7TransferNumber, verdict.status, verdict.detail);
   } catch (err: any) {
     if (err?.name === 'AbortError') {
       // The 30s timeout fired before auto-submit returned. The auto-submit

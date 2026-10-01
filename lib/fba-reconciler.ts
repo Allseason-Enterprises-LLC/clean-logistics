@@ -291,14 +291,30 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
  *
  * These need a HUMAN, so cap them and escalate loudly instead of retrying.
  */
-function isPermanentConfigError(detail: string | null | undefined): boolean {
+export function isPermanentConfigError(detail: string | null | undefined): boolean {
   const d = String(detail || '');
   return (
     d.includes('HTTP 401') ||
     d.includes('"Unauthorized"') ||
     d.includes('CRON_SECRET not set') ||
-    d.includes('HTTP 403')
+    d.includes('HTTP 403') ||
+    // 2026-10-01: data errors a retry can never fix. TR-00497..00501 were
+    // re-fired 6× each over 24h with "No Amazon SKU mapping"; nobody was told.
+    d.includes('No Amazon SKU mapping') ||
+    d.includes('not available for inbound')
   );
+}
+
+/** Human-readable hint for the capped-error alert, by error class. */
+export function configErrorHint(detail: string | null | undefined): string {
+  const d = String(detail || '');
+  if (d.includes('No Amazon SKU mapping')) {
+    return 'The CIN7 SKU has no row in sku_master (amazon_seller_sku). Find the MSKU in the Seller Central listings report, add the mapping, then set the bridge row handoff status back to allow a re-fire.';
+  }
+  if (d.includes('not available for inbound')) {
+    return 'Amazon has the MSKU but the FBA offer is not registered for inbound (no FNSKU / barcode type unset). Fix in Seller Central: Edit listing → Offer → fulfilled by Amazon → barcode type. Re-fires resume automatically once Amazon accepts.';
+  }
+  return 'A 401/403 means the self-POST is hitting a Deployment-Protection-walled URL or CRON_SECRET does not match. Retrying cannot fix it. Check FBA_SELF_BASE_URL / CRON_SECRET in the Vercel project env.';
 }
 
 /** Attempts allowed for a config error before we stop and escalate. */
@@ -526,9 +542,7 @@ export async function reconcileFbaHandoffs(
             `Transfer: ${row.cin7_transfer_number}\n` +
             `Attempts: ${row.fba_handoff_attempts} (capped at ${CONFIG_ERROR_MAX_ATTEMPTS})\n` +
             `Error: ${String(row.last_fba_handoff_detail || '').slice(0, 200)}\n\n` +
-            `A 401/403 means the self-POST is hitting a Deployment-Protection-walled ` +
-            `URL or CRON_SECRET does not match. Retrying cannot fix it. ` +
-            `Check FBA_SELF_BASE_URL / CRON_SECRET in the Vercel project env.`;
+            configErrorHint(row.last_fba_handoff_detail);
           console.error(`[reconciler] ${msg.replace(/\n/g, ' ')}`);
           await sendTelegramAlert(msg);
           // Also record it in the unified ledger so `scanned` reconciles

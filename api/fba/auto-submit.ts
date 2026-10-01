@@ -382,6 +382,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           if (updErr) {
             console.warn(`[fba-auto] Bind plan_id to reservation failed: ${updErr.message} (code=${updErr.code})`);
           } else {
+            // 2026-10-01 BUG FIX: earlyRecordId is reset to null before every
+            // attempt (see the retry loop) and was only re-assigned in the
+            // FALLBACK branch above. On the normal path it stayed null, so the
+            // post-Amazon persistence step took the "insert fresh" branch,
+            // collided with the partial unique index (the reservation row IS
+            // the live row), got fbaRecordId=null, and silently skipped BOTH
+            // the plan_created and labels_ready status writes. Result: Amazon
+            // ACTIVE + labels posted + row frozen at 'draft' — on EVERY
+            // successful first-attempt run (TR-00502/00497..00501/00507).
+            // The reconciler then read those as frozen drafts: duplicate label
+            // posts, needless re-fires. The reservation row is the record.
+            earlyRecordId = reservationId;
             console.log(`[fba-auto] Bound plan ${planId} to reservation ${reservationId}`);
           }
         } catch (e: any) {
