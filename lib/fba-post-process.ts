@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { callAmazonSpApi } from './amazon-sp-api-client';
 import { extractTransferNumber } from './order-naming';
 
@@ -301,6 +301,42 @@ function isCancelledStatus(status: string | null | undefined): boolean {
   return s.includes('cancel') || s.includes('void');
 }
 
+/**
+ * Pure-ish lookup: the ShipHero child order the sync created for THIS lot of
+ * THIS transfer, from the bridge row's response_payload.child_orders. Returns
+ * null when the transfer was not lot-split or the lot is not recorded —
+ * callers then fall back to name-based lookups. Never throws.
+ */
+export async function resolveLotChildOrder(
+  cin7TransferNumber: string,
+  lot: string,
+  db: SupabaseClient = getSupabase()
+): Promise<{ orderId: string; orderNumber: string } | null> {
+  const tr = extractTransferNumber(cin7TransferNumber);
+  if (!tr || !lot) return null;
+  try {
+    const { data } = await db
+      .from('cin7_transfer_shiphero_orders')
+      .select('response_payload')
+      .eq('cin7_transfer_number', tr)
+      .maybeSingle();
+    return pickLotChild((data as any)?.response_payload, lot);
+  } catch (err: any) {
+    console.warn(`[fba-post-process] child_orders lookup failed for ${tr}/${lot}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/** Pure: select the child order for a lot from a response_payload. */
+export function pickLotChild(responsePayload: any, lot: string): { orderId: string; orderNumber: string } | null {
+  const children = responsePayload?.child_orders;
+  if (!Array.isArray(children)) return null;
+  const want = String(lot).trim().toUpperCase();
+  const hit = children.find((c: any) => String(c?.lot || '').trim().toUpperCase() === want);
+  if (!hit?.orderId || !hit?.orderNumber) return null;
+  return { orderId: String(hit.orderId), orderNumber: String(hit.orderNumber) };
+}
+
 export async function findShipheroOrder(
   token: string,
   cin7TransferNumber: string
@@ -601,10 +637,36 @@ export async function postProcessFbaShipment(
   // Lot-split: try the per-lot child order first (e.g. CIN7-TR-00123-CN61522602),
   // fall back to the legacy transfer-level order number.
   const shToken = await getShipHeroToken();
-  let shOrder = input.shipheroOrderNumberOverride
-    ? await findShipheroOrder(shToken, input.shipheroOrderNumberOverride)
-    : null;
+  let shOrder: { orderId: string; accountId: string } | null = null;
   let shOrderNumber = input.shipheroOrderNumberOverride || input.cin7TransferNumber;
+
+  // ── AUTHORITATIVE per-lot resolution (2026-10-01, TR-00507) ─────────────
+  // The sync records every lot-split child order (number + ShipHero id) in
+  // the bridge row's response_payload.child_orders. Callers used to pass a
+  // GUESSED override (`CIN7-TR-00507-2606060A`) that never matched the real
+  // child (`AMZ_ADAPTACORE_00507-2606060A`), so the lookup fell through to the
+  // bridge's primary order — which is always the FIRST lot. Result on TR-00507:
+  // all 10 PDFs for three lots attached to the 300-unit lot's order; the
+  // 1,500-unit order had none. The record exists — use it, don't guess.
+  if (input.lot) {
+    const child = await resolveLotChildOrder(input.cin7TransferNumber, input.lot);
+    if (child) {
+      // Resolve by the recorded NUMBER through the normal lookup so we get the
+      // live order (account_id, not-cancelled check) rather than a bare id.
+      const live = await findShipheroOrder(shToken, child.orderNumber);
+      if (live) {
+        shOrder = live;
+        shOrderNumber = child.orderNumber;
+        console.log(`[fba-post-process] resolved lot ${input.lot} → ${child.orderNumber} via bridge child_orders`);
+      } else {
+        console.warn(`[fba-post-process] child_orders names ${child.orderNumber} for lot ${input.lot} but ShipHero lookup returned nothing — falling through`);
+      }
+    }
+  }
+
+  if (!shOrder && input.shipheroOrderNumberOverride) {
+    shOrder = await findShipheroOrder(shToken, input.shipheroOrderNumberOverride);
+  }
   if (!shOrder) {
     if (input.shipheroOrderNumberOverride) {
       console.warn(
