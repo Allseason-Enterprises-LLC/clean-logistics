@@ -164,6 +164,18 @@ export async function createAssemblyWorkOrder(
   }
 }
 
+/**
+ * CUSTOM work order — for preflight "DATA FIX" and FNSKU-labelling tasks where
+ * nothing is assembled. Never tries ASSEMBLY (it would build stock on complete).
+ */
+export async function createCustomWorkOrder(
+  token: string,
+  input: CreateAssemblyWorkOrderInput,
+  fetchImpl: FetchLike = fetch as any
+): Promise<WorkOrderRef> {
+  return createWorkOrderOfType(token, input, 'CUSTOM', fetchImpl);
+}
+
 export async function getWorkOrder(
   token: string,
   legacyId: number,

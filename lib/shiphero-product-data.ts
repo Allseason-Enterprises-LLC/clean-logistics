@@ -23,6 +23,8 @@ interface ProductData {
   expirationDate: string | null;
   lotNumber: string | null;
   isKit: boolean;
+  /** Raw ShipHero product_note — preflight quotes it back to the floor. */
+  productNote: string | null;
 }
 
 /**
@@ -285,6 +287,7 @@ export async function getShipHeroProductData(
     expirationDate,
     lotNumber,
     isKit,
+    productNote: product.product_note ?? null,
   };
 }
 

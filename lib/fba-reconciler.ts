@@ -21,6 +21,9 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { readWorkOrderState } from './kit-work-order-gate';
+import { applyPreflightGate, clearMarketingHold, type PreflightGateResult } from './fba-preflight-gate';
+import { gatherPreflightFacts } from './fba-preflight-facts';
+import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
 import { fetchCIN7TransferDetail } from './cin7-transfer-sync';
@@ -457,12 +460,66 @@ async function sendTelegramAlert(message: string): Promise<void> {
   }
 }
 
+/** Same rule as lookupSkuMapping (fba-orchestrator) but on the reconciler's own
+ *  client — that module instantiates Supabase at import time and cannot be
+ *  loaded offline. Prefer a non-FBM amazon_seller_sku; FNSKU from amazon_products. */
+async function resolveMappingWith(db: SupabaseClient, cin7Sku: string): Promise<{ amz_sku: string | null; amz_fnsku?: string | null } | null> {
+  const { data: rows, error } = await db.from('sku_master').select('amazon_seller_sku').eq('cin7_sku', cin7Sku);
+  if (error) throw new Error(`sku_master read failed: ${error.message}`);
+  const preferred = (rows || []).find((r: any) => r.amazon_seller_sku && !String(r.amazon_seller_sku).toUpperCase().includes('-FBM-'))
+    || (rows || []).find((r: any) => r.amazon_seller_sku);
+  if (!preferred?.amazon_seller_sku) return null;
+  const { data: amz } = await db.from('amazon_products').select('fnsku').eq('seller_sku', preferred.amazon_seller_sku).eq('marketplace_id', 'ATVPDKIKX0DER').limit(1);
+  return { amz_sku: preferred.amazon_seller_sku, amz_fnsku: amz?.[0]?.fnsku || null };
+}
+
+/** Live preflight for a bridge row: same gate the sync uses. Fail CLOSED on
+ *  error (return a synthetic 'floor' hold with no WO so the row is skipped and
+ *  the error is in the ledger, rather than firing blind). */
+async function livePreflight(db: SupabaseClient, row: any): Promise<PreflightGateResult | null> {
+  const lines: Array<{ sku: string; quantity: number }> = Array.isArray(row.request_payload?.partnerLineItems)
+    ? row.request_payload.partnerLineItems.map((l: any) => ({ sku: String(l.sku), quantity: Number(l.quantity) || 0 }))
+    : [];
+  if (lines.length === 0) return null; // nothing to check; legacy row
+  try {
+    const token = await getShipHeroToken(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, process.env.SHIPHERO_WAREHOUSE_ID || '22e17170-af72-4bf8-b77c-d73c86b06765');
+    return await applyPreflightGate(
+      {
+        supabase: db,
+        shipheroToken: token,
+        gatherFacts: (sku, qty) => gatherPreflightFacts(
+          { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s) },
+          sku, qty
+        ),
+        sendTelegram: async (html) => { await sendTelegramAlert(html); return true; },
+      },
+      {
+        id: row.cin7_transfer_id, transferNumber: row.cin7_transfer_number, destinationName: row.cin7_destination,
+        lines, shipheroOrderNumber: row.shiphero_order_number ?? null,
+      }
+    );
+  } catch (e: any) {
+    console.error(`[reconciler] preflight threw for ${row.cin7_transfer_number} — NOT firing: ${e?.message || e}`);
+    return { gated: true, hold: 'floor', result: { ok: false, blockers: [], floor: [], marketing: [] } } as PreflightGateResult;
+  }
+}
+
 export async function reconcileFbaHandoffs(
-  options: { supabase?: SupabaseClient; dryRun?: boolean; readCin7Status?: (row: any) => Promise<string | null> } = {}
+  options: {
+    supabase?: SupabaseClient;
+    dryRun?: boolean;
+    readCin7Status?: (row: any) => Promise<string | null>;
+    /** Re-run preflight for a row at the fire decision. Default = live gate;
+     *  pass `null` to disable (tests of unrelated paths). */
+    preflight?: ((row: any) => Promise<PreflightGateResult | null>) | null;
+  } = {}
 ): Promise<ReconcileResult> {
   const startedAt = Date.now();
   const db = getSupabase(options.supabase);
-  const deps = { readCin7Status: options.readCin7Status };
+  const deps = {
+    readCin7Status: options.readCin7Status,
+    preflight: options.preflight === null ? undefined : (options.preflight ?? ((row: any) => livePreflight(db, row))),
+  };
   const result: ReconcileResult = {
     scanned: 0,
     reFired: 0,
@@ -529,6 +586,29 @@ export async function reconcileFbaHandoffs(
           detail: `CIN7 says ${liveCin7 ?? 'UNREADABLE'} — only ${[...CIN7_FIREABLE_STATUSES].join('/')} may fire. Not touching Amazon.`,
         });
         continue;
+      }
+
+      // ── PREFLIGHT AT THE FIRE DECISION (2026-10-01). The sync ran it once;
+      //    re-run here because (a) a "DATA FIX" work order was just marked
+      //    COMPLETED and the floor may not have actually fixed the data, and
+      //    (b) a marketing hold clears only when Amazon says ready. A failed
+      //    preflight re-parks via the same gate (new WO naming what is still
+      //    missing, or hold refreshed) — it never fires into a known failure.
+      //    Injected for tests; undefined dep = skip (legacy behaviour).
+      if (deps?.preflight) {
+        const pf = await deps.preflight(row);
+        if (pf && pf.gated) {
+          result.skipped.push({
+            transfer: row.cin7_transfer_number,
+            reason: pf.hold === 'floor' ? 'awaiting_work_order' : 'awaiting_listing',
+            detail: `preflight: ${pf.result.blockers.map((b) => b.code).join('+')}` + (pf.workOrder ? ` — work order ${pf.workOrder.ids.join(',')}` : ' — marketing notified, no floor action'),
+          });
+          continue;
+        }
+        if (pf && !pf.gated && row.request_payload?.preflight_hold) {
+          // Hold cleared on its own (Amazon now accepts the MSKU).
+          await clearMarketingHold(db, row.id, row.request_payload);
+        }
       }
 
       const decision = shouldRetryNow(row);

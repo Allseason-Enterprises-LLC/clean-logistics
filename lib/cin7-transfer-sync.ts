@@ -10,6 +10,8 @@ import {
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { applyKitWorkOrderGate, buildWorkOrdersDigestNotice, type WorkOrderState } from './kit-work-order-gate';
+import { applyPreflightGate } from './fba-preflight-gate';
+import { gatherPreflightFacts } from './fba-preflight-facts';
 import { sendTelegram } from './fba-post-process';
 import { resolveKitProductIdentity } from './kit-product-identity';
 import { attachKitBarcode } from './kit-barcode-attach';
@@ -807,6 +809,57 @@ export async function syncCIN7LasVegasTransferOrders(
                 .eq('cin7_transfer_id', transfer.id)
                 .eq('cin7_destination', transfer.destinationName || '');
               gated = true; // treat as gated: do NOT fire
+            }
+
+            // ── PREFLIGHT (Weston 2026-10-01): never hand a transfer to
+            //    auto-submit that will fail on missing ShipHero data or an
+            //    Amazon listing problem. Floor-fixable → CUSTOM "DATA FIX" work
+            //    order (same park/release path as the kit gate). Amazon-side →
+            //    marketing notice + hold, no floor WO. Fail CLOSED on a gate
+            //    error: do not fire.
+            if (!gated) {
+              try {
+                const pf = await applyPreflightGate(
+                  {
+                    supabase,
+                    shipheroToken: shipHeroWarehouse.credentials.accessToken,
+                    gatherFacts: (sku, qty) => gatherPreflightFacts(
+                      {
+                        shipheroToken: shipHeroWarehouse.credentials.accessToken,
+                        resolveAmazonSku: async (s) => { const m = await lookupSkuMapping(s); return m ? { amz_sku: m.amz_sku ?? null, amz_fnsku: m.amz_fnsku ?? null } : null; },
+                      },
+                      sku, qty
+                    ),
+                    sendTelegram,
+                  },
+                  {
+                    ...transfer,
+                    shipheroOrderNumber: result.shipheroOrderNumber ?? result.orderNumber ?? null,
+                  }
+                );
+                if (pf.gated) {
+                  gated = true;
+                  if (pf.hold === 'floor') workOrdersCreated++;
+                  console.log(
+                    `[preflight] ${transfer.transferNumber}: ${pf.hold} hold — ` +
+                      pf.result.blockers.map((b) => b.code).join('+') +
+                      (pf.workOrder ? ` (work order ${pf.workOrder.ids.join(',')})` : '') +
+                      ' — FBA handoff NOT queued'
+                  );
+                }
+              } catch (pfErr) {
+                const msg = pfErr instanceof Error ? pfErr.message : String(pfErr);
+                errors.push(`Transfer ${transfer.transferNumber}: preflight gate failed — ${msg}`);
+                await supabase
+                  .from('cin7_transfer_shiphero_orders')
+                  .update({
+                    last_fba_handoff_status: 'work_order_failed',
+                    last_fba_handoff_detail: `${new Date().toISOString().slice(0, 16)}: preflight could not run / create the work order — ${msg}`.slice(0, 500),
+                  })
+                  .eq('cin7_transfer_id', transfer.id)
+                  .eq('cin7_destination', transfer.destinationName || '');
+                gated = true;
+              }
             }
 
             if (!gated) {

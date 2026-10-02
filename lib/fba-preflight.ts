@@ -1,0 +1,230 @@
+/**
+ * FBA PREFLIGHT — "the pipeline never fails on something the floor can fix."
+ *
+ * Before a transfer is handed to auto-submit we check every input the Amazon
+ * workflow needs. Each missing input becomes a BLOCKER with:
+ *   • who can fix it  — 'floor' (ShipHero data entry → CUSTOM work order with a
+ *                        checklist) or 'marketing' (Amazon listing → channel
+ *                        notice tagging marketing, NO floor work order)
+ *   • a checklist      — the exact steps, in the words the person doing them
+ *                        needs. The WO instructions are built from these.
+ *
+ * Weston 2026-10-01 (design decisions, do not relitigate here):
+ *   • ShipHero is the ONLY source of truth for case pack, dims, weight, lot and
+ *     expiration. If CIN7 has it and ShipHero doesn't, the WO is to COPY it into
+ *     ShipHero. We never read CIN7 for these.
+ *   • Amazon-side blockers (no MSKU mapping, offer not inbound-ready) get NO
+ *     floor WO — the floor can't fix a listing. They get a channel notice to
+ *     marketing ("fix on our side first") and the transfer parks until Amazon
+ *     says ready.
+ *   • When Amazon flips ready and the label type is FNSKU, a SECOND WO follows:
+ *     print FNSKU labels, apply FNSKU + Transparency to every unit (Wild Yam,
+ *     TR-00481, was exactly this and the system just failed silently).
+ *
+ * This module is PURE: it takes already-fetched facts and returns a decision.
+ * No I/O. The gate (kit-work-order-gate / sync) does the fetching and acting.
+ */
+
+export type BlockerOwner = 'floor' | 'marketing';
+
+export type BlockerCode =
+  | 'MISSING_CASE_PACK'      // product_note lacks "Quantity per Case"
+  | 'MISSING_BOX_DIMS'       // product_note lacks "Box Size: L x W x H"
+  | 'MISSING_BOX_WEIGHT'     // product_note lacks "Box Weight"
+  | 'MISSING_LOT'            // no lot on the SKU in ShipHero
+  | 'MISSING_EXPIRATION'     // lot exists but no expiration / no dated lot
+  | 'NO_AMAZON_MAPPING'      // sku_master has no MSKU for the CIN7 SKU
+  | 'OFFER_NOT_INBOUND_READY'// Amazon: "MSKUs are not available for inbound"
+  | 'NEEDS_FNSKU_LABELS';    // Amazon ready + labelOwner SELLER_ONLY → sticker every unit
+
+export interface Blocker {
+  code: BlockerCode;
+  owner: BlockerOwner;
+  /** One line for the ledger / digest. */
+  summary: string;
+  /** Numbered steps for the WO instructions or the marketing notice. */
+  checklist: string[];
+}
+
+/** Facts the gate has already fetched. Every field optional: unknown ≠ missing
+ *  for the Amazon side (fail OPEN there — see below), but missing ShipHero data
+ *  IS a blocker (fail CLOSED — the shipment cannot be built without it). */
+export interface PreflightFacts {
+  cin7Sku: string;
+  quantity: number;
+  /** Parsed from ShipHero product_note. null = note absent or unparseable. */
+  casePack?: { caseQuantity: number; boxLength: number; boxWidth: number; boxHeight: number; boxWeightLbs: number } | null;
+  /** Raw note so the checklist can quote what IS there. */
+  productNote?: string | null;
+  /** From ShipHero lots / product expiry. */
+  lotNumber?: string | null;
+  expirationDate?: string | null;
+  /** From sku_master. null = no row. */
+  amazonMsku?: string | null;
+  /** Result of Amazon prepDetails for the MSKU. undefined = not checked (don't block). */
+  inboundReady?: boolean;
+  /** From prepDetails.labelOwnerConstraint. SELLER_ONLY → we sticker FNSKUs. */
+  labelOwnerConstraint?: 'SELLER_ONLY' | 'AMAZON_ONLY' | 'NONE_ONLY' | string | null;
+  fnsku?: string | null;
+  /** Kit SKUs are handled by the kit gate; preflight still checks their data. */
+  isKit?: boolean;
+}
+
+export interface PreflightResult {
+  ok: boolean;
+  blockers: Blocker[];
+  /** Blockers the FLOOR fixes → become ONE custom work order. */
+  floor: Blocker[];
+  /** Blockers MARKETING fixes → become ONE channel notice. */
+  marketing: Blocker[];
+}
+
+const SH_NOTE_FORMAT = [
+  'Box Weight: <number> Lbs',
+  'Box Size: <L> x <W> x <H> inches',
+  'Quantity per Case: <number> <units>',
+];
+
+/** Pure. Order of blockers is the order the floor should work them. */
+export function runPreflight(f: PreflightFacts): PreflightResult {
+  const blockers: Blocker[] = [];
+  const sku = f.cin7Sku;
+
+  // ── ShipHero data (floor) — fail CLOSED ────────────────────────────────
+  const cp = f.casePack ?? null;
+  const noteHint = f.productNote
+    ? `Current note reads: "${String(f.productNote).replace(/\s+/g, ' ').trim().slice(0, 120)}".`
+    : 'The product note is empty.';
+  if (!cp || !(cp.caseQuantity > 0)) {
+    blockers.push({
+      code: 'MISSING_CASE_PACK', owner: 'floor',
+      summary: `ShipHero has no case quantity for ${sku}`,
+      checklist: [
+        `Count how many sellable units are in ONE shipping case of ${sku}.`,
+        `ShipHero → Products → ${sku} → Notes. Add a line exactly: "Quantity per Case: <number> units".`,
+        noteHint,
+      ],
+    });
+  }
+  if (!cp || !(cp.boxLength > 0 && cp.boxWidth > 0 && cp.boxHeight > 0)) {
+    blockers.push({
+      code: 'MISSING_BOX_DIMS', owner: 'floor',
+      summary: `ShipHero has no case dimensions for ${sku}`,
+      checklist: [
+        `Measure the outside of one packed shipping case of ${sku} in inches (length x width x height).`,
+        `ShipHero → Products → ${sku} → Notes. Add a line exactly: "Box Size: <L> x <W> x <H> inches".`,
+        'Amazon limits: no side over 25 in, so if a case is bigger tell the office before entering it.',
+        noteHint,
+      ],
+    });
+  }
+  if (!cp || !(cp.boxWeightLbs > 0)) {
+    blockers.push({
+      code: 'MISSING_BOX_WEIGHT', owner: 'floor',
+      summary: `ShipHero has no case weight for ${sku}`,
+      checklist: [
+        `Weigh one packed shipping case of ${sku} on the floor scale, in pounds.`,
+        `ShipHero → Products → ${sku} → Notes. Add a line exactly: "Box Weight: <number> Lbs".`,
+        'Amazon limit: 50 lb per case. If heavier, tell the office before entering it.',
+        noteHint,
+      ],
+    });
+  }
+  if (!f.lotNumber) {
+    blockers.push({
+      code: 'MISSING_LOT', owner: 'floor',
+      summary: `ShipHero has no lot for ${sku}`,
+      checklist: [
+        `Read the lot number printed on the ${sku} product (bottle / bag / case label).`,
+        `ShipHero → Products → ${sku} → Lots → Add lot: enter the lot number AND its best-by / expiration date.`,
+        'Move the on-hand units into that lot so the quantity shows against it.',
+      ],
+    });
+  } else if (!f.expirationDate) {
+    blockers.push({
+      code: 'MISSING_EXPIRATION', owner: 'floor',
+      summary: `ShipHero lot ${f.lotNumber} for ${sku} has no expiration date`,
+      checklist: [
+        `Read the best-by / expiration date printed on the ${sku} product for lot ${f.lotNumber}.`,
+        `ShipHero → Products → ${sku} → Lots → ${f.lotNumber} → set the expiration date.`,
+      ],
+    });
+  }
+
+  // ── Amazon side (marketing) ────────────────────────────────────────────
+  if (f.amazonMsku === null) {
+    blockers.push({
+      code: 'NO_AMAZON_MAPPING', owner: 'marketing',
+      summary: `No Amazon MSKU mapped for ${sku}`,
+      checklist: [
+        `Find the seller SKU for ${sku} in Seller Central → Inventory → Manage All Inventory (or the listings report). Match by ASIN + UPC, not by name.`,
+        `If there is no listing yet, create the FBA offer on the correct ASIN.`,
+        `Send Freight the MSKU + ASIN; the mapping is added and the shipment fires automatically.`,
+      ],
+    });
+  } else if (f.inboundReady === false) {
+    blockers.push({
+      code: 'OFFER_NOT_INBOUND_READY', owner: 'marketing',
+      summary: `Amazon will not accept ${f.amazonMsku} for inbound yet`,
+      checklist: [
+        `Seller Central → Manage Inventory → ${f.amazonMsku} → Edit → Offer tab.`,
+        `Set "Fulfilled by Amazon" and choose the barcode type (UPC = no stickers; Amazon barcode = FNSKU stickers on every unit). Save.`,
+        `Amazon takes 10–60 minutes to accept the offer for inbound. The shipment then fires on its own — no further action.`,
+      ],
+    });
+  }
+
+  // ── Second-stage floor WO once Amazon is ready and wants FNSKUs ────────
+  if (f.amazonMsku && f.inboundReady === true && f.labelOwnerConstraint === 'SELLER_ONLY') {
+    blockers.push({
+      code: 'NEEDS_FNSKU_LABELS', owner: 'floor',
+      summary: `Every unit of ${sku} needs an FNSKU label${f.fnsku ? ` (${f.fnsku})` : ''} before it ships`,
+      checklist: [
+        `Print ${f.quantity} FNSKU labels${f.fnsku ? ` for ${f.fnsku}` : ''}: Seller Central → Manage Inventory → ${f.amazonMsku} → Print item labels.`,
+        `Apply ONE FNSKU label to EVERY unit, covering the UPC barcode completely so only the FNSKU scans.`,
+        `If this product is enrolled in Amazon Transparency, also apply ONE Transparency code sticker to every unit (do not cover it).`,
+        `Pack back into cases and stage; the FBA box labels will post here once labelling is marked complete.`,
+      ],
+    });
+  }
+
+  const floor = blockers.filter((b) => b.owner === 'floor');
+  const marketing = blockers.filter((b) => b.owner === 'marketing');
+  return { ok: blockers.length === 0, blockers, floor, marketing };
+}
+
+/** The ShipHero note format, for messages that teach it. */
+export const SHIPHERO_NOTE_FORMAT = SH_NOTE_FORMAT;
+
+/** Deterministic reason key stored on the work order state. */
+export function preflightReason(r: PreflightResult): string {
+  return 'preflight:' + r.floor.map((b) => b.code).join('+');
+}
+
+/**
+ * Work-order NAME (≤ what ShipHero shows in its list) + INSTRUCTIONS for the
+ * floor blockers. One WO for all of them: one row to complete.
+ */
+export function buildPreflightWorkOrderText(args: {
+  transferNumber: string;
+  orderNumber: string | null | undefined;
+  sku: string;
+  quantity: number;
+  blockers: Blocker[];
+}): { name: string; instructions: string } {
+  const floor = args.blockers.filter((b) => b.owner === 'floor');
+  const what = floor.map((b) => b.code.replace(/^MISSING_|^NEEDS_/, '').replace(/_/g, ' ').toLowerCase()).join(', ');
+  const name = `DATA FIX ${args.orderNumber || args.transferNumber} — ${what}`.slice(0, 120);
+  const L: string[] = [];
+  L.push(`FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the following is entered in ShipHero.`);
+  L.push(`Product: ${args.sku} · ${args.quantity} units`);
+  L.push('');
+  let n = 1;
+  for (const b of floor) {
+    L.push(`${b.summary.toUpperCase()}`);
+    for (const step of b.checklist) L.push(`  ${n++}. ${step}`);
+    L.push('');
+  }
+  L.push('When every step is done, mark this work order COMPLETE. The system re-checks ShipHero and creates the FBA shipment; box labels post to the FBA channel. If something is still missing, a new work order will say exactly what.');
+  return { name, instructions: L.join('\n') };
+}
