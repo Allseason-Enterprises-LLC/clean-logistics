@@ -46,7 +46,7 @@ async function main() {
     ok('notice is the formal "New Work Order Needed" format', /<b>New Work Order Needed — 3-Pack for Amazon FBA<\/b>/.test(sent[0]));
     ok('notice carries ORDER number + TR + WO id + build spec', /AMZ_CN-CAP-REJUVINOL-2OZ_00500/.test(sent[0]) && /\(TR-00500\)/.test(sent[0]) && /<code>171200<\/code>/.test(sent[0]) && /<b>40 × 3-Pack<\/b> \(120 units total\)/.test(sent[0]));
     ok('notice says labels are NOT created until Complete', /<b>not<\/b> created until the work order is marked Complete/.test(sent[0]));
-    ok('no identity resolver given -> "UPC or FNSKU … check Amazon" + Seller Central', /may differ, please check Amazon/.test(sent[0]) && /Download it from Seller Central/.test(sent[0]));
+    ok('no identity resolver given -> check ONE pack, "UPC or FNSKU … check Amazon", Seller Central in the else-branch', /Check ONE finished pack/.test(sent[0]) && /may differ, please check Amazon/.test(sent[0]) && /download the barcode from Seller Central/.test(sent[0]));
     ok('floor-facing: no engineering words', !/reconciler|jsonb|request_payload|bridge|gate/i.test(sent[0]));
     ok('exactly ONE work order created (one per transfer)', created.length === 1);
     ok('WO uses the ShipHero GRAPH warehouse id, not our UUID', created[0].warehouseId === SHIPHERO_LV_WAREHOUSE_GRAPH_ID && created[0].warehouseId === 'V2FyZWhvdXNlOjEzNTg3Mg==');
@@ -81,16 +81,49 @@ async function main() {
     ok('single (-1 msku) -> NOT gated', r.gated === false);
     ok('single -> no WO created, no row update', creates === 0 && updates.length === 0);
   }
+  // ---------- STOCK CHECK: pre-built packs on the shelf -> NO work order ----------
+  {
+    const { db, updates } = fakeDb(ROW); const sent: string[] = []; let created = 0;
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      getBulk: async () => ({ bulk: 50, pickable: 0, rows: 1 }),
+      createWorkOrder: async () => { created++; return { id: 'x', legacyId: 1, status: 'IN_PROGRESS' }; },
+      sendTelegram: async (m) => { sent.push(m); return true; } }, { ...TRANSFER, lines: [{ sku: 'CN-CAP-REJUVINOL-2OZ-3', quantity: 50 }] });
+    ok('🔴 bulk 50 >= qty 50 -> NOT gated, NO work order created, NO notice, row untouched', !r.gated && created === 0 && sent.length === 0 && updates.length === 0);
+    ok('result reports stockSatisfied with the numbers', r.stockSatisfied?.[0]?.sku === 'CN-CAP-REJUVINOL-2OZ-3' && r.stockSatisfied?.[0]?.bulk === 50 && r.stockSatisfied?.[0]?.quantity === 50);
+    ok('verdict still says it IS a kit SKU (detection unchanged, only the WO is skipped)', r.verdict.isKit);
+  }
+  {
+    const { db } = fakeDb(ROW); let created = 0;
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      getBulk: async () => ({ bulk: 49, pickable: 0, rows: 1 }),
+      createWorkOrder: async () => { created++; return { id: 'x', legacyId: 2, status: 'IN_PROGRESS' }; } }, { ...TRANSFER, lines: [{ sku: 'CN-CAP-REJUVINOL-2OZ-3', quantity: 50 }] });
+    ok('bulk 49 < qty 50 -> GATED, work order created (one short is still short)', r.gated && created === 1);
+  }
+  {
+    const { db } = fakeDb(ROW); let created = 0;
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      getBulk: async () => ({ bulk: 0, pickable: 500, rows: 1 }),
+      createWorkOrder: async () => { created++; return { id: 'x', legacyId: 3, status: 'IN_PROGRESS' }; } }, { ...TRANSFER, lines: [{ sku: 'CN-CAP-REJUVINOL-2OZ-3', quantity: 50 }] });
+    ok('PICKABLE stock does not count (only non-pickable bulk = finished packs) -> gated', r.gated && created === 1);
+  }
+  {
+    const { db } = fakeDb(ROW); let created = 0;
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+      getBulk: async () => { throw new Error('Token is expired'); },
+      createWorkOrder: async () => { created++; return { id: 'x', legacyId: 4, status: 'IN_PROGRESS' }; } }, TRANSFER);
+    ok('🔴 stock read FAILS -> treated as 0 -> gated (fail CLOSED, never skips a WO blind)', r.gated && created === 1);
+  }
+
   // ---------- creator fell back to CUSTOM -> state + notice warn the floor ----------
   {
     const { db, updates } = fakeDb(ROW); const sent: string[] = [];
-    await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 8, status: 'IN_PROGRESS', type: 'CUSTOM' }),
       sendTelegram: async (m) => { sent.push(m); return true; } }, TRANSFER);
     ok('creator reports CUSTOM -> state.type CUSTOM', updates[0].request_payload.work_order.type === 'CUSTOM');
     ok('🔴 notice warns: Custom WO will NOT build stock, receive manually', /\(Custom\)/.test(sent[0]) && /will <b>not<\/b> build stock by itself/.test(sent[0]) && /manually/.test(sent[0]));
     const { db: db2 } = fakeDb(ROW); const sent2: string[] = [];
-    await applyKitWorkOrderGate({ supabase: db2, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    await applyKitWorkOrderGate({ supabase: db2, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS', type: 'ASSEMBLY' }),
       sendTelegram: async (m) => { sent2.push(m); return true; } }, TRANSFER);
     ok('ASSEMBLY -> notice says (Assembly), no stock warning', /\(Assembly\)/.test(sent2[0]) && !/not<\/b> build stock/.test(sent2[0]));
@@ -100,7 +133,7 @@ async function main() {
   {
     const { db } = fakeDb(ROW);
     const collected: any[] = []; let posted = 0;
-    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 7, status: 'IN_PROGRESS' }),
       sendTelegram: async () => { posted++; return true; }, collectNotice: (i) => collected.push(i) }, TRANSFER);
     ok('🔴 with collectNotice: gated, notice COLLECTED, nothing posted inline', r.gated && collected.length === 1 && collected[0].transferNumber === 'TR-00500' && collected[0].state.ids[0] === '7' && posted === 0);
@@ -121,14 +154,14 @@ async function main() {
   // ---------- notice failure must never un-gate ----------
   {
     const { db, updates } = fakeDb(ROW);
-    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    const r = await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }),
       sendTelegram: async () => { throw new Error('telegram down'); } }, TRANSFER);
     ok('🔴 telegram throwing -> still gated, row still parked (fail OPEN on notifications)', r.gated === true && updates.length === 1);
-    const r2 = await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    const r2 = await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }), sendTelegram: async () => false }, TRANSFER);
     ok('telegram returning false -> still gated', r2.gated === true);
-    ok('no sendTelegram provided (poller/tests) -> gate works without it', (await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3',
+    ok('no sendTelegram provided (poller/tests) -> gate works without it', (await applyKitWorkOrderGate({ supabase: fakeDb(ROW).db, shipheroToken: 'tok', resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
       createWorkOrder: async () => ({ id: 'x', legacyId: 9, status: 'IN_PROGRESS' }) }, TRANSFER)).gated === true);
     ok('buildWorkOrderCreatedNotice falls back to TR when no order number', /<b>TR-9<\/b>/.test(buildWorkOrderCreatedNotice({ type: 'CUSTOM', ids: ['1'], status: 'IN_PROGRESS', created_at: 'x', kit_sku: 'S', kit_qty: 1, reason: 'r' } as any, 'TR-9')));
     ok('isBlockedByWorkOrder(no work_order) -> false (all existing rows keep firing)', !isBlockedByWorkOrder(ROW.request_payload));
@@ -161,7 +194,7 @@ async function main() {
     let threw = '';
     try {
       await applyKitWorkOrderGate({ supabase: db, shipheroToken: 'tok',
-        resolveAmazonSku: async () => 'X-3',
+        resolveAmazonSku: async () => 'X-3', getBulk: async () => ({ bulk: 0, pickable: 0, rows: 0 }),
         createWorkOrder: async () => { throw new Error('Invalid Product'); } }, TRANSFER);
     } catch (e: any) { threw = e.message; }
     ok('WO create failure -> throws (never silently un-gated)', /Invalid Product/.test(threw) && updates.length === 0);

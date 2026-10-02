@@ -826,7 +826,7 @@ export async function syncCIN7LasVegasTransferOrders(
                     gatherFacts: (sku, qty) => gatherPreflightFacts(
                       {
                         shipheroToken: shipHeroWarehouse.credentials.accessToken,
-                        resolveAmazonSku: async (s) => { const m = await lookupSkuMapping(s); return m ? { amz_sku: m.amz_sku ?? null, amz_fnsku: m.amz_fnsku ?? null } : null; },
+                        resolveAmazonSku: async (s) => { const m = await lookupSkuMapping(s); return m ? { amz_sku: m.amz_sku ?? null, amz_fnsku: m.amz_fnsku ?? null, amz_asin: m.amz_asin ?? null } : null; },
                         hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(supabase, s, transfer.transferNumber),
                       },
                       sku, qty

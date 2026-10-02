@@ -10,6 +10,12 @@
 import { getShipHeroProductData } from './shiphero-product-data';
 import { callAmazonSpApi, SpApiError } from './amazon-sp-api-client';
 import type { PreflightFacts } from './fba-preflight';
+import { catalogIdentity } from './kit-product-identity';
+
+async function defaultAmazonUpc(asin: string): Promise<string | null> {
+  const c = await catalogIdentity(asin);
+  return c.upc ?? (c.ean ? c.ean.replace(/^0/, '') : null);
+}
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 const MARKETPLACE_ID = 'ATVPDKIKX0DER';
@@ -77,7 +83,9 @@ export async function hasPriorFbaShipmentRow(db: SupabaseClient, cin7Sku: string
 
 export interface GatherDeps {
   shipheroToken: string;
-  resolveAmazonSku: (cin7Sku: string) => Promise<{ amz_sku: string | null; amz_fnsku?: string | null } | null>;
+  resolveAmazonSku: (cin7Sku: string) => Promise<{ amz_sku: string | null; amz_fnsku?: string | null; amz_asin?: string | null } | null>;
+  /** ASIN → Amazon catalog UPC/EAN. Defaults to kit-product-identity.catalogIdentity. Fail-open. */
+  amazonUpcForAsin?: (asin: string) => Promise<string | null>;
   /** Our own record: a non-cancelled fba_shipments row exists for this CIN7 SKU
    *  on a DIFFERENT transfer. Injected (DB). Optional. */
   hasPriorShipmentRow?: (cin7Sku: string) => Promise<boolean>;
@@ -103,6 +111,7 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
           boxWeightLbs: Number(p.casePack.boxWeightLbs) || 0,
         }
       : null;
+    facts.shipheroBarcode = p.barcode ?? null;
     facts.lotNumber = p.lotNumber ?? null;
     facts.expirationDate = p.expirationDate ?? null;
   } catch (e: any) {
@@ -110,10 +119,12 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
   }
 
   // sku_master — null row = NO_AMAZON_MAPPING.
+  let asin: string | null = null;
   try {
     const m = await deps.resolveAmazonSku(sku);
     facts.amazonMsku = m?.amz_sku ?? null;
     facts.fnsku = m?.amz_fnsku ?? null;
+    asin = m?.amz_asin ?? null;
   } catch (e: any) {
     // Lookup failure is NOT "no mapping" — leave undefined so preflight doesn't post to marketing on a DB blip.
     facts.amazonMsku = undefined;
@@ -126,10 +137,17 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
     facts.inboundReady = r.inboundReady;
     facts.labelOwnerConstraint = r.labelOwnerConstraint;
 
-    // First-shipment detection — only matters when Amazon wants seller FNSKUs.
-    // Either record (ours or Amazon's) saying "shipped before" wins; an
+    // Amazon's UPC for the listing (barcode-conflict check on UPC listings).
+    // Fail-open: no UPC → no comparison → no blocker.
+    if (r.inboundReady === true && asin) {
+      try { facts.amazonUpc = await (deps.amazonUpcForAsin ?? defaultAmazonUpc)(asin); }
+      catch (e: any) { console.warn(`[preflight] catalog UPC lookup failed for ${asin}: ${e?.message || e}`); }
+    }
+
+    // First-shipment detection — now for BOTH label types (verify-and-branch
+    // WO). Either record (ours or Amazon's) saying "shipped before" wins; an
     // inconclusive probe also counts as shipped-before (no needless WO).
-    if (r.inboundReady === true && r.labelOwnerConstraint === 'SELLER_ONLY') {
+    if (r.inboundReady === true) {
       let ours: boolean | undefined;
       try { ours = deps.hasPriorShipmentRow ? await deps.hasPriorShipmentRow(sku) : undefined; }
       catch (e: any) { console.warn(`[preflight] prior-shipment lookup failed for ${sku}: ${e?.message || e}`); }

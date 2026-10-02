@@ -36,15 +36,28 @@ ok('not-ready checklist points at Seller Central Offer tab + barcode type', runP
 ok('inboundReady undefined (not checked) → does NOT block (fail open on the unknown)', runPreflight({ ...good, inboundReady: undefined }).ok);
 ok('mapping missing AND not ready → only the mapping blocker (fix order matters)', codes({ ...good, amazonMsku: null, inboundReady: false }).join() === 'NO_AMAZON_MAPPING');
 
-// ── second stage: FNSKU labels — FIRST shipment only (Weston 2026-10-01) ──
-const firstShip: PreflightFacts = { ...good, labelOwnerConstraint: 'SELLER_ONLY', fnsku: 'X004ABCDEF', shippedBefore: false };
-ok('🔴 ready + SELLER_ONLY + never shipped → NEEDS_FNSKU_LABELS as a FLOOR blocker', runPreflight(firstShip).floor.map((b) => b.code).join() === 'NEEDS_FNSKU_LABELS');
-ok('FNSKU checklist: print N labels, cover UPC, Transparency if enrolled', (() => { const c = runPreflight(firstShip).floor[0].checklist.join(' '); return c.includes('1920 FNSKU labels') && c.includes('X004ABCDEF') && /covering the UPC/.test(c) && /Transparency/.test(c) && /enrolled/.test(c); })());
-ok('summary says FIRST FBA shipment', /FIRST FBA shipment/.test(runPreflight(firstShip).floor[0].summary));
-ok('🔴 ADAPTACORE shape: SELLER_ONLY but shipped before → NO label WO (floor already labels as routine)', codes({ ...firstShip, shippedBefore: true }).length === 0);
-ok('history unknown (probe failed) → NO label WO (needless WO on an established product is the worse error)', codes({ ...firstShip, shippedBefore: undefined }).length === 0);
-ok('ready + NONE_ONLY (UPC) → no label WO even on first shipment', codes({ ...good, labelOwnerConstraint: 'NONE_ONLY', shippedBefore: false }).length === 0);
-ok('not ready yet → no FNSKU WO even if SELLER_ONLY + first (stage 2 waits for stage 1)', !codes({ ...firstShip, inboundReady: false }).includes('NEEDS_FNSKU_LABELS'));
+// ── barcode: verify-and-branch on FIRST shipment (Weston 2026-10-01: "sometimes preconfigured, sometimes not") ──
+const firstFnsku: PreflightFacts = { ...good, labelOwnerConstraint: 'SELLER_ONLY', fnsku: 'X004ABCDEF', shippedBefore: false };
+const firstUpc: PreflightFacts = { ...good, labelOwnerConstraint: 'NONE_ONLY', shippedBefore: false, shipheroBarcode: '810197341394', amazonUpc: '810197341394' };
+ok('🔴 first shipment + FNSKU listing → VERIFY_BARCODE_FIRST_SHIPMENT (floor)', runPreflight(firstFnsku).floor.map((b) => b.code).join() === 'VERIFY_BARCODE_FIRST_SHIPMENT');
+ok('FNSKU verify checklist: pull ONE unit → if already FNSKU, nothing → else print N, cover, Transparency if enrolled', (() => { const c = runPreflight(firstFnsku).floor[0].checklist; const s = c.join(' '); return /Pull ONE unit/.test(s) && /already shows exactly that FNSKU: nothing to apply/.test(s) && s.includes('1920 FNSKU labels') && s.includes('X004ABCDEF') && /covering the existing barcode/.test(s) && /Transparency/.test(s) && /enrolled/.test(s) && c.findIndex((x) => /nothing to apply/.test(x)) < c.findIndex((x) => /Print 1920/.test(x)); })());
+ok('🔴 first shipment + UPC listing → ALSO verify (UPC must scan right), with the "do NOT ship, switch to FNSKU" branch', (() => { const r = runPreflight(firstUpc); const s = r.floor[0]?.checklist.join(' ') ?? ''; return r.floor.map((b) => b.code).join() === 'VERIFY_BARCODE_FIRST_SHIPMENT' && /810197341394/.test(s) && /no FNSKU stickers/.test(s) && /do NOT ship/.test(s); })());
+ok('summary names what Amazon requires', /FNSKU X004ABCDEF/.test(runPreflight(firstFnsku).floor[0].summary) && /UPC 810197341394/.test(runPreflight(firstUpc).floor[0].summary));
+ok('🔴 ADAPTACORE shape: SELLER_ONLY but shipped before → NO WO (floor already labels as routine)', codes({ ...firstFnsku, shippedBefore: true }).length === 0);
+ok('history unknown (probe failed) → NO WO', codes({ ...firstFnsku, shippedBefore: undefined }).length === 0);
+ok('not ready yet → no verify WO (stage 2 waits for stage 1)', !codes({ ...firstFnsku, inboundReady: false }).includes('VERIFY_BARCODE_FIRST_SHIPMENT'));
+
+// ── barcode conflict: ShipHero UPC ≠ Amazon UPC on a UPC listing → fires on EVERY shipment ──
+const wildYam: PreflightFacts = { ...good, labelOwnerConstraint: 'NONE_ONLY', shippedBefore: true, shipheroBarcode: '810197341394', amazonUpc: '810197342124' };
+ok('🔴 Wild Yam shape: UPC listing, ShipHero 810197341394 vs Amazon 810197342124 → UPC_MISMATCH even though shipped before', runPreflight(wildYam).floor.map((b) => b.code).join() === 'UPC_MISMATCH');
+ok('mismatch checklist: both numbers named, both branches (fix ShipHero / switch to FNSKU), office confirms before Complete', (() => { const s = runPreflight(wildYam).floor[0].checklist.join(' '); return s.includes('810197341394') && s.includes('810197342124') && /ShipHero record is wrong/.test(s) && /WRONG product/.test(s) && /switched to FNSKU/.test(s) && /office confirms/.test(s); })());
+ok('mismatch takes precedence over first-shipment verify (one WO, not two)', codes({ ...wildYam, shippedBefore: false }).join() === 'UPC_MISMATCH');
+ok('FNSKU listing ignores UPC mismatch (FNSKU covers the UPC anyway)', codes({ ...wildYam, labelOwnerConstraint: 'SELLER_ONLY' }).length === 0);
+ok('matching UPCs → no conflict', codes({ ...wildYam, amazonUpc: '810197341394' }).length === 0);
+ok('EAN-13 with leading 0 == UPC-A (no false conflict)', codes({ ...wildYam, amazonUpc: '0810197341394' }).length === 0);
+ok('either barcode unknown → no comparison, no conflict (fail open)', codes({ ...wildYam, amazonUpc: null }).length === 0 && codes({ ...wildYam, shipheroBarcode: null }).length === 0);
+ok('WO name for a barcode-only task is VERIFY BARCODE, not DATA FIX', buildPreflightWorkOrderText({ transferNumber: 'TR-00481', orderNumber: 'AMZ_WY_00481', sku: 's', quantity: 2016, blockers: runPreflight(wildYam).blockers }).name.startsWith('VERIFY BARCODE AMZ_WY_00481'));
+ok('WO name stays DATA FIX when data is also missing', buildPreflightWorkOrderText({ transferNumber: 'T', orderNumber: 'O', sku: 's', quantity: 1, blockers: runPreflight({ ...wildYam, lotNumber: null }).blockers }).name.startsWith('DATA FIX O'));
 
 // ── WO text ──
 const r = runPreflight({ ...good, casePack: null, productNote: null, lotNumber: null });

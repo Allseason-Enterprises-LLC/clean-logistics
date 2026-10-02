@@ -463,14 +463,14 @@ async function sendTelegramAlert(message: string): Promise<void> {
 /** Same rule as lookupSkuMapping (fba-orchestrator) but on the reconciler's own
  *  client — that module instantiates Supabase at import time and cannot be
  *  loaded offline. Prefer a non-FBM amazon_seller_sku; FNSKU from amazon_products. */
-async function resolveMappingWith(db: SupabaseClient, cin7Sku: string): Promise<{ amz_sku: string | null; amz_fnsku?: string | null } | null> {
-  const { data: rows, error } = await db.from('sku_master').select('amazon_seller_sku').eq('cin7_sku', cin7Sku);
+async function resolveMappingWith(db: SupabaseClient, cin7Sku: string): Promise<{ amz_sku: string | null; amz_fnsku?: string | null; amz_asin?: string | null } | null> {
+  const { data: rows, error } = await db.from('sku_master').select('amazon_seller_sku, amazon_asin').eq('cin7_sku', cin7Sku);
   if (error) throw new Error(`sku_master read failed: ${error.message}`);
   const preferred = (rows || []).find((r: any) => r.amazon_seller_sku && !String(r.amazon_seller_sku).toUpperCase().includes('-FBM-'))
     || (rows || []).find((r: any) => r.amazon_seller_sku);
   if (!preferred?.amazon_seller_sku) return null;
-  const { data: amz } = await db.from('amazon_products').select('fnsku').eq('seller_sku', preferred.amazon_seller_sku).eq('marketplace_id', 'ATVPDKIKX0DER').limit(1);
-  return { amz_sku: preferred.amazon_seller_sku, amz_fnsku: amz?.[0]?.fnsku || null };
+  const { data: amz } = await db.from('amazon_products').select('fnsku, asin').eq('seller_sku', preferred.amazon_seller_sku).eq('marketplace_id', 'ATVPDKIKX0DER').limit(1);
+  return { amz_sku: preferred.amazon_seller_sku, amz_fnsku: amz?.[0]?.fnsku || null, amz_asin: amz?.[0]?.asin || (preferred as any).amazon_asin || null };
 }
 
 /** Live preflight for a bridge row: same gate the sync uses. Fail CLOSED on

@@ -35,7 +35,8 @@ export type BlockerCode =
   | 'MISSING_EXPIRATION'     // lot exists but no expiration / no dated lot
   | 'NO_AMAZON_MAPPING'      // sku_master has no MSKU for the CIN7 SKU
   | 'OFFER_NOT_INBOUND_READY'// Amazon: "MSKUs are not available for inbound"
-  | 'NEEDS_FNSKU_LABELS';    // Amazon ready + labelOwner SELLER_ONLY → sticker every unit
+  | 'VERIFY_BARCODE_FIRST_SHIPMENT' // first FBA shipment: floor checks the unit's barcode vs what Amazon requires, then branches
+  | 'UPC_MISMATCH';          // ShipHero barcode ≠ Amazon listing UPC on a UPC-type listing → units would scan as the wrong product
 
 export interface Blocker {
   code: BlockerCode;
@@ -75,8 +76,19 @@ export interface PreflightFacts {
    * needless labelling WO on an established product is the worse error.
    */
   shippedBefore?: boolean;
+  /** Barcode on the ShipHero product record (what the warehouse scans). */
+  shipheroBarcode?: string | null;
+  /** UPC/EAN on the Amazon listing (listings report product-id / Listings API). */
+  amazonUpc?: string | null;
   /** Kit SKUs are handled by the kit gate; preflight still checks their data. */
   isKit?: boolean;
+}
+
+/** Digits-only compare; EAN-13 with a leading 0 equals the 12-digit UPC-A. */
+export function barcodesMatch(a: string | null | undefined, b: string | null | undefined): boolean | undefined {
+  const na = String(a ?? '').replace(/\D/g, ''); const nb = String(b ?? '').replace(/\D/g, '');
+  if (!na || !nb) return undefined;
+  return na.replace(/^0+/, '') === nb.replace(/^0+/, '');
 }
 
 export interface PreflightResult {
@@ -183,21 +195,66 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
     });
   }
 
-  // ── Second-stage floor WO once Amazon is ready and wants FNSKUs ────────
-  //    FIRST FBA shipment of the MSKU only. Established products already
-  //    carry their barcodes (the floor labels as routine); flagging every one
-  //    would park every transfer. Unknown history → assume established.
-  if (f.amazonMsku && f.inboundReady === true && f.labelOwnerConstraint === 'SELLER_ONLY' && f.shippedBefore === false) {
-    blockers.push({
-      code: 'NEEDS_FNSKU_LABELS', owner: 'floor',
-      summary: `FIRST FBA shipment of ${sku}: every unit needs an FNSKU label${f.fnsku ? ` (${f.fnsku})` : ''} before it ships`,
-      checklist: [
-        `Print ${f.quantity} FNSKU labels${f.fnsku ? ` for ${f.fnsku}` : ''}: Seller Central → Manage Inventory → ${f.amazonMsku} → Print item labels.`,
-        `Apply ONE FNSKU label to EVERY unit, covering the UPC barcode completely so only the FNSKU scans.`,
-        `If this product is enrolled in Amazon Transparency, also apply ONE Transparency code sticker to every unit (do not cover it).`,
-        `Pack back into cases and stage; the FBA box labels will post here once labelling is marked complete.`,
-      ],
-    });
+  // ── Barcode checks once Amazon is ready ────────────────────────────────
+  //    The system knows what Amazon REQUIRES (UPC vs FNSKU) but can never see
+  //    what is PRINTED on the unit. Weston 2026-10-01: "sometimes the products
+  //    are already preconfigured with the correct UPC or FNSKU barcode, but
+  //    sometimes not." So the floor VERIFIES one unit and branches — the WO is
+  //    a verification, not a blind "apply labels".
+  if (f.amazonMsku && f.inboundReady === true) {
+    const wantsFnsku = f.labelOwnerConstraint === 'SELLER_ONLY';
+    const upcMatch = barcodesMatch(f.shipheroBarcode, f.amazonUpc);
+    const required = wantsFnsku
+      ? `FNSKU${f.fnsku ? ` ${f.fnsku}` : ' (see Seller Central → Print item labels)'}`
+      : `UPC${f.amazonUpc ? ` ${f.amazonUpc}` : ''}`;
+    const printSteps = [
+      `Print ${f.quantity} FNSKU labels${f.fnsku ? ` for ${f.fnsku}` : ''}: Seller Central → Manage Inventory → ${f.amazonMsku} → Print item labels.`,
+      `Apply ONE FNSKU label to EVERY unit, covering the existing barcode completely so only the FNSKU scans.`,
+      `If this product is enrolled in Amazon Transparency, also apply ONE Transparency code sticker to every unit (do not cover it).`,
+    ];
+
+    // (a) UPC-type listing whose ShipHero barcode does not match Amazon's UPC:
+    //     units would be received as a different product. Fires on EVERY
+    //     shipment (not just the first) — it is a data conflict, not a habit.
+    if (!wantsFnsku && upcMatch === false) {
+      blockers.push({
+        code: 'UPC_MISMATCH', owner: 'floor',
+        summary: `Barcode conflict on ${sku}: ShipHero has UPC ${f.shipheroBarcode}, the Amazon listing has UPC ${f.amazonUpc}`,
+        checklist: [
+          `Pull ONE unit of ${sku} and read the barcode printed on it.`,
+          `If the unit shows ${f.amazonUpc} (Amazon's UPC): the ShipHero record is wrong. Tell the office to correct the ShipHero barcode to ${f.amazonUpc}, then mark this work order Complete.`,
+          `If the unit shows ${f.shipheroBarcode} or anything else: Amazon would receive it as the WRONG product. Do NOT ship on the UPC. Tell the office — the listing must be switched to FNSKU labels, then:`,
+          ...printSteps,
+          `Mark this work order Complete only after the office confirms which path was taken.`,
+        ],
+      });
+    }
+
+    // (b) FIRST FBA shipment of the MSKU: verify one unit, then branch.
+    //     Established products are not flagged (unknown history = established).
+    else if (f.shippedBefore === false) {
+      blockers.push({
+        code: 'VERIFY_BARCODE_FIRST_SHIPMENT', owner: 'floor',
+        summary: `FIRST FBA shipment of ${sku}: confirm the barcode on the unit is the one Amazon requires (${required})`,
+        checklist: wantsFnsku
+          ? [
+              `Amazon requires every unit to carry ${required}.`,
+              `Pull ONE unit of ${sku} and read the barcode printed on it.`,
+              `If it already shows exactly that FNSKU: nothing to apply. Mark this work order Complete.`,
+              `If it shows a different code or only a UPC:`,
+              ...printSteps,
+              `Then mark this work order Complete. The FBA box labels will post here within ~15 minutes.`,
+            ]
+          : [
+              `Amazon requires every unit to scan as ${required} (the product's own UPC — no FNSKU stickers).`,
+              `Pull ONE unit of ${sku} and read the barcode printed on it.`,
+              `If it shows exactly that UPC: nothing to apply. Mark this work order Complete.`,
+              `If it shows a different code, or a code that does not scan: do NOT ship. Tell the office — the listing must be switched to FNSKU labels, then:`,
+              ...printSteps,
+              `Then mark this work order Complete. The FBA box labels will post here within ~15 minutes.`,
+            ],
+      });
+    }
   }
 
   const floor = blockers.filter((b) => b.owner === 'floor');
@@ -225,10 +282,14 @@ export function buildPreflightWorkOrderText(args: {
   blockers: Blocker[];
 }): { name: string; instructions: string } {
   const floor = args.blockers.filter((b) => b.owner === 'floor');
-  const what = floor.map((b) => b.code.replace(/^MISSING_|^NEEDS_/, '').replace(/_/g, ' ').toLowerCase()).join(', ');
-  const name = `DATA FIX ${args.orderNumber || args.transferNumber} — ${what}`.slice(0, 120);
+  const label = (c: string) => c === 'VERIFY_BARCODE_FIRST_SHIPMENT' ? 'verify barcode (first FBA shipment)' : c === 'UPC_MISMATCH' ? 'barcode conflict' : c.replace(/^MISSING_/, '').replace(/_/g, ' ').toLowerCase();
+  const what = floor.map((b) => label(b.code)).join(', ');
+  const barcodeOnly = floor.length > 0 && floor.every((b) => b.code === 'VERIFY_BARCODE_FIRST_SHIPMENT' || b.code === 'UPC_MISMATCH');
+  const name = `${barcodeOnly ? 'VERIFY BARCODE' : 'DATA FIX'} ${args.orderNumber || args.transferNumber} — ${what}`.slice(0, 120);
   const L: string[] = [];
-  L.push(`FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the following is entered in ShipHero.`);
+  L.push(barcodeOnly
+    ? `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) is waiting on a barcode check. One unit, one minute.`
+    : `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the following is entered in ShipHero.`);
   L.push(`Product: ${args.sku} · ${args.quantity} units`);
   L.push('');
   let n = 1;

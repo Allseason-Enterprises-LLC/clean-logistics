@@ -17,7 +17,7 @@ async function main() {
   ok('product block: name, CIN7 SKU, ASIN, UPC', /<b>Product:<\/b> Clean Nutra NMN/.test(upc) && /<code>CN-BDL-CAP-NMNSUPP-60CT-2PK<\/code>/.test(upc) && /<b>ASIN:<\/b> <code>B0HJN6KKVK<\/code>/.test(upc) && /<b>UPC:<\/b> <code>810197342278<\/code>/.test(upc));
   ok('work order block: id, order number, TR, build qty, units total', /<b>Work Order:<\/b> <code>171102<\/code>/.test(upc) && /AMZ_NMNSUPP_00484/.test(upc) && /\(TR-00484\)/.test(upc) && /<b>100 × 2-Pack<\/b> \(200 units total\)/.test(upc));
   ok('priority HIGH / 1 business day', /HIGH/.test(upc) && /1 business day/.test(upc));
-  ok('🔴 step 2 says "UPC or FNSKU — may differ, please check Amazon" + shows what we found + links PNG', /<b>UPC or FNSKU<\/b> barcode — <b>may differ, please check Amazon<\/b>\. We found <b>UPC<\/b> <code>810197342278<\/code>/.test(upc) && /href="https:\/\/x\/barcode.png"/.test(upc));
+  ok('🔴 step 2: check ONE pack, "UPC or FNSKU — may differ, please check Amazon", shows what we found + PNG, then branch (already shows it → nothing / else label all)', /Check ONE finished pack.*<b>UPC or FNSKU<\/b> Amazon requires — <b>may differ, please check Amazon<\/b>\. We found <b>UPC<\/b> <code>810197342278<\/code>/.test(upc) && /href="https:\/\/x\/barcode.png"/.test(upc) && /already shows it, nothing to apply; if not, label every pack/.test(upc));
   ok('Transparency sticker instruction present', /Transparency/.test(upc));
   ok('non-pickable bulk bin + mark Complete steps', /non-pickable bulk bin/.test(upc) && /Mark work order <code>171102<\/code> <b>Complete<\/b>/.test(upc));
   ok('closing warning: labels not created until Complete', /<b>not<\/b> created until the work order is marked Complete/.test(upc));
@@ -30,7 +30,8 @@ async function main() {
 
   // ── notice: NO barcode known → Seller Central instruction ──
   const none = buildWorkOrderCreatedNotice({ ...base }, 'TR-1');
-  ok('🔴 no FNSKU/UPC -> "UPC or FNSKU … check Amazon" + Seller Central download', /<b>UPC or FNSKU<\/b> barcode — <b>may differ, please check Amazon<\/b>\. Download it from Seller Central/.test(none) && !/We found/.test(none));
+  ok('🔴 no FNSKU/UPC -> check ONE pack, "UPC or FNSKU … check Amazon", Seller Central download in the else-branch', /Check ONE finished pack.*<b>UPC or FNSKU<\/b> Amazon requires — <b>may differ, please check Amazon<\/b>\. If the pack already shows it, nothing to apply; if not, download the barcode from Seller Central/.test(none) && !/We found/.test(none));
+  ok('Transparency step says "if this product is enrolled"', /Transparency<\/b> sticker to each pack <b>if this product is enrolled<\/b>/.test(none));
 
   // ── ShipHero work order text carries the same instruction ──
   const wot = buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: 'AMZ_X_00001', kitSku: 'CN-BDL-X-2PK', qty: 10, packCount: 2 });

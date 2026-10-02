@@ -21,7 +21,7 @@
  */
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { isKitTransfer, type KitTransferVerdict } from './kit-detection';
-import { createAssemblyWorkOrder } from './shiphero-work-orders';
+import { createAssemblyWorkOrder, getNonPickableBulkUnits } from './shiphero-work-orders';
 import { resolveKitProductIdentity, renderBarcodePng, extractAsin, type KitProductIdentity } from './kit-product-identity';
 
 /** ShipHero GRAPH id for Clean Nutra LV (Warehouse:135872) — the UUID in
@@ -62,6 +62,8 @@ export interface GateResult {
   gated: boolean;
   verdict: KitTransferVerdict;
   workOrder?: WorkOrderState;
+  /** Set when a kit SKU was NOT gated because finished-pack stock already covers it. */
+  stockSatisfied?: Array<{ sku: string; quantity: number; bulk: number }>;
 }
 
 export interface GateDeps {
@@ -69,6 +71,9 @@ export interface GateDeps {
   shipheroToken: string;
   /** cin7 sku -> amazon msku (sku_master). Injected so tests are offline. */
   resolveAmazonSku: (cin7Sku: string) => Promise<string | null>;
+  /** Finished-pack stock in NON-pickable bulk for a kit SKU. Injected for tests;
+   *  defaults to the live ShipHero read. */
+  getBulk?: (token: string, sku: string) => Promise<{ bulk: number; pickable: number; rows: number }>;
   createWorkOrder?: typeof createAssemblyWorkOrder;
   /** Posts the "work order created" notice to the FBA channel. Optional; a
    *  failure here never blocks the gate (fail OPEN on notifications). */
@@ -126,13 +131,15 @@ export function buildWorkOrderCreatedNotice(state: WorkOrderState, transferNumbe
   // Weston 2026-09-27: always say "UPC or FNSKU (may differ — please check
   // Amazon)". We show the one we found, but the floor must confirm in Seller
   // Central which barcode Amazon actually requires for this ASIN.
+  // Weston 2026-10-01: verify, then branch — the pack may already carry the
+  // right barcode; the floor checks one finished pack before labelling all.
   if (state.barcode_kind && (state.fnsku || state.upc)) {
     const code = state.fnsku || state.upc;
-    L.push(`2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b>. We found <b>${esc(state.barcode_kind)}</b> <code>${esc(code!)}</code>${state.barcode_url ? ` — <a href="${state.barcode_url}">barcode PNG</a> (also attached to the ShipHero order)` : ''}`);
+    L.push(`2. Check ONE finished pack: it must scan as the <b>UPC or FNSKU</b> Amazon requires — <b>may differ, please check Amazon</b>. We found <b>${esc(state.barcode_kind)}</b> <code>${esc(code!)}</code>${state.barcode_url ? ` — <a href="${state.barcode_url}">barcode PNG</a> (also attached to the ShipHero order)` : ''}. If the pack already shows it, nothing to apply; if not, label every pack with it.`);
   } else {
-    L.push(`2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b>. Download it from Seller Central (Manage Inventory → Print item labels)`);
+    L.push(`2. Check ONE finished pack: it must scan as the <b>UPC or FNSKU</b> Amazon requires — <b>may differ, please check Amazon</b>. If the pack already shows it, nothing to apply; if not, download the barcode from Seller Central (Manage Inventory → Print item labels) and label every pack.`);
   }
-  L.push(`3. Apply the <b>Amazon Transparency</b> sticker to each pack (codes come from the Transparency program)`);
+  L.push(`3. Apply the <b>Amazon Transparency</b> sticker to each pack <b>if this product is enrolled</b> (codes come from the Transparency program)`);
   L.push(`4. Put finished packs in a <b>non-pickable bulk bin</b>`);
   L.push(`5. Mark work order <code>${woIds}</code> <b>Complete</b> in ShipHero`);
   L.push('');
@@ -199,6 +206,32 @@ export async function applyKitWorkOrderGate(
 
   const verdict = isKitTransfer(enriched);
   if (!verdict.isKit) return { gated: false, verdict };
+
+  // STOCK CHECK — a work order exists to BUILD packs. If the finished packs
+  // are already on the shelf (non-pickable bulk >= order qty), there is
+  // nothing to build: skip the WO and let the shipment fire. Weston
+  // 2026-09-29 (CARDIOZEN 2PK..6PK, 50 each, built before automation):
+  // "make sure it gets pushed through to shipment and doesn't create a work
+  // order". Systemic, not a one-off bypass: any pre-built pack passes.
+  // FAIL CLOSED: a failed stock read counts as 0 → gate as before.
+  const readBulk = deps.getBulk ?? getNonPickableBulkUnits;
+  const stockSatisfied: NonNullable<GateResult['stockSatisfied']> = [];
+  const stillNeedsWo: string[] = [];
+  for (const sku of verdict.kitSkus) {
+    const line = enriched.find((l) => l.sku === sku);
+    const qty = line?.quantity ?? 0;
+    let bulk = 0;
+    try { bulk = (await readBulk(deps.shipheroToken, sku)).bulk; }
+    catch (e: any) { console.warn(`[kit-gate] ${transfer.transferNumber}: bulk read failed for ${sku} (treating as 0): ${e?.message || e}`); }
+    if (qty > 0 && bulk >= qty) {
+      console.log(`[kit-gate] ${transfer.transferNumber}: ${sku} has ${bulk} finished packs in bulk >= ${qty} ordered — no work order needed`);
+      stockSatisfied.push({ sku, quantity: qty, bulk });
+    } else {
+      stillNeedsWo.push(sku);
+    }
+  }
+  if (stillNeedsWo.length === 0) return { gated: false, verdict, stockSatisfied };
+  verdict.kitSkus = stillNeedsWo;
 
   // Weston: one WO per transfer order (one TO per SKU in practice). If a
   // transfer somehow carries several kit lines, we still create ONE WO per
@@ -302,8 +335,8 @@ export function buildWorkOrdersDigestNotice(items: Array<{ state: WorkOrderState
   });
   L.push('<b>For each work order:</b>');
   L.push('1. Kit the packs as specified in the work order');
-  L.push('2. Label each finished pack with the <b>UPC or FNSKU</b> barcode — <b>may differ, please check Amazon</b> (barcodes above are also attached to each ShipHero order)');
-  L.push('3. Apply the <b>Amazon Transparency</b> sticker to each pack');
+  L.push('2. Check ONE finished pack: it must scan as the <b>UPC or FNSKU</b> Amazon requires — <b>may differ, please check Amazon</b> (barcodes above are also attached to each ShipHero order). Already correct → nothing to apply; otherwise label every pack');
+  L.push('3. Apply the <b>Amazon Transparency</b> sticker to each pack <b>if this product is enrolled</b>');
   L.push('4. Put finished packs in a <b>non-pickable bulk bin</b>');
   L.push('5. Mark the work order <b>Complete</b> in ShipHero');
   L.push('');
