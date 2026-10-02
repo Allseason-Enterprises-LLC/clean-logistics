@@ -36,11 +36,15 @@ ok('not-ready checklist points at Seller Central Offer tab + barcode type', runP
 ok('inboundReady undefined (not checked) → does NOT block (fail open on the unknown)', runPreflight({ ...good, inboundReady: undefined }).ok);
 ok('mapping missing AND not ready → only the mapping blocker (fix order matters)', codes({ ...good, amazonMsku: null, inboundReady: false }).join() === 'NO_AMAZON_MAPPING');
 
-// ── second stage: FNSKU labels ──
-ok('🔴 ready + SELLER_ONLY → NEEDS_FNSKU_LABELS as a FLOOR blocker', (() => { const r = runPreflight({ ...good, labelOwnerConstraint: 'SELLER_ONLY', fnsku: 'X004ABCDEF' }); return r.floor.map((b) => b.code).join() === 'NEEDS_FNSKU_LABELS'; })());
-ok('FNSKU checklist: print N labels, cover UPC, Transparency if enrolled', (() => { const c = runPreflight({ ...good, labelOwnerConstraint: 'SELLER_ONLY', fnsku: 'X004ABCDEF' }).floor[0].checklist.join(' '); return c.includes('1920 FNSKU labels') && c.includes('X004ABCDEF') && /covering the UPC/.test(c) && /Transparency/.test(c) && /enrolled/.test(c); })());
-ok('ready + NONE_ONLY (UPC) → no label WO', codes({ ...good, labelOwnerConstraint: 'NONE_ONLY' }).length === 0);
-ok('not ready yet → no FNSKU WO even if SELLER_ONLY (stage 2 waits for stage 1)', !codes({ ...good, inboundReady: false, labelOwnerConstraint: 'SELLER_ONLY' }).includes('NEEDS_FNSKU_LABELS'));
+// ── second stage: FNSKU labels — FIRST shipment only (Weston 2026-10-01) ──
+const firstShip: PreflightFacts = { ...good, labelOwnerConstraint: 'SELLER_ONLY', fnsku: 'X004ABCDEF', shippedBefore: false };
+ok('🔴 ready + SELLER_ONLY + never shipped → NEEDS_FNSKU_LABELS as a FLOOR blocker', runPreflight(firstShip).floor.map((b) => b.code).join() === 'NEEDS_FNSKU_LABELS');
+ok('FNSKU checklist: print N labels, cover UPC, Transparency if enrolled', (() => { const c = runPreflight(firstShip).floor[0].checklist.join(' '); return c.includes('1920 FNSKU labels') && c.includes('X004ABCDEF') && /covering the UPC/.test(c) && /Transparency/.test(c) && /enrolled/.test(c); })());
+ok('summary says FIRST FBA shipment', /FIRST FBA shipment/.test(runPreflight(firstShip).floor[0].summary));
+ok('🔴 ADAPTACORE shape: SELLER_ONLY but shipped before → NO label WO (floor already labels as routine)', codes({ ...firstShip, shippedBefore: true }).length === 0);
+ok('history unknown (probe failed) → NO label WO (needless WO on an established product is the worse error)', codes({ ...firstShip, shippedBefore: undefined }).length === 0);
+ok('ready + NONE_ONLY (UPC) → no label WO even on first shipment', codes({ ...good, labelOwnerConstraint: 'NONE_ONLY', shippedBefore: false }).length === 0);
+ok('not ready yet → no FNSKU WO even if SELLER_ONLY + first (stage 2 waits for stage 1)', !codes({ ...firstShip, inboundReady: false }).includes('NEEDS_FNSKU_LABELS'));
 
 // ── WO text ──
 const r = runPreflight({ ...good, casePack: null, productNote: null, lotNumber: null });

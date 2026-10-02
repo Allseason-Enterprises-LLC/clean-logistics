@@ -22,7 +22,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { readWorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate, clearMarketingHold, type PreflightGateResult } from './fba-preflight-gate';
-import { gatherPreflightFacts } from './fba-preflight-facts';
+import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
 import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
@@ -488,7 +488,7 @@ async function livePreflight(db: SupabaseClient, row: any): Promise<PreflightGat
         supabase: db,
         shipheroToken: token,
         gatherFacts: (sku, qty) => gatherPreflightFacts(
-          { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s) },
+          { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s), hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(db, s, row.cin7_transfer_number) },
           sku, qty
         ),
         sendTelegram: async (html) => { await sendTelegramAlert(html); return true; },

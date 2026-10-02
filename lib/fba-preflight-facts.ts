@@ -10,6 +10,7 @@
 import { getShipHeroProductData } from './shiphero-product-data';
 import { callAmazonSpApi, SpApiError } from './amazon-sp-api-client';
 import type { PreflightFacts } from './fba-preflight';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 const MARKETPLACE_ID = 'ATVPDKIKX0DER';
 const FBA_INBOUND_BASE = '/inbound/fba/2024-03-20';
@@ -41,11 +42,48 @@ export async function probeAmazonReadiness(msku: string, api: typeof callAmazonS
   }
 }
 
+/**
+ * Has Amazon EVER held FBA inventory for this MSKU? The FBA inventory summary
+ * lists an MSKU as soon as any inbound has been received (even if 0 now). This
+ * is Amazon's own record of "we've sent this in before".
+ *   true  → a summary row exists for the MSKU
+ *   false → Amazon returned OK and no row
+ *   undefined → call failed (caller treats as shipped-before: no WO)
+ */
+export async function amazonHasShippedBefore(msku: string, api: typeof callAmazonSpApi = callAmazonSpApi): Promise<boolean | undefined> {
+  try {
+    const res = await api<any>({
+      method: 'GET', region: 'na', path: '/fba/inventory/v1/summaries',
+      query: { granularityType: 'Marketplace', granularityId: MARKETPLACE_ID, marketplaceIds: MARKETPLACE_ID, sellerSkus: msku, details: 'false' },
+    });
+    const rows: any[] = res.data?.payload?.inventorySummaries ?? [];
+    return rows.some((r) => r.sellerSku === msku);
+  } catch (err: any) {
+    console.warn(`[preflight] FBA inventory history probe for ${msku} failed (${err?.status ?? ''} ${err?.message ?? err}) — assuming shipped before`);
+    return undefined;
+  }
+}
+
+/** Our record: any non-cancelled fba_shipments row for this CIN7 SKU on a
+ *  transfer other than the one being evaluated. */
+export async function hasPriorFbaShipmentRow(db: SupabaseClient, cin7Sku: string, excludeTransferNumber: string): Promise<boolean> {
+  const bare = excludeTransferNumber.replace(/^CIN7-/, '');
+  const { data, error } = await db.from('fba_shipments').select('id')
+    .eq('cin7_sku', cin7Sku).not('status', 'in', '("cancelled","failed","voided")')
+    .neq('cin7_transfer_number', `CIN7-${bare}`).limit(1);
+  if (error) throw new Error(`fba_shipments history read failed: ${error.message}`);
+  return (data?.length ?? 0) > 0;
+}
+
 export interface GatherDeps {
   shipheroToken: string;
   resolveAmazonSku: (cin7Sku: string) => Promise<{ amz_sku: string | null; amz_fnsku?: string | null } | null>;
+  /** Our own record: a non-cancelled fba_shipments row exists for this CIN7 SKU
+   *  on a DIFFERENT transfer. Injected (DB). Optional. */
+  hasPriorShipmentRow?: (cin7Sku: string) => Promise<boolean>;
   getProductData?: typeof getShipHeroProductData;
   probeReadiness?: typeof probeAmazonReadiness;
+  shippedBeforeOnAmazon?: typeof amazonHasShippedBefore;
 }
 
 export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quantity: number): Promise<PreflightFacts> {
@@ -87,6 +125,17 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
     const r = await (deps.probeReadiness ?? probeAmazonReadiness)(facts.amazonMsku);
     facts.inboundReady = r.inboundReady;
     facts.labelOwnerConstraint = r.labelOwnerConstraint;
+
+    // First-shipment detection — only matters when Amazon wants seller FNSKUs.
+    // Either record (ours or Amazon's) saying "shipped before" wins; an
+    // inconclusive probe also counts as shipped-before (no needless WO).
+    if (r.inboundReady === true && r.labelOwnerConstraint === 'SELLER_ONLY') {
+      let ours: boolean | undefined;
+      try { ours = deps.hasPriorShipmentRow ? await deps.hasPriorShipmentRow(sku) : undefined; }
+      catch (e: any) { console.warn(`[preflight] prior-shipment lookup failed for ${sku}: ${e?.message || e}`); }
+      const amazon = await (deps.shippedBeforeOnAmazon ?? amazonHasShippedBefore)(facts.amazonMsku);
+      facts.shippedBefore = ours === true || amazon === true ? true : (ours === false && amazon === false) ? false : undefined;
+    }
   }
   return facts;
 }

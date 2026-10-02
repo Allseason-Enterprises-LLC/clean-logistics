@@ -11,7 +11,7 @@ import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
 import { applyKitWorkOrderGate, buildWorkOrdersDigestNotice, type WorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate } from './fba-preflight-gate';
-import { gatherPreflightFacts } from './fba-preflight-facts';
+import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
 import { sendTelegram } from './fba-post-process';
 import { resolveKitProductIdentity } from './kit-product-identity';
 import { attachKitBarcode } from './kit-barcode-attach';
@@ -827,6 +827,7 @@ export async function syncCIN7LasVegasTransferOrders(
                       {
                         shipheroToken: shipHeroWarehouse.credentials.accessToken,
                         resolveAmazonSku: async (s) => { const m = await lookupSkuMapping(s); return m ? { amz_sku: m.amz_sku ?? null, amz_fnsku: m.amz_fnsku ?? null } : null; },
+                        hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(supabase, s, transfer.transferNumber),
                       },
                       sku, qty
                     ),

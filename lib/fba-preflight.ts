@@ -66,6 +66,15 @@ export interface PreflightFacts {
   /** From prepDetails.labelOwnerConstraint. SELLER_ONLY → we sticker FNSKUs. */
   labelOwnerConstraint?: 'SELLER_ONLY' | 'AMAZON_ONLY' | 'NONE_ONLY' | string | null;
   fnsku?: string | null;
+  /**
+   * Has this MSKU EVER been shipped to FBA before (Amazon FBA inventory has a
+   * record, or our fba_shipments has a non-cancelled row)? Weston 2026-10-01:
+   * "it's only usually for first orders that we have to flag this — if we've
+   * sent in inventory before, they should already have barcodes on them."
+   * undefined = could not determine → treat as shipped-before (no WO): a
+   * needless labelling WO on an established product is the worse error.
+   */
+  shippedBefore?: boolean;
   /** Kit SKUs are handled by the kit gate; preflight still checks their data. */
   isKit?: boolean;
 }
@@ -175,10 +184,13 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
   }
 
   // ── Second-stage floor WO once Amazon is ready and wants FNSKUs ────────
-  if (f.amazonMsku && f.inboundReady === true && f.labelOwnerConstraint === 'SELLER_ONLY') {
+  //    FIRST FBA shipment of the MSKU only. Established products already
+  //    carry their barcodes (the floor labels as routine); flagging every one
+  //    would park every transfer. Unknown history → assume established.
+  if (f.amazonMsku && f.inboundReady === true && f.labelOwnerConstraint === 'SELLER_ONLY' && f.shippedBefore === false) {
     blockers.push({
       code: 'NEEDS_FNSKU_LABELS', owner: 'floor',
-      summary: `Every unit of ${sku} needs an FNSKU label${f.fnsku ? ` (${f.fnsku})` : ''} before it ships`,
+      summary: `FIRST FBA shipment of ${sku}: every unit needs an FNSKU label${f.fnsku ? ` (${f.fnsku})` : ''} before it ships`,
       checklist: [
         `Print ${f.quantity} FNSKU labels${f.fnsku ? ` for ${f.fnsku}` : ''}: Seller Central → Manage Inventory → ${f.amazonMsku} → Print item labels.`,
         `Apply ONE FNSKU label to EVERY unit, covering the UPC barcode completely so only the FNSKU scans.`,
