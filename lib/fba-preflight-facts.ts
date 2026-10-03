@@ -86,6 +86,9 @@ export interface GatherDeps {
   resolveAmazonSku: (cin7Sku: string) => Promise<{ amz_sku: string | null; amz_fnsku?: string | null; amz_asin?: string | null } | null>;
   /** ASIN → Amazon catalog UPC/EAN. Defaults to kit-product-identity.catalogIdentity. Fail-open. */
   amazonUpcForAsin?: (asin: string) => Promise<string | null>;
+  /** When sku_master has no row: ask Amazon directly (offer with MSKU == CIN7
+   *  SKU whose UPC matches the ShipHero barcode). Optional; null = still unmapped. */
+  autoResolve?: (cin7Sku: string, shipheroBarcode: string | null | undefined) => Promise<{ amz_sku: string; amz_asin: string | null; amz_fnsku: string | null } | null>;
   /** Our own record: a non-cancelled fba_shipments row exists for this CIN7 SKU
    *  on a DIFFERENT transfer. Injected (DB). Optional. */
   hasPriorShipmentRow?: (cin7Sku: string) => Promise<boolean>;
@@ -138,7 +141,13 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
   // sku_master — null row = NO_AMAZON_MAPPING.
   let asin: string | null = null;
   try {
-    const m = await deps.resolveAmazonSku(sku);
+    let m = await deps.resolveAmazonSku(sku);
+    if (!m?.amz_sku && deps.autoResolve) {
+      // sku_master has nothing — before declaring "no mapping" and paging
+      // marketing, ask Amazon whether it already has this exact SKU.
+      try { m = await deps.autoResolve(sku, facts.shipheroBarcode); }
+      catch (e: any) { console.warn(`[preflight] auto-resolve threw for ${sku}: ${e?.message || e}`); }
+    }
     facts.amazonMsku = m?.amz_sku ?? null;
     facts.fnsku = m?.amz_fnsku ?? null;
     asin = m?.amz_asin ?? null;

@@ -24,6 +24,7 @@ import { readWorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate, clearMarketingHold, type PreflightGateResult } from './fba-preflight-gate';
 import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
 import { sendTelegram as sendFbaTelegram } from './fba-post-process';
+import { autoResolveAmazonSku } from './amazon-auto-map';
 import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
@@ -489,7 +490,7 @@ export async function livePreflight(db: SupabaseClient, row: any): Promise<Prefl
         supabase: db,
         shipheroToken: token,
         gatherFacts: (sku, qty) => gatherPreflightFacts(
-          { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s), hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(db, s, row.cin7_transfer_number) },
+          { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s), hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(db, s, row.cin7_transfer_number), autoResolve: (s, bc) => autoResolveAmazonSku({ cin7Sku: s, shipheroBarcode: bc, db }) },
           sku, qty
         ),
         // FBA channel, HTML — the same proven sender post-process uses. NOT
@@ -501,6 +502,8 @@ export async function livePreflight(db: SupabaseClient, row: any): Promise<Prefl
       {
         id: row.cin7_transfer_id, transferNumber: row.cin7_transfer_number, destinationName: row.cin7_destination,
         lines, shipheroOrderNumber: row.shiphero_order_number ?? null,
+        existingHold: row.request_payload?.preflight_hold ?? null,
+        existingWorkOrder: readWorkOrderState(row.request_payload),
       }
     );
   } catch (e: any) {

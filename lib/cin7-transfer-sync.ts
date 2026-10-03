@@ -12,6 +12,7 @@ import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin
 import { applyKitWorkOrderGate, buildWorkOrdersDigestNotice, type WorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate } from './fba-preflight-gate';
 import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
+import { autoResolveAmazonSku } from './amazon-auto-map';
 import { sendTelegram } from './fba-post-process';
 import { resolveKitProductIdentity } from './kit-product-identity';
 import { attachKitBarcode } from './kit-barcode-attach';
@@ -828,6 +829,7 @@ export async function syncCIN7LasVegasTransferOrders(
                         shipheroToken: shipHeroWarehouse.credentials.accessToken,
                         resolveAmazonSku: async (s) => { const m = await lookupSkuMapping(s); return m ? { amz_sku: m.amz_sku ?? null, amz_fnsku: m.amz_fnsku ?? null, amz_asin: m.amz_asin ?? null } : null; },
                         hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(supabase, s, transfer.transferNumber),
+                        autoResolve: (s, bc) => autoResolveAmazonSku({ cin7Sku: s, shipheroBarcode: bc, db: supabase }),
                       },
                       sku, qty
                     ),

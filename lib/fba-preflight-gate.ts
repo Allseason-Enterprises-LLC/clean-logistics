@@ -51,6 +51,10 @@ export async function applyPreflightGate(
     destinationName?: string | null;
     lines: Array<{ sku: string; quantity: number }>;
     shipheroOrderNumber?: string | null;
+    /** request_payload.preflight_hold already on the row, if any (dedupes the notice). */
+    existingHold?: MarketingHold | null;
+    /** request_payload.work_order already on the row, if any (dedupes the WO). */
+    existingWorkOrder?: WorkOrderState | null;
   }
 ): Promise<PreflightGateResult> {
   // One preflight per line; a transfer is one SKU in practice but stay honest.
@@ -71,11 +75,18 @@ export async function applyPreflightGate(
   const nowIso = (deps.now ?? (() => new Date()))().toISOString();
   const primary = results.find((x) => !x.r.ok) ?? results[0];
 
+  // ONE notice per hold. The reconciler re-runs preflight every tick; if the
+  // row already carries a preflight_hold with the SAME codes, the floor and
+  // marketing have already been told — refresh the hold silently.
+  // (2026-10-03: TR-00484/00489 each got the ⏸ notice twice in 15 minutes.)
+  const existingHold: MarketingHold | undefined = transfer.existingHold ?? undefined;
+  const sameHold = !!existingHold && JSON.stringify([...existingHold.codes].sort()) === JSON.stringify(merged.marketing.map((b) => b.code).sort());
+
   // ── Marketing first: if the listing is the problem, a floor WO for data
   //    entry is still useful, but the FNSKU stage must wait. Post the notice
-  //    regardless; the floor WO (if any) is created below.
+  //    (once); the floor WO (if any) is created below.
   let marketingNotified = false;
-  if (merged.marketing.length > 0 && deps.sendTelegram) {
+  if (merged.marketing.length > 0 && deps.sendTelegram && !sameHold) {
     try {
       marketingNotified = await deps.sendTelegram(buildMarketingHoldNotice({
         transferNumber: transfer.transferNumber, orderNumber: transfer.shipheroOrderNumber ?? null,
@@ -86,8 +97,15 @@ export async function applyPreflightGate(
     }
   }
 
-  // ── Floor: ONE custom WO with every floor blocker's checklist.
+  // ── Floor: ONE custom WO with every floor blocker's checklist. If the row
+  //    already carries an open preflight WO for the SAME reason, don't create
+  //    another (the poller re-runs preflight at release; same blockers → same WO).
   let state: WorkOrderState | undefined;
+  const reasonNow = preflightReason(merged);
+  const openSame = transfer.existingWorkOrder && transfer.existingWorkOrder.status !== 'COMPLETED' && transfer.existingWorkOrder.reason === reasonNow ? transfer.existingWorkOrder : null;
+  if (merged.floor.length > 0 && openSame) {
+    return { gated: true, result: merged, workOrder: openSame, marketingNotified, hold: 'floor' };
+  }
   if (merged.floor.length > 0) {
     const text = buildPreflightWorkOrderText({
       transferNumber: transfer.transferNumber, orderNumber: transfer.shipheroOrderNumber,
@@ -123,7 +141,7 @@ export async function applyPreflightGate(
   // ── Marketing-only hold: no WO. Park with a hold marker the reconciler
   //    honours; it clears itself when preflight passes on a later tick.
   await parkMarketingHold(deps.supabase, transfer.id, transfer.destinationName || '', {
-    since: nowIso, codes: merged.marketing.map((b) => b.code), summary: merged.marketing.map((b) => b.summary).join('; '),
+    since: existingHold?.since ?? nowIso, codes: merged.marketing.map((b) => b.code), summary: merged.marketing.map((b) => b.summary).join('; '),
   });
   return { gated: true, result: merged, marketingNotified, hold: 'marketing' };
 }
