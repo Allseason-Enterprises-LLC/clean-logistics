@@ -10,7 +10,8 @@ import * as path from 'path';
 // through a tiny re-implementation guard: instead we validate via the API using
 // a payload built from the same shapes the builder produces.
 const mod = fs.readFileSync(path.join(__dirname, '../lib/fba-post-process.ts'), 'utf8');
-if (!mod.includes("parse_mode: 'HTML'")) throw new Error('sendTelegram is not using HTML');
+// Default parse mode is HTML (parameterised 2026-10-03 so legacy Markdown alerts can share the sender).
+if (!mod.includes("parseMode: 'HTML' | 'Markdown' = 'HTML'") || !mod.includes('parse_mode: parseMode')) throw new Error('sendTelegram is not defaulting to HTML');
 if (mod.includes("parse_mode: 'Markdown'")) throw new Error('Markdown still present');
 if (!mod.includes('function esc(')) throw new Error('esc() helper missing');
 

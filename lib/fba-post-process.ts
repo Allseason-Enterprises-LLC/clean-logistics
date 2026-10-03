@@ -550,7 +550,19 @@ export function shouldSkipTelegramAsAlreadyNotified(r: { attachmentsCreated: num
   return r.labels.length > 0 && r.attachmentsCreated === 0 && r.attachmentsSkipped >= r.labels.length;
 }
 
-export async function sendTelegram(text: string): Promise<boolean> {
+/**
+ * Markdown-flavoured alert → same channel, same guard rails. Exists so the
+ * four hand-rolled senders (reconciler, auto-submit, two health crons) that
+ * read TELEGRAM_FBA_CHAT_ID from env — stale on Vercel, so their messages
+ * silently went nowhere on 2026-10-03 — can be deleted. New code should use
+ * sendTelegram (HTML). `_test-single-telegram-sender.ts` fails the build on
+ * any other api.telegram.org call under lib/ or api/.
+ */
+export async function sendTelegramMarkdown(text: string): Promise<boolean> {
+  return sendTelegram(text, 'Markdown');
+}
+
+export async function sendTelegram(text: string, parseMode: 'HTML' | 'Markdown' = 'HTML'): Promise<boolean> {
   const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
   const chatId = resolveFbaChatId();
   if (!botToken || !chatId) {
@@ -569,7 +581,7 @@ export async function sendTelegram(text: string): Promise<boolean> {
       body: JSON.stringify({
         chat_id: chatId,
         text,
-        parse_mode: 'HTML',
+        parse_mode: parseMode,
         disable_web_page_preview: true,
       }),
     });

@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import { getShipHeroProductData, getShipHeroToken, getLotBreakdown } from '../../lib/shiphero-product-data';
 import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from '../../lib/lot-allocation';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
-import { postProcessFbaShipment } from '../../lib/fba-post-process';
+import { postProcessFbaShipment, sendTelegramMarkdown } from '../../lib/fba-post-process';
 import { PartneredUnavailableError } from '../../lib/fba-inbound';
 import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
@@ -23,21 +23,9 @@ function requireAuth(req: VercelRequest, res: VercelResponse): boolean {
  * never thrown, so an alert outage doesn't compound a real failure.
  */
 async function sendFbaAlert(text: string): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
-  if (!botToken || !chatId) {
-    console.warn('[fba-auto] Telegram env vars not set — skipping alert');
-    return;
-  }
   try {
-    const resp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
-    });
-    if (!resp.ok) {
-      console.error('[fba-auto] Telegram alert failed:', resp.status, (await resp.text()).slice(0, 300));
-    }
+    const ok = await sendTelegramMarkdown(text); // one sender, hardcoded channel (2026-10-03)
+    if (!ok) console.error('[fba-auto] Telegram alert was not delivered');
   } catch (err: any) {
     console.error('[fba-auto] Telegram alert threw:', err?.message);
   }

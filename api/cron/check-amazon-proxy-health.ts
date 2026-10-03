@@ -13,21 +13,15 @@
  */
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
+import { sendTelegramMarkdown } from '../../lib/fba-post-process';
 
 export const config = { maxDuration: 60 };
 
 const SUPABASE_PROJECT_REF = 'gvrwkjmmgohtovtcyjiu';
 
 async function sendTelegramAlert(message: string): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
-  if (!token || !chatId) return;
   try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'Markdown' }),
-    });
+    await sendTelegramMarkdown(message); // one sender, hardcoded channel (2026-10-03)
   } catch (err: any) {
     console.warn('[health] Telegram alert failed:', err?.message || err);
   }

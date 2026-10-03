@@ -17,6 +17,7 @@
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { refreshShipHeroTokenIfNeeded } from '../../lib/shiphero-auth';
+import { sendTelegramMarkdown } from '../../lib/fba-post-process';
 
 function authorized(req: VercelRequest): boolean {
   if (req.headers['x-vercel-cron'] === '1' && process.env.VERCEL === '1') {
@@ -29,25 +30,8 @@ function authorized(req: VercelRequest): boolean {
 }
 
 async function alertTelegram(message: string): Promise<void> {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
-  if (!botToken || !chatId) {
-    console.warn(
-      '[refresh-shiphero-token] No Telegram creds — skipping alert'
-    );
-    return;
-  }
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-      }),
-    });
+    await sendTelegramMarkdown(message); // one sender, hardcoded channel (2026-10-03)
   } catch (err) {
     console.error('[refresh-shiphero-token] Telegram alert failed:', err);
   }

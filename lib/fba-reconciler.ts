@@ -23,7 +23,7 @@ import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { readWorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate, clearMarketingHold, type PreflightGateResult } from './fba-preflight-gate';
 import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
-import { sendTelegram as sendFbaTelegram } from './fba-post-process';
+import { sendTelegram as sendFbaTelegram, sendTelegramMarkdown } from './fba-post-process';
 import { autoResolveAmazonSku } from './amazon-auto-map';
 import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
@@ -447,16 +447,13 @@ async function findLivePlanOnCancelledRows(
   return null;
 }
 
+/** All reconciler alerts go through the ONE channel sender (hardcoded chat id).
+ *  The old inline fetch read TELEGRAM_FBA_CHAT_ID from env — stale on Vercel —
+ *  so config-error escalations were silently lost. */
 async function sendTelegramAlert(message: string): Promise<void> {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_FBA_CHAT_ID?.trim();
-  if (!token || !chatId) return;
   try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'Markdown' }),
-    });
+    const ok = await sendTelegramMarkdown(message);
+    if (!ok) console.warn('[reconciler] Telegram alert was not delivered');
   } catch (err: any) {
     console.warn('[reconciler] Telegram alert failed:', err?.message || err);
   }
