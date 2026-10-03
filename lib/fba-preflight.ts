@@ -33,6 +33,7 @@ export type BlockerCode =
   | 'MISSING_BOX_WEIGHT'     // product_note lacks "Box Weight"
   | 'MISSING_LOT'            // no lot on the SKU in ShipHero
   | 'MISSING_EXPIRATION'     // lot exists but no expiration / no dated lot
+  | 'STOCK_NOT_IN_BULK'      // not enough lot-tracked units in NON-pickable bins to fill the order in whole cases
   | 'NO_AMAZON_MAPPING'      // sku_master has no MSKU for the CIN7 SKU
   | 'OFFER_NOT_INBOUND_READY'// Amazon: "MSKUs are not available for inbound"
   | 'VERIFY_BARCODE_FIRST_SHIPMENT' // first FBA shipment: floor checks the unit's barcode vs what Amazon requires, then branches
@@ -76,6 +77,12 @@ export interface PreflightFacts {
    * needless labelling WO on an established product is the worse error.
    */
   shippedBefore?: boolean;
+  /** Lot-tracked units in NON-pickable (bulk) bins, by lot — what FBA plans against.
+   *  undefined = not read (don't block). */
+  bulkLots?: Array<{ name: string; availableQty: number; expiresAt: string }>;
+  /** Units sitting in pickable DTC bins (excluded from FBA planning) — so the
+   *  WO can say where the stock actually is. */
+  pickableUnits?: number;
   /** Barcode on the ShipHero product record (what the warehouse scans). */
   shipheroBarcode?: string | null;
   /** UPC/EAN on the Amazon listing (listings report product-id / Listings API). */
@@ -170,6 +177,34 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
         `ShipHero → Products → ${sku} → Lots → ${f.lotNumber} → set the expiration date.`,
       ],
     });
+  }
+
+  // ── Stock position (floor) — the allocator plans FBA against NON-pickable
+  //    bulk bins only, in whole cases. TR-00509/00510/00516 (2026-10-02/03):
+  //    stock was on hand but in pickable DTC bins → "Insufficient lot-tracked
+  //    stock" 9–13× each, silently. Moving cases is a floor job → WO.
+  if (cp && cp.caseQuantity > 0 && Array.isArray(f.bulkLots)) {
+    const caseQty = cp.caseQuantity;
+    const bulkCases = f.bulkLots.reduce((n, l) => n + Math.floor(l.availableQty / caseQty), 0);
+    const needCases = Math.ceil(f.quantity / caseQty);
+    if (bulkCases < needCases) {
+      const shortCases = needCases - bulkCases;
+      const bulkUnits = f.bulkLots.reduce((n, l) => n + l.availableQty, 0);
+      const lots = f.bulkLots.filter((l) => l.availableQty > 0).map((l) => `${l.name}=${l.availableQty}`).join(', ') || 'none';
+      const pick = f.pickableUnits ?? 0;
+      blockers.push({
+        code: 'STOCK_NOT_IN_BULK', owner: 'floor',
+        summary: `Only ${bulkUnits} units (${bulkCases} full cases) of ${sku} are in bulk bins; the order needs ${f.quantity} (${needCases} cases)`,
+        checklist: [
+          `FBA shipments are built from NON-pickable bulk bins (A-prefix) only, in full cases of ${caseQty}. Bulk currently holds: ${lots}.`,
+          pick > 0
+            ? `${pick} units are sitting in pickable DTC pick bins (B-prefix). Move ${shortCases} full case(s) (${shortCases * caseQty} units) of ${sku} from the pick bin into a non-pickable bulk bin, keeping the lot on the move.`
+            : `Bring ${shortCases} full case(s) (${shortCases * caseQty} units) of ${sku} into a non-pickable bulk bin with the lot assigned — if there is no more stock, tell the office the order must be reduced.`,
+          `In ShipHero, confirm the bulk bin now shows the moved quantity under the correct lot.`,
+          `Mark this work order Complete. The system re-reads bulk stock and creates the shipment.`,
+        ],
+      });
+    }
   }
 
   // ── Amazon side (marketing) ────────────────────────────────────────────
@@ -282,14 +317,17 @@ export function buildPreflightWorkOrderText(args: {
   blockers: Blocker[];
 }): { name: string; instructions: string } {
   const floor = args.blockers.filter((b) => b.owner === 'floor');
-  const label = (c: string) => c === 'VERIFY_BARCODE_FIRST_SHIPMENT' ? 'verify barcode (first FBA shipment)' : c === 'UPC_MISMATCH' ? 'barcode conflict' : c.replace(/^MISSING_/, '').replace(/_/g, ' ').toLowerCase();
+  const label = (c: string) => c === 'VERIFY_BARCODE_FIRST_SHIPMENT' ? 'verify barcode (first FBA shipment)' : c === 'UPC_MISMATCH' ? 'barcode conflict' : c === 'STOCK_NOT_IN_BULK' ? 'move stock to bulk' : c.replace(/^MISSING_/, '').replace(/_/g, ' ').toLowerCase();
   const what = floor.map((b) => label(b.code)).join(', ');
   const barcodeOnly = floor.length > 0 && floor.every((b) => b.code === 'VERIFY_BARCODE_FIRST_SHIPMENT' || b.code === 'UPC_MISMATCH');
-  const name = `${barcodeOnly ? 'VERIFY BARCODE' : 'DATA FIX'} ${args.orderNumber || args.transferNumber} — ${what}`.slice(0, 120);
+  const stockOnly = floor.length > 0 && floor.every((b) => b.code === 'STOCK_NOT_IN_BULK');
+  const name = `${barcodeOnly ? 'VERIFY BARCODE' : stockOnly ? 'MOVE STOCK' : 'DATA FIX'} ${args.orderNumber || args.transferNumber} — ${what}`.slice(0, 120);
   const L: string[] = [];
   L.push(barcodeOnly
     ? `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) is waiting on a barcode check. One unit, one minute.`
-    : `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the following is entered in ShipHero.`);
+    : stockOnly
+      ? `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the stock is in a bulk bin.`
+      : `FBA shipment ${args.orderNumber || args.transferNumber} (${args.transferNumber}) cannot be created until the following is entered in ShipHero.`);
   L.push(`Product: ${args.sku} · ${args.quantity} units`);
   L.push('');
   let n = 1;

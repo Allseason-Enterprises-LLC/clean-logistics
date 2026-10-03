@@ -7,7 +7,7 @@
  *     "not available for inbound" → inboundReady=undefined → preflight does
  *     not block (fail open: an Amazon hiccup must not park a transfer).
  */
-import { getShipHeroProductData } from './shiphero-product-data';
+import { getShipHeroProductData, getLotBreakdown } from './shiphero-product-data';
 import { callAmazonSpApi, SpApiError } from './amazon-sp-api-client';
 import type { PreflightFacts } from './fba-preflight';
 import { catalogIdentity } from './kit-product-identity';
@@ -90,6 +90,9 @@ export interface GatherDeps {
    *  on a DIFFERENT transfer. Injected (DB). Optional. */
   hasPriorShipmentRow?: (cin7Sku: string) => Promise<boolean>;
   getProductData?: typeof getShipHeroProductData;
+  /** Lot-tracked stock by lot. Called twice: bulk-only and including pickable;
+   *  the difference is what sits in DTC pick bins. Fail-open (undefined). */
+  getLots?: typeof getLotBreakdown;
   probeReadiness?: typeof probeAmazonReadiness;
   shippedBeforeOnAmazon?: typeof amazonHasShippedBefore;
 }
@@ -116,6 +119,20 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
     facts.expirationDate = p.expirationDate ?? null;
   } catch (e: any) {
     console.warn(`[preflight] ShipHero product read failed for ${sku} — treating as missing: ${e?.message || e}`);
+  }
+
+  // Stock position — bulk (non-pickable) is what FBA plans against. Fail-open:
+  // if the read fails we leave bulkLots undefined and the allocator decides.
+  try {
+    const lots = deps.getLots ?? getLotBreakdown;
+    const bulk = await lots(deps.shipheroToken, sku);
+    const all = await lots(deps.shipheroToken, sku, { includePickable: true });
+    facts.bulkLots = bulk.map((l) => ({ name: l.name, availableQty: l.availableQty, expiresAt: l.expiresAt }));
+    const bulkTotal = bulk.reduce((n, l) => n + l.availableQty, 0);
+    const allTotal = all.reduce((n, l) => n + l.availableQty, 0);
+    facts.pickableUnits = Math.max(0, allTotal - bulkTotal);
+  } catch (e: any) {
+    console.warn(`[preflight] lot breakdown failed for ${sku} — not blocking on stock: ${e?.message || e}`);
   }
 
   // sku_master — null row = NO_AMAZON_MAPPING.

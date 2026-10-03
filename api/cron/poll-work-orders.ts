@@ -15,8 +15,9 @@ import { pollWorkOrders } from '../../lib/work-order-poller';
 import { sendTelegram } from '../../lib/fba-post-process';
 import { resolveShipHeroLasVegasWarehouse } from '../../lib/cin7-transfer-sync';
 import { checkTelegramHealth } from '../../lib/telegram-health';
+import { livePreflight } from '../../lib/fba-reconciler';
 
-export const config = { maxDuration: 120 };
+export const config = { maxDuration: 300 }; // preflight at release adds ShipHero + Amazon reads per released row
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const auth = req.headers.authorization?.replace('Bearer ', '');
@@ -41,7 +42,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const telegram = await checkTelegramHealth();
     if (!telegram.ok) console.error(`[poll-work-orders] ⚠️ TELEGRAM DEAD: ${telegram.problem}`);
 
-    const result = await pollWorkOrders({ supabase, shipheroToken, sendTelegram });
+    const result = await pollWorkOrders({
+      supabase, shipheroToken, sendTelegram,
+      // Preflight at release so the ✅ message tells the truth (2026-10-03).
+      // livePreflight needs the bridge row's identity + lines; fetch the full
+      // row by id — the poller only selected id/transfer/request_payload.
+      preflight: async (r) => {
+        const { data: full } = await supabase
+          .from('cin7_transfer_shiphero_orders')
+          .select('id, cin7_transfer_id, cin7_transfer_number, cin7_destination, shiphero_order_number, request_payload')
+          .eq('id', r.id).maybeSingle();
+        if (!full) return null;
+        const pf = await livePreflight(supabase, { ...full, request_payload: r.request_payload });
+        if (!pf) return null;
+        return { gated: pf.gated, hold: pf.hold, blockers: pf.result.blockers.map((b) => ({ code: b.code, summary: b.summary })), workOrderIds: pf.workOrder?.ids };
+      },
+    });
     const balanced =
       result.scanned ===
       result.released.length + result.failed.length + result.nudged.length +

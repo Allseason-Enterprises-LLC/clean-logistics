@@ -40,6 +40,15 @@ export interface PollerDeps {
   sendTelegram: (html: string) => Promise<boolean>;
   getWorkOrder?: typeof getWorkOrder;
   getBulk?: typeof getNonPickableBulkUnits;
+  /**
+   * Preflight the released transfer BEFORE promising labels. Returns the
+   * blockers (empty = clear). When something blocks, the gate itself has
+   * already created the WO / posted the marketing notice; the poller then
+   * says the TRUE thing instead of "labels within ~15 minutes".
+   * 2026-10-03: TR-00508/00509/00510/00516/00484/00489 all got the ✅ promise
+   * and then nothing, for 1–2 days. Optional for tests; omit = legacy message.
+   */
+  preflight?: (row: { id: string; cin7_transfer_number: string; request_payload: any }) => Promise<{ gated: boolean; hold: 'floor' | 'marketing' | null; blockers: Array<{ code: string; summary: string }>; workOrderIds?: string[] } | null>;
   now?: () => Date;
 }
 
@@ -106,7 +115,27 @@ export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
         case 'release': {
           await patch({ status: 'COMPLETED', completed_at: live[0]?.completedAt ?? nowIso },
             { status: 'pending', detail: `${nowIso.slice(0, 16)}: work order ${woIds} COMPLETED — released to the reconciler for FBA handoff` });
-          await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). FBA labels will post here automatically within ~15 minutes.`);
+
+          // Say the TRUE thing. Preflight first; promise labels only when clear.
+          let pf: Awaited<ReturnType<NonNullable<PollerDeps['preflight']>>> = null;
+          if (deps.preflight) {
+            try {
+              pf = await deps.preflight({ id: row.id, cin7_transfer_number: tr, request_payload: { ...row.request_payload, work_order: { ...wo, status: 'COMPLETED' } } });
+            } catch (e: any) {
+              console.warn(`[poller] preflight threw for ${tr} (not promising labels): ${e?.message || e}`);
+              pf = { gated: true, hold: 'floor', blockers: [{ code: 'PREFLIGHT_ERROR', summary: 'the pre-shipment check could not run' }] };
+            }
+          }
+          if (!pf || !pf.gated) {
+            await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). FBA labels will post here automatically within ~15 minutes.`);
+          } else if (pf.hold === 'marketing') {
+            // The gate already posted the ⏸ notice tagging marketing with the steps.
+            await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). ⏸ The FBA shipment is <b>on hold for an Amazon listing fix</b> (${esc(pf.blockers.map((b) => b.summary).join('; '))}) — see the notice above. <b>Warehouse: no action.</b> Labels post automatically once the listing is ready.`);
+          } else {
+            // Floor blocker — the gate already created the follow-up WO and posted its 🔧 notice.
+            const next = pf.workOrderIds?.length ? ` A new work order <code>${esc(pf.workOrderIds.join(', '))}</code> has the steps.` : '';
+            await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). ⚠️ One more thing is needed before the FBA shipment can be created: ${esc(pf.blockers.map((b) => b.summary).join('; '))}.${next} Labels post automatically once that is marked Complete.`);
+          }
           r.released.push(tr); break;
         }
         case 'failed': {

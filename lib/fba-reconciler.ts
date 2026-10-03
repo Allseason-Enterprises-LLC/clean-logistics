@@ -23,6 +23,7 @@ import { fireFbaAutoSubmit, isFbaDestination } from './cin7-fba-handoff';
 import { readWorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate, clearMarketingHold, type PreflightGateResult } from './fba-preflight-gate';
 import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
+import { sendTelegram as sendFbaTelegram } from './fba-post-process';
 import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
@@ -476,7 +477,7 @@ async function resolveMappingWith(db: SupabaseClient, cin7Sku: string): Promise<
 /** Live preflight for a bridge row: same gate the sync uses. Fail CLOSED on
  *  error (return a synthetic 'floor' hold with no WO so the row is skipped and
  *  the error is in the ledger, rather than firing blind). */
-async function livePreflight(db: SupabaseClient, row: any): Promise<PreflightGateResult | null> {
+export async function livePreflight(db: SupabaseClient, row: any): Promise<PreflightGateResult | null> {
   const lines: Array<{ sku: string; quantity: number }> = Array.isArray(row.request_payload?.partnerLineItems)
     ? row.request_payload.partnerLineItems.map((l: any) => ({ sku: String(l.sku), quantity: Number(l.quantity) || 0 }))
     : [];
@@ -491,7 +492,11 @@ async function livePreflight(db: SupabaseClient, row: any): Promise<PreflightGat
           { shipheroToken: token, resolveAmazonSku: (s) => resolveMappingWith(db, s), hasPriorShipmentRow: (s) => hasPriorFbaShipmentRow(db, s, row.cin7_transfer_number) },
           sku, qty
         ),
-        sendTelegram: async (html) => { await sendTelegramAlert(html); return true; },
+        // FBA channel, HTML — the same proven sender post-process uses. NOT
+        // sendTelegramAlert: that reads TELEGRAM_FBA_CHAT_ID from env (stale on
+        // Vercel) and sends Markdown, so the HTML hold notices for TR-00484 /
+        // TR-00508 on 2026-10-03 were silently dropped. Nobody was told.
+        sendTelegram: (html) => sendFbaTelegram(html),
       },
       {
         id: row.cin7_transfer_id, transferNumber: row.cin7_transfer_number, destinationName: row.cin7_destination,
