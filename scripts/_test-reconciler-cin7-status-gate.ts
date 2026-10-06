@@ -45,7 +45,7 @@ async function main() {
   const block = src.slice(gate, retryDecision);
   ok('gate pushes to skipped[] with reason cin7_status_not_fireable and the live status', /cin7_status_not_fireable/.test(block) && /liveCin7 \?\? 'UNREADABLE'/.test(block));
   ok('gate ends with continue', /continue;\s*\}/.test(block));
-  ok('candidate select includes cin7_transfer_id (fallback id for the live read)', /select\(\s*'id, cin7_transfer_number, cin7_transfer_id,/.test(src));
+  ok('candidate select includes cin7_transfer_id (fallback id for the live read)', /const SELECT_COLS =\s*'id, cin7_transfer_number, cin7_transfer_id,/.test(src) && /\.select\(SELECT_COLS\)/.test(src));
   ok('readCin7Status is injectable via options (tests stay offline)', /readCin7Status\?: \(row: any\) => Promise<string \| null>/.test(src));
 
   console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

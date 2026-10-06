@@ -265,24 +265,56 @@ async function fbaRecordExists(
   return false;
 }
 
+/** Handoff statuses that mean "this row is still waiting on us or the floor". */
+export const UNRESOLVED_HANDOFF_STATUSES = ['pending', 'awaiting_work_order', 'awaiting_listing', 'handoff_failed', 'dispatch_failed'] as const;
+
+const SELECT_COLS =
+  'id, cin7_transfer_number, cin7_transfer_id, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number, last_fba_handoff_status';
+
+/**
+ * Candidates = recent FBA bridges (lookback window) UNION every FBA bridge
+ * that is still unresolved, however old.
+ *
+ * 2026-10-06 (Weston: "Wendy's work orders are complete. Why are shipments
+ * not firing?"): TR-00490/00491 synced 2026-09-27, kit work orders took nine
+ * days, and the rows had aged past LOOKBACK_HOURS — the reconciler never saw
+ * the release. Six rows were invisible this way (00481/00484/00489-00492). A
+ * parked or failed row stays a candidate until it is resolved or cancelled.
+ */
 async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
   const since = new Date(Date.now() - LOOKBACK_HOURS * 3600 * 1000).toISOString();
 
-  const { data, error } = await db
+  const recent = await db
     .from('cin7_transfer_shiphero_orders')
-    .select(
-      'id, cin7_transfer_number, cin7_transfer_id, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number'
-    )
+    .select(SELECT_COLS)
     .eq('status', 'synced')
     .gte('synced_at', since)
     .order('synced_at', { ascending: false })
     .limit(50);
+  if (recent.error) throw new Error(`bridge query failed: ${recent.error.message}`);
 
-  if (error) throw new Error(`bridge query failed: ${error.message}`);
-  if (!data) return [];
+  const unresolved = await db
+    .from('cin7_transfer_shiphero_orders')
+    .select(SELECT_COLS)
+    .eq('status', 'synced')
+    .lt('synced_at', since)
+    .in('last_fba_handoff_status', [...UNRESOLVED_HANDOFF_STATUSES])
+    .order('synced_at', { ascending: false })
+    .limit(50);
+  if (unresolved.error) throw new Error(`bridge query (unresolved) failed: ${unresolved.error.message}`);
+
+  const seen = new Set<string>();
+  const all = [...(recent.data || []), ...(unresolved.data || [])].filter((r: any) => {
+    if (seen.has(r.id)) return false;
+    seen.add(r.id);
+    return true;
+  });
+  if ((unresolved.data || []).length > 0) {
+    console.log(`[reconciler] +${unresolved.data!.length} unresolved FBA bridge(s) older than ${LOOKBACK_HOURS}h kept in view: ${unresolved.data!.map((r: any) => r.cin7_transfer_number).join(', ')}`);
+  }
 
   // Filter to FBA-bound transfers only (cin7_destination contains amazon/fba)
-  return data.filter((row: any) => isFbaDestination(row.cin7_destination));
+  return all.filter((row: any) => isFbaDestination(row.cin7_destination));
 }
 
 /**
