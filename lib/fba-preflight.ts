@@ -251,7 +251,15 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
     // (a) UPC-type listing whose ShipHero barcode does not match Amazon's UPC:
     //     units would be received as a different product. Fires on EVERY
     //     shipment (not just the first) — it is a data conflict, not a habit.
-    if (!wantsFnsku && upcMatch === false) {
+    //
+    //     ⚠️ The ShipHero barcode field legitimately carries EITHER the UPC or
+    //     the FNSKU (Weston 2026-10-07). A barcode holding the listing's own
+    //     FNSKU is a correct, stronger identification — NOT a conflict. Only
+    //     flag when it matches neither.
+    const fnskuMatch = f.fnsku && f.shipheroBarcode
+      ? String(f.fnsku).trim().toUpperCase() === String(f.shipheroBarcode).trim().toUpperCase()
+      : undefined;
+    if (!wantsFnsku && upcMatch === false && fnskuMatch !== true) {
       blockers.push({
         code: 'UPC_MISMATCH', owner: 'floor',
         summary: `Barcode conflict on ${sku}: ShipHero has UPC ${f.shipheroBarcode}, the Amazon listing has UPC ${f.amazonUpc}`,

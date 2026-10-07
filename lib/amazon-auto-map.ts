@@ -25,11 +25,46 @@ const MARKETPLACE_ID = 'ATVPDKIKX0DER';
 
 export interface AutoMapping { msku: string; asin: string | null; upc: string | null; fnsku: string | null }
 
-/** Pure: does Amazon's listing for this MSKU identify the same physical product as ShipHero? */
-export function acceptAutoMapping(listingUpc: string | null | undefined, shipheroBarcode: string | null | undefined): 'accept' | 'conflict' | 'unverifiable' {
-  const m = barcodesMatch(listingUpc, shipheroBarcode);
-  if (m === true) return 'accept';
-  if (m === false) return 'conflict';
+/**
+ * Pure: exact FNSKU compare (case-insensitive, trimmed).
+ *
+ * ⚠️ Do NOT route FNSKUs through `barcodesMatch` — that strips non-digits and
+ * leading zeros, so `X005CNC45Z` collapses to `5` and would "match" any other
+ * FNSKU with a single 5 in it. FNSKUs are alphanumeric identifiers and must be
+ * compared whole.
+ */
+export function fnskusMatch(a: string | null | undefined, b: string | null | undefined): boolean | undefined {
+  const na = String(a ?? '').trim().toUpperCase(); const nb = String(b ?? '').trim().toUpperCase();
+  if (!na || !nb) return undefined;
+  return na === nb;
+}
+
+/**
+ * Pure: does Amazon's listing for this MSKU identify the same physical product
+ * as ShipHero?
+ *
+ * ShipHero's barcode field carries **either** the product's UPC **or** its
+ * Amazon FNSKU, depending on how the product was set up — Weston 2026-10-07:
+ * *"in many scenarios we're using FNSKU so if the FNSKU matches then we should
+ * be using that."* An FNSKU match is a STRONGER identity proof than a UPC match
+ * (it is Amazon's own per-offer identifier), so either one accepts.
+ *
+ * Only a barcode that matches NEITHER — while we have something to compare it
+ * against — is a genuine conflict. Before this, an FNSKU in the barcode field
+ * was read as a UPC conflict and parked the transfer on a marketing hold for a
+ * listing that was never broken (TR-00517/00518/00519, 2PK/3PK/4PK).
+ */
+export function acceptAutoMapping(
+  listingUpc: string | null | undefined,
+  listingFnsku: string | null | undefined,
+  shipheroBarcode: string | null | undefined,
+): 'accept' | 'conflict' | 'unverifiable' {
+  const byUpc = barcodesMatch(listingUpc, shipheroBarcode);
+  if (byUpc === true) return 'accept';
+  const byFnsku = fnskusMatch(listingFnsku, shipheroBarcode);
+  if (byFnsku === true) return 'accept';
+  // Conflict only if at least one comparison was actually possible and failed.
+  if (byUpc === false || byFnsku === false) return 'conflict';
   return 'unverifiable';
 }
 
@@ -45,7 +80,13 @@ export async function fetchListingByMsku(msku: string, api: typeof callAmazonSpA
     if (!s) return null;
     const ids: any[] = d.attributes?.externally_assigned_product_identifier || [];
     const upc = ids.find((i) => /^(upc|ean|gtin)$/i.test(i.type))?.value ?? null;
-    const fnsku = (d.fulfillmentAvailability || []).find((f: any) => f.fulfillmentChannelCode === 'AMAZON_NA')?.fnSku ?? null;
+    // FNSKU lives on summaries[0].fnSku. `fulfillmentAvailability` entries come
+    // back as bare {fulfillmentChannelCode:'AMAZON_NA'} with NO fnSku key, so
+    // reading it from there always yielded null and the FNSKU comparison below
+    // could never fire (verified live on all 5 NMN multi-packs 2026-10-07).
+    const fnsku = s.fnSku
+      ?? (d.fulfillmentAvailability || []).find((f: any) => f.fulfillmentChannelCode === 'AMAZON_NA')?.fnSku
+      ?? null;
     return { msku, asin: s.asin ?? null, upc, fnsku };
   } catch (err: any) {
     if (err?.status === 404) return null;
@@ -64,17 +105,18 @@ export async function autoResolveAmazonSku(args: {
   try { listing = await (args.fetchListing ?? fetchListingByMsku)(args.cin7Sku); }
   catch (e: any) { console.warn(`[auto-map] ${args.cin7Sku}: listing lookup threw (${e?.message || e}) — not auto-mapping`); return null; }
   if (!listing) return null;
-  const verdict = acceptAutoMapping(listing.upc, args.shipheroBarcode);
+  const verdict = acceptAutoMapping(listing.upc, listing.fnsku, args.shipheroBarcode);
   if (verdict !== 'accept') {
-    console.warn(`[auto-map] ${args.cin7Sku}: Amazon has an offer with that MSKU but UPC ${listing.upc ?? '?'} vs ShipHero ${args.shipheroBarcode ?? '?'} is ${verdict} — not auto-mapping`);
+    console.warn(`[auto-map] ${args.cin7Sku}: Amazon has an offer with that MSKU but ShipHero barcode ${args.shipheroBarcode ?? '?'} matches neither UPC ${listing.upc ?? '?'} nor FNSKU ${listing.fnsku ?? '?'} — ${verdict}, not auto-mapping`);
     return null;
   }
+  const matchedOn = barcodesMatch(listing.upc, args.shipheroBarcode) === true ? `UPC ${listing.upc}` : `FNSKU ${listing.fnsku}`;
   try {
     await args.db.from('sku_master').insert({
       cin7_sku: args.cin7Sku, amazon_seller_sku: listing.msku, amazon_asin: listing.asin, verified: false,
-      notes: `auto-mapped ${new Date().toISOString().slice(0, 10)} by preflight: Amazon offer MSKU == CIN7 SKU and listing UPC ${listing.upc} == ShipHero barcode`,
+      notes: `auto-mapped ${new Date().toISOString().slice(0, 10)} by preflight: Amazon offer MSKU == CIN7 SKU and listing ${matchedOn} == ShipHero barcode`,
     });
-    console.log(`[auto-map] ${args.cin7Sku} → ${listing.msku} (${listing.asin}) recorded in sku_master`);
+    console.log(`[auto-map] ${args.cin7Sku} → ${listing.msku} (${listing.asin}) matched on ${matchedOn}, recorded in sku_master`);
   } catch (e: any) {
     console.warn(`[auto-map] ${args.cin7Sku}: mapping accepted but sku_master insert failed (will re-resolve next tick): ${e?.message || e}`);
   }

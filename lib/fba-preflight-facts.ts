@@ -98,6 +98,16 @@ export interface GatherDeps {
   getLots?: typeof getLotBreakdown;
   probeReadiness?: typeof probeAmazonReadiness;
   shippedBeforeOnAmazon?: typeof amazonHasShippedBefore;
+  /** MSKU → the listing's FNSKU. Defaults to the Listings API. Pass `null` to
+   *  skip the lookup entirely (tests). Fail-open. */
+  fnskuForMsku?: ((msku: string) => Promise<string | null>) | null;
+}
+
+/** MSKU → FNSKU via the Listings API (summaries[0].fnSku). Fail-open to null. */
+export async function defaultFnskuForMsku(msku: string): Promise<string | null> {
+  const { fetchListingByMsku } = await import('./amazon-auto-map');
+  const l = await fetchListingByMsku(msku);
+  return l?.fnsku ?? null;
 }
 
 export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quantity: number): Promise<PreflightFacts> {
@@ -168,6 +178,17 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
     if (r.inboundReady === true && asin) {
       try { facts.amazonUpc = await (deps.amazonUpcForAsin ?? defaultAmazonUpc)(asin); }
       catch (e: any) { console.warn(`[preflight] catalog UPC lookup failed for ${asin}: ${e?.message || e}`); }
+    }
+
+    // FNSKU: sku_master rarely carries one (amz_fnsku is null on most rows), but
+    // the barcode-conflict check below MUST be able to recognise a ShipHero
+    // barcode that holds the listing's FNSKU rather than its UPC — otherwise a
+    // correctly-configured FNSKU product reads as a UPC conflict and parks on a
+    // bogus hold (TR-00517/00518/00519, 2026-10-07). Read it from the live
+    // listing when we don't already have it. Fail-open.
+    if (r.inboundReady === true && !facts.fnsku && deps.fnskuForMsku !== null) {
+      try { facts.fnsku = await (deps.fnskuForMsku ?? defaultFnskuForMsku)(facts.amazonMsku); }
+      catch (e: any) { console.warn(`[preflight] FNSKU lookup failed for ${facts.amazonMsku}: ${e?.message || e}`); }
     }
 
     // First-shipment detection — now for BOTH label types (verify-and-branch
