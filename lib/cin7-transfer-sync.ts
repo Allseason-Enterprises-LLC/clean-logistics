@@ -465,8 +465,13 @@ function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroT
     skus: (transfer.lines || []).map((l) => l.sku),
     reference: transfer.reference,
   });
+  // Floor-facing: facts only, no instructions. "for Amazon kitting" sat here
+  // from the first commit (2026-05-07) and the floor read it as a directive on
+  // TR-00539 (a single). Anything that must be built or labelled is already a
+  // ShipHero work order by the time this order exists — the note has nothing
+  // to add (Weston, 2026-10-08).
   const notes = [
-    'CIN7 transfer order for Amazon kitting.',
+    'CIN7 transfer order → Amazon FBA.',
     `Transfer #: ${transfer.transferNumber}`,
     transfer.sourceName ? `Source: ${transfer.sourceName}` : null,
     transfer.destinationName ? `Destination: ${transfer.destinationName}` : null,
