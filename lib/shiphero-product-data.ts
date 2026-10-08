@@ -295,6 +295,100 @@ export async function getShipHeroProductData(
   };
 }
 
+export interface KitComponent { sku: string; quantity: number }
+
+/**
+ * Convert COMPONENT lot availability into KIT lot availability.
+ *
+ * A kit holds no inventory of its own in ShipHero — its components do. Any
+ * stock check that queries `warehouse_products` for a kit SKU gets 0 and
+ * concludes "out of stock" for a product that is fully buildable.
+ *
+ * TR-00539 (2026-10-08): `CN-CAP-LIPOGLUT-90CT-R2` read 0 units while its core
+ * `CN-CAP-LIPOGLUT-90CT` held 21,924 in A-prefix bulk. The preflight gate
+ * blocked the transfer and issued the floor a MOVE STOCK work order that could
+ * never be satisfied — there was nothing to move. Weston: "the system needs to
+ * be able to be smart enough to create a shipment when the core sku has the
+ * inventory even if the kit doesn't."
+ *
+ * Rules:
+ * - buildable kits per lot = floor(componentUnits / unitsPerKit) — PARTIAL KITS
+ *   NEVER COUNT, same discipline as whole-cases-only.
+ * - multi-component kits bind on the SCARCEST component (min across
+ *   components), never the sum, and report the EARLIEST expiry — the worst case
+ *   that FBA must honour, matching the kit-aware expiry logic above.
+ * - per-lot granularity is preserved so FEFO and lot-splitting still work.
+ * - fail OPEN (return []) on a component read error: "unknown", never invented
+ *   stock. The caller treats empty as not-read and the allocator decides at
+ *   fire time.
+ */
+export async function resolveKitLotAvailability(
+  components: KitComponent[],
+  readComponentLots: (sku: string) => Promise<LotAvailability[]>,
+): Promise<LotAvailability[]> {
+  const comps = (components || []).filter((c) => c?.sku);
+  if (!comps.length) return [];
+
+  // lot name → buildable kits per component, plus the earliest expiry seen.
+  const perComponent: Array<Map<string, LotAvailability>> = [];
+  for (const comp of comps) {
+    const unitsPerKit = Math.max(1, Number(comp.quantity) || 1);
+    let lots: LotAvailability[];
+    try {
+      lots = await readComponentLots(comp.sku);
+    } catch (e: any) {
+      console.warn(`[kit-stock] ${comp.sku}: component lot read failed — kit availability unknown: ${e?.message || e}`);
+      return [];
+    }
+    const m = new Map<string, LotAvailability>();
+    for (const l of lots || []) {
+      if (!l?.name) continue;
+      const kits = Math.floor((l.availableQty || 0) / unitsPerKit);
+      if (kits <= 0) continue;
+      const cur = m.get(l.name);
+      if (cur) {
+        cur.availableQty += kits;
+        if (l.expiresAt && l.expiresAt < cur.expiresAt) cur.expiresAt = l.expiresAt;
+      } else {
+        m.set(l.name, { name: l.name, expiresAt: l.expiresAt, availableQty: kits });
+      }
+    }
+    perComponent.push(m);
+  }
+
+  // Single component (the overwhelmingly common case: an R-suffix rework or a
+  // multipack of one core) → its per-lot rows ARE the kit's, already divided.
+  if (perComponent.length === 1) {
+    return Array.from(perComponent[0].values());
+  }
+
+  // Multi-component: the kit cannot be built beyond its scarcest part. Lots are
+  // component-specific so they cannot be intersected by name; collapse to one
+  // synthetic row keyed on the limiting component's lot, carrying the earliest
+  // expiry across all components.
+  const totals = perComponent.map((m) => Array.from(m.values()).reduce((n, l) => n + l.availableQty, 0));
+  const buildable = Math.min(...totals);
+  const allLots = perComponent.flatMap((m) => Array.from(m.values()));
+  if (!allLots.length) return [];
+  const earliest = allLots.reduce((a, b) => (a.expiresAt && b.expiresAt && a.expiresAt <= b.expiresAt ? a : b));
+  const limitingIdx = totals.indexOf(buildable);
+  const limitingLots = Array.from(perComponent[limitingIdx].values());
+  if (buildable <= 0) {
+    return limitingLots.map((l) => ({ ...l, availableQty: 0, expiresAt: earliest.expiresAt }));
+  }
+  // Attribute the buildable count to the limiting component's lots, earliest first.
+  const sorted = limitingLots.slice().sort((a, b) => String(a.expiresAt).localeCompare(String(b.expiresAt)));
+  const out: LotAvailability[] = [];
+  let left = buildable;
+  for (const l of sorted) {
+    if (left <= 0) break;
+    const take = Math.min(left, l.availableQty);
+    out.push({ name: l.name, expiresAt: earliest.expiresAt, availableQty: take });
+    left -= take;
+  }
+  return out;
+}
+
 /**
  * Per-lot availability for a SKU, aggregated across warehouse locations.
  *
@@ -302,6 +396,10 @@ export async function getShipHeroProductData(
  * derived from warehouse_products → locations → expiration_lot (verified
  * against the live schema 2026-07-22). Locations with expiration_lot: null
  * (untracked stock) and inactive lots are excluded.
+ *
+ * KITS ARE RESOLVED THROUGH THEIR COMPONENTS (added 2026-10-08, TR-00539):
+ * a kit SKU has no inventory of its own, so querying it directly returns 0.
+ * See `resolveKitLotAvailability`.
  *
  * PICKABLE (DTC) LOCATIONS ARE EXCLUDED (added 2026-08-20 per Weston):
  * B-prefix pick bins (location.pickable=true) hold DTC fulfillment stock.
@@ -315,9 +413,19 @@ export async function getShipHeroProductData(
 export async function getLotBreakdown(
   shipheroToken: string,
   sku: string,
-  opts: { includePickable?: boolean } = {},
+  opts: { includePickable?: boolean; _noKitRecurse?: boolean } = {},
 ): Promise<LotAvailability[]> {
   const query = `{
+    products(sku: "${sku}") {
+      data(first: 1) {
+        edges {
+          node {
+            kit
+            kit_components { sku quantity }
+          }
+        }
+      }
+    }
     warehouse_products(sku: "${sku}") {
       data(first: 5) {
         edges {
@@ -349,6 +457,23 @@ export async function getLotBreakdown(
   const json: any = await resp.json();
   if (json.errors) {
     throw new Error(`ShipHero lot breakdown error for ${sku}: ${JSON.stringify(json.errors)}`);
+  }
+
+  // KIT → resolve through components. A kit's own warehouse_products rows are
+  // always empty, so without this every kitted transfer reads "0 in bulk".
+  // `_noKitRecurse` stops a malformed kit that lists itself as a component.
+  const prod = json.data?.products?.data?.edges?.[0]?.node;
+  const isKit = prod?.kit === true || prod?.kit === 'true';
+  const kitComponents: KitComponent[] = Array.isArray(prod?.kit_components) ? prod.kit_components : [];
+  if (isKit && kitComponents.length > 0 && !opts._noKitRecurse) {
+    const names = kitComponents.map((c) => `${c.sku}×${c.quantity ?? 1}`).join(', ');
+    console.log(`[lot-breakdown] ${sku}: KIT — resolving availability through components (${names})`);
+    const resolved = await resolveKitLotAvailability(kitComponents, (compSku) =>
+      getLotBreakdown(shipheroToken, compSku, { ...opts, _noKitRecurse: true }),
+    );
+    const total = resolved.reduce((n, l) => n + l.availableQty, 0);
+    console.log(`[lot-breakdown] ${sku}: KIT buildable = ${total} kit(s) across ${resolved.length} lot(s)`);
+    return resolved;
   }
 
   const byLot = new Map<string, LotAvailability>();
