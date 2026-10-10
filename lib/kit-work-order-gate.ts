@@ -40,6 +40,12 @@ export interface WorkOrderState {
   completed_at?: string | null;
   /** last nudge/escalation post to Telegram, for once-a-day pacing */
   last_nudge_at?: string | null;
+  /**
+   * When the single terminal-state alert was sent (CANCELED/CLOSED). Presence
+   * removes the row from the poller's scope so a dead WO cannot re-alert every
+   * tick — see isTerminalWorkOrder() in work-order-poller.ts.
+   */
+  alerted_at?: string | null;
   kit_sku: string;
   kit_qty: number;
   /** The ShipHero order number the WO is named after (what the floor searches). */

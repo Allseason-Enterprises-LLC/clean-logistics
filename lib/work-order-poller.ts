@@ -54,6 +54,42 @@ export interface PollerDeps {
 
 const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/**
+ * Terminal = the work order will never progress on its own again, so the poller
+ * has nothing left to do with the row.
+ *
+ * 🔴 CANCELED/CLOSED ARE TERMINAL. Before 2026-10-10 only COMPLETED exited the
+ * poller's scope, and the `failed` branch wrote `status: 'CANCELED'` — which is
+ * not COMPLETED, so the row was re-selected every tick and re-sent the ⚠️
+ * "was CANCELED … someone needs to decide whether to rebuild it" alert forever.
+ * Weston had deliberately canceled those four WOs (TR-00146/00326/00328/00329)
+ * on my own advice, and the FBA channel got the same four alerts on repeat.
+ *
+ * A notice the floor cannot act on, repeated indefinitely, trains them to
+ * ignore the channel — which is worse than silence.
+ */
+export function isTerminalWorkOrder(status: string | null | undefined): boolean {
+  if (!status) return false; // unknown → keep polling, never strand a live WO
+  const s = String(status).toUpperCase();
+  return s === 'COMPLETED' || s === 'CANCELED' || s === 'CANCELLED' || s === 'CLOSED';
+}
+
+/**
+ * Should this bridge row be polled this tick?
+ *
+ * Exits on: no work order, or a terminal work order that has already had its
+ * one alert (`alerted_at`). A terminal WO with no `alerted_at` is still polled
+ * once so the first notice goes out. A WO that went back to a live status is
+ * polled again regardless of `alerted_at`.
+ */
+export function shouldPollWorkOrderRow(payload: any): boolean {
+  const wo = payload?.work_order;
+  if (!wo || !wo.status) return false;
+  if (!isTerminalWorkOrder(wo.status)) return true;      // live → poll
+  if (String(wo.status).toUpperCase() === 'COMPLETED') return false; // released already
+  return !wo.alerted_at;                                  // canceled/closed → once
+}
+
 export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
   const now = (deps.now ?? (() => new Date()))();
   const nowIso = now.toISOString();
@@ -70,10 +106,7 @@ export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
     .limit(100);
   if (error) throw new Error(`poller: bridge query failed: ${error.message}`);
 
-  const rows = (data || []).filter((row: any) => {
-    const wo = readWorkOrderState(row.request_payload);
-    return wo && wo.status !== 'COMPLETED';
-  });
+  const rows = (data || []).filter((row: any) => shouldPollWorkOrderRow(row.request_payload));
   r.scanned = rows.length;
 
   for (const row of rows as any[]) {
@@ -139,7 +172,9 @@ export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
           r.released.push(tr); break;
         }
         case 'failed': {
-          await patch({ status: d.status },
+          // Stamp alerted_at so this row leaves the poller's scope — a terminal
+          // WO must alert ONCE. See isTerminalWorkOrder().
+          await patch({ status: d.status, alerted_at: nowIso },
             { status: 'work_order_failed', detail: `${nowIso.slice(0, 16)}: work order ${woIds} is ${d.status} in ShipHero — FBA shipment NOT created; needs a human` });
           await deps.sendTelegram(`⚠️ <b>${label}</b>: work order ${woIds} was <b>${d.status}</b> in ShipHero, so the FBA shipment was <b>not</b> created (${spec}). Someone needs to decide whether to rebuild it.`);
           r.failed.push(tr); break;
