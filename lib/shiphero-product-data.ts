@@ -410,6 +410,41 @@ export async function resolveKitLotAvailability(
  * Example: TR-00340 planned 370 boxes instead of 325 because 1,547 units of
  * lot 6E0224 sat in pick bin B01-02-04-A-01.
  */
+/**
+ * Bins whose stock must NEVER be planned into an FBA shipment.
+ *
+ * WHY THIS EXISTS (TR-00567, 2026-10-12): `getLotBreakdown` excluded only
+ * `location.pickable === true`. A bin named `Returns` is NOT pickable, so 134u
+ * of lot 5L0473 read as ordinary eligible bulk — and because that lot carried
+ * the earliest expiry, FEFO would have shipped returned stock FIRST.
+ *
+ * Standing instruction from the floor (Katherine, 2026-10-12):
+ *   "Do not ship stock from Returns bin."
+ *
+ * ShipHero's Location type exposes no sellable/quarantine/disposition flag
+ * (only `name` and `pickable`), so NAME MATCHING is the only available signal.
+ * Keep the list conservative — a false positive hides real sellable stock and
+ * produces a phantom shortfall, which is its own incident. Every skip is
+ * logged with bin name and quantity.
+ *
+ * Word-boundary matched so a legitimate bin like `A01-RETURNED-GOODS-STAGING`
+ * is caught, while an aisle code that merely contains the letters is not.
+ */
+export const NON_SELLABLE_BIN_PATTERNS: readonly RegExp[] = [
+  /\breturns?\b/i,
+  /\breturned\b/i,
+  /\bquarantine\b/i,
+  /\bdamage[ds]?\b/i,
+  /\bexpired\b/i,
+  /\brecall(ed)?\b/i,
+];
+
+/** True when a ShipHero bin name marks stock that must not go to FBA. */
+export function isNonSellableBin(locationName?: string | null): boolean {
+  if (!locationName) return false;
+  return NON_SELLABLE_BIN_PATTERNS.some((re) => re.test(locationName));
+}
+
 export async function getLotBreakdown(
   shipheroToken: string,
   sku: string,
@@ -478,11 +513,31 @@ export async function getLotBreakdown(
 
   const byLot = new Map<string, LotAvailability>();
   let pickableSkipped = 0;
+  let nonSellableSkipped = 0;
   for (const we of json.data?.warehouse_products?.data?.edges || []) {
     for (const le of we.node?.locations?.edges || []) {
       const n = le.node;
       const lot = n?.expiration_lot;
       if (!lot?.name || !lot.is_active || !lot.expires_at) continue;
+      // Skip NON-SELLABLE bins (added 2026-10-12, TR-00567). The pickable flag
+      // is NOT sufficient: a `Returns` bin is non-pickable, so it read as
+      // ordinary eligible bulk. On TR-00567 lot 5L0473 held 134u in a bin
+      // literally named `Returns` and — because it carried the EARLIEST expiry
+      // (2028-02-28) — FEFO would have consumed it FIRST, putting returned
+      // stock on the first Amazon shipment.
+      // Standing instruction from Katherine (floor), 2026-10-12:
+      // "Do not ship stock from Returns bin."
+      // Matched on bin NAME because ShipHero exposes no sellable/quarantine
+      // flag on Location. Keep this list conservative and log every skip.
+      if (isNonSellableBin(n?.location?.name)) {
+        if ((n.quantity || 0) > 0) {
+          nonSellableSkipped += n.quantity;
+          console.log(
+            `[lot-breakdown] ${sku}: skipping ${n.quantity}u of lot ${lot.name} in NON-SELLABLE bin ${n.location?.name ?? '?'} (never shipped to FBA)`
+          );
+        }
+        continue;
+      }
       // Skip DTC pick bins — FBA plans against bulk stock only (see docblock).
       // OVERRIDE (opts.includePickable): deliberate operator decision to raid
       // DTC pick bins, e.g. a slow-moving SKU whose whole position is going to
@@ -515,6 +570,9 @@ export async function getLotBreakdown(
   }
   if (pickableSkipped > 0) {
     console.log(`[lot-breakdown] ${sku}: excluded ${pickableSkipped} units total in pickable DTC bins from FBA lot math`);
+  }
+  if (nonSellableSkipped > 0) {
+    console.log(`[lot-breakdown] ${sku}: excluded ${nonSellableSkipped} units total in NON-SELLABLE bins (returns/quarantine/damaged) from FBA lot math`);
   }
   return Array.from(byLot.values());
 }
