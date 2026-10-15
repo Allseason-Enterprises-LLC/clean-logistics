@@ -488,6 +488,82 @@ export async function attachToShipHero(
   return { id: data?.order_add_attachment?.attachment?.id ?? '', created: true };
 }
 
+export interface LabelSet {
+  lot: string | null;
+  expiration: string | null;
+  units: number;
+  cases: number;
+  unitsPerBox: number;
+  shipments: Array<{ fbaId: string; destination: string; boxes: number }>;
+}
+
+/** Store this run's label set on its fba_shipments row (prep_instructions.label_set). */
+async function persistLabelSet(
+  planId: string,
+  labels: PostProcessResult['labels'],
+  meta: Omit<LabelSet, 'shipments'>
+): Promise<void> {
+  const db = getSupabase();
+  const { data: row } = await db.from('fba_shipments').select('id, prep_instructions').eq('plan_id', planId).neq('status', 'cancelled').maybeSingle();
+  if (!row) return;
+  const prep = (row.prep_instructions && typeof row.prep_instructions === 'object') ? row.prep_instructions : {};
+  const label_set: LabelSet = { ...meta, shipments: labels.map((l) => ({ fbaId: l.fbaId, destination: l.destination, boxes: l.boxes })) };
+  await db.from('fba_shipments').update({ prep_instructions: { ...prep, label_set } }).eq('id', row.id);
+}
+
+/** Every active row of this transfer (incl. -S1 top-ups) that has a stored label set, oldest first. */
+async function loadLabelSetsForTransfer(cin7TransferNumber: string): Promise<LabelSet[]> {
+  const db = getSupabase();
+  const tr = extractTransferNumber(cin7TransferNumber) || cin7TransferNumber;
+  const { data } = await db
+    .from('fba_shipments')
+    .select('cin7_transfer_number, cin7_lot, lot_expiration, prep_instructions, created_at')
+    .like('cin7_transfer_number', `%${tr}%`)
+    .neq('status', 'cancelled')
+    .order('created_at', { ascending: true });
+  const sets: LabelSet[] = [];
+  for (const r of data ?? []) {
+    const ls = (r.prep_instructions as any)?.label_set;
+    if (ls && Array.isArray(ls.shipments)) sets.push({ ...ls, lot: ls.lot ?? r.cin7_lot ?? null, expiration: ls.expiration ?? r.lot_expiration ?? null });
+  }
+  return sets;
+}
+
+function labelOwnerFromPrep(prep: any): string {
+  const c = prep?.mskuPrepDetails?.[0]?.labelOwnerConstraint ?? prep?.mskuPrepDetails?.[0]?.prepOwnerConstraint;
+  return c === 'NONE_ONLY' ? 'NONE — ship with the UPC, no FNSKU stickers' : c === 'AMAZON_ONLY' ? 'AMAZON' : 'SELLER';
+}
+
+/** Pure. One note for the whole transfer, grouped by lot, every box accounted for. */
+export function buildConsolidatedPackingNote(args: {
+  transferNumber: string;
+  productName: string;
+  box: { length: number; width: number; height: number; weightLbs: number };
+  labelOwner: string;
+  sets: LabelSet[];
+}): string {
+  const { sets } = args;
+  const totalUnits = sets.reduce((s, x) => s + x.units, 0);
+  const totalBoxes = sets.reduce((s, x) => s + x.shipments.reduce((a, b) => a + b.boxes, 0), 0);
+  const upb = sets[0]?.unitsPerBox;
+  const L: string[] = [
+    `FBA Shipment for ${args.transferNumber} - ${args.productName}`,
+    `${totalUnits.toLocaleString()} units · ${totalBoxes} boxes · ${sets.length} lot${sets.length === 1 ? '' : 's'} · ${sets.reduce((s, x) => s + x.shipments.length, 0)} label set${sets.length === 1 && sets[0].shipments.length === 1 ? '' : 's'}`,
+    `Box: ${args.box.length}x${args.box.width}x${args.box.height} in, ${args.box.weightLbs} lbs each${upb ? `. Units per case: ${upb}.` : '.'}`,
+    '',
+  ];
+  for (const s of sets) {
+    const boxes = s.shipments.reduce((a, b) => a + b.boxes, 0);
+    L.push(`LOT ${s.lot ?? '—'} · Exp ${s.expiration ?? 'N/A'} · ${s.units.toLocaleString()} units · ${boxes} boxes — pack ONLY this lot with these labels:`);
+    for (const sh of s.shipments) L.push(`  • ${sh.fbaId} -> ${sh.destination}: ${sh.boxes} boxes`);
+    L.push('');
+  }
+  L.push(`Total: ${totalBoxes} boxes. Apply one UNIQUE label per box. Do not mix lots in a box.`);
+  L.push(`FNSKU labeling: ${args.labelOwner}.`);
+  L.push('Labels are attached to this order (one PDF per destination).');
+  return L.join('\n');
+}
+
 async function updatePackingNote(token: string, orderId: string, note: string): Promise<void> {
   const mutation = `
     mutation($d: UpdateOrderInput!) {
@@ -781,24 +857,29 @@ export async function postProcessFbaShipment(
 
   if (hasShippingCost) result.totalShippingCost = totalShippingCost;
 
-  // Update packing note
+  // Update packing note — CONSOLIDATED across every lot/run of this transfer.
+  // Until 2026-10-15 this rebuilt the note from THIS lot only, so a 2-lot
+  // transfer showed the last lot's boxes and the floor read "labels missing"
+  // (TR-00533/00567/00591/00596). Now: persist this run's label set on its
+  // fba_shipments row (prep_instructions.label_sets — jsonb, no DDL), then
+  // rebuild the note from ALL active rows of the transfer, grouped by lot.
   try {
-    const lines = [
-      `FBA Shipment for ${input.cin7TransferNumber} - ${input.product.productName || input.product.amazonSku}`,
-      `${input.quantity.boxes} cases (${input.quantity.totalUnits.toLocaleString()} units) - Exp: ${input.expiration || 'N/A'} ${input.lot ? `(Lot ${input.lot})` : ''} FEFO`,
-      `Box: ${input.box.length}x${input.box.width}x${input.box.height} in, ${input.box.weightLbs} lbs each. Units per case: ${input.quantity.unitsPerBox}.`,
-      '',
-      `Amazon Partnered Carrier - ${result.labels.length} destination(s):`,
-      ...result.labels.map(
-        (l) => `  • ${l.fbaId} -> ${l.destination}: ${l.boxes} boxes`
-      ),
-      '',
-      `Total: ${result.labels.reduce((s, l) => s + l.boxes, 0)} boxes = ${input.quantity.boxes} cases. Apply one UNIQUE label per box.`,
-      'FNSKU labeling: SELLER.',
-      '',
-      'Labels are attached to this order (one PDF per destination).',
-    ];
-    await updatePackingNote(shToken, shOrder.orderId, lines.join('\n'));
+    await persistLabelSet(planId, result.labels, {
+      lot: input.lot ?? null,
+      expiration: input.expiration ?? null,
+      units: input.quantity.totalUnits,
+      cases: input.quantity.boxes,
+      unitsPerBox: input.quantity.unitsPerBox,
+    });
+    const sets = await loadLabelSetsForTransfer(input.cin7TransferNumber);
+    const note = buildConsolidatedPackingNote({
+      transferNumber: input.cin7TransferNumber,
+      productName: input.product.productName || input.product.amazonSku,
+      box: input.box,
+      labelOwner: labelOwnerFromPrep(input.fbaResult?.prepInstructions ?? (input.fbaResult as any)?.prep_instructions),
+      sets,
+    });
+    await updatePackingNote(shToken, shOrder.orderId, note);
   } catch (err: any) {
     errors.push(`packing_note update: ${err?.message}`);
   }
