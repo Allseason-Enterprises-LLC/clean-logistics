@@ -3,7 +3,8 @@ import { createClient } from '@supabase/supabase-js';
 import { getShipHeroProductData, getShipHeroToken, getLotBreakdown } from '../../lib/shiphero-product-data';
 import { allocateFefoByLot, sanitizeLotName, mergeSameSkuItems, findShortfalls, type LotAllocation } from '../../lib/lot-allocation';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
-import { postProcessFbaShipment, sendTelegramMarkdown } from '../../lib/fba-post-process';
+import { postProcessFbaShipment, sendTelegramMarkdown, sendTelegram } from '../../lib/fba-post-process';
+import { readTransferCoverage, recordCoverage, describeCoverage, type Coverage } from '../../lib/fba-coverage';
 import { PartneredUnavailableError } from '../../lib/fba-inbound';
 import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 
@@ -737,6 +738,38 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await sendFbaAlert(msg);
     }
 
+    // ---- TRANSFER-LEVEL COVERAGE INVARIANT (2026-10-15) ----
+    // The per-run check above sees only THIS payload. The transfer is whole
+    // only when units across EVERY active row (all lots, all runs, -S1 top-ups)
+    // equal the CIN7 transfer. Read Amazon's plan items (authoritative), write
+    // the verdict to the bridge row, and say so in the channel when it is not
+    // whole — SHORT or OVER (over = duplicate-shipment risk, louder).
+    let coverage: Coverage | null = null;
+    if (deferredLots.length === 0) {
+      try {
+        const unitsForPlan = async (planId: string): Promise<number | null> => {
+          const r = await callAmazonSpApi<any>({ method: 'GET', path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/items` });
+          const items = (r as any)?.data?.items ?? (r as any)?.items;
+          return Array.isArray(items) ? items.reduce((s: number, i: any) => s + Number(i?.quantity || 0), 0) : null;
+        };
+        const cov = await readTransferCoverage(supabase, cin7_transfer_number, unitsForPlan);
+        if (cov) {
+          coverage = cov.coverage;
+          await recordCoverage(supabase, cov.transfer, cov.coverage);
+          if (!cov.coverage.whole) {
+            const text = describeCoverage(cov.transfer, cov.coverage) +
+              (cov.coverage.over ? '' : '\nThe labels already made are correct; the missing units need a top-up from Freight.');
+            console.error(`[fba-auto] COVERAGE ${cov.transfer}: ${JSON.stringify(cov.coverage.bySku)}`);
+            await sendTelegram(text);
+          } else {
+            console.log(`[fba-auto] COVERAGE ${cov.transfer}: whole (${cov.coverage.rows} rows)`);
+          }
+        }
+      } catch (covErr: any) {
+        console.warn(`[fba-auto] coverage check failed (non-fatal): ${covErr?.message}`);
+      }
+    }
+
     res.status(200).json({
       cin7_transfer_number,
       processed: results.length,
@@ -746,6 +779,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       chain_depth: chainDepth,
       lines_merged: linesMerged,
       shortfalls,
+      coverage,
       results,
     });
   } catch (error) {
