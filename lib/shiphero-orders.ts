@@ -566,6 +566,40 @@ export async function createShipHeroOrderFromCIN7Transfer({
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
 
+    // "already exists" = the order IS there (an earlier run, a lot-child, a
+    // hand-made order). Bind it instead of failing. 2026-10-15: TR-00595 /
+    // 00597 / 00504 sat `failed` for days — 6,000+ units, zero labels, zero
+    // notice — because the bridge refused to adopt an order that already had
+    // its name. Only a LIVE (non-cancelled) order is adopted.
+    if (isOrderAlreadyExists(message)) {
+      const existing = await findLiveOrderByNumber(credentials.accessToken, input.orderNumber).catch(() => null);
+      if (existing) {
+        console.warn(`[shiphero-orders] ${input.orderNumber} already exists (${existing.orderId}) — binding to bridge row instead of failing`);
+        await upsertBridgeRecord(db, {
+          cin7TransferId,
+          cin7TransferNumber,
+          cin7Destination,
+          cin7Source,
+          status: 'synced',
+          requestPayload: input,
+          responsePayload: { adopted_existing: true, order_id: existing.orderId, order_number: existing.orderNumber, original_error: message },
+          shipheroOrderId: existing.orderId,
+          shipheroOrderNumber: existing.orderNumber,
+        });
+        return {
+          created: false,
+          existingOrderId: existing.orderId,
+          orderId: existing.orderId,
+          orderNumber: existing.orderNumber,
+          shipheroOrderId: existing.orderId,
+          shipheroOrderNumber: existing.orderNumber,
+          status: 'synced',
+          requestPayload: input,
+          responsePayload: { adopted_existing: true },
+        };
+      }
+    }
+
     await upsertBridgeRecord(db, {
       cin7TransferId,
       cin7TransferNumber,
@@ -577,6 +611,49 @@ export async function createShipHeroOrderFromCIN7Transfer({
       responsePayload: { error: message },
     });
 
+    // A failed sync is a stalled transfer the floor will discover by waiting.
+    // Say so where the floor and the office look (one FBA-channel sender).
+    await notifySyncFailed(cin7TransferNumber, input.orderNumber, message);
+
     throw error;
+  }
+}
+
+/** ShipHero's duplicate-order-number refusal, as observed on TR-00504/00595/00597. */
+export function isOrderAlreadyExists(message: string): boolean {
+  return /order number .* already exists/i.test(message);
+}
+
+/** Exact-name lookup; returns the first LIVE (non-cancelled) order or null. */
+async function findLiveOrderByNumber(token: string, orderNumber: string): Promise<{ orderId: string; orderNumber: string } | null> {
+  const query = `query { orders(order_number: "${orderNumber}") { data(first: 5) { edges { node { id order_number fulfillment_status } } } } }`;
+  const res = await fetch(SHIPHERO_GRAPHQL_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query }),
+  });
+  const json: any = await res.json();
+  const nodes: any[] = (json?.data?.orders?.data?.edges ?? []).map((e: any) => e.node);
+  const live = nodes.find((n) => !/cancel/i.test(String(n?.fulfillment_status || '')));
+  return live ? { orderId: live.id, orderNumber: live.order_number } : null;
+}
+
+/** Exported so the test can assert the message; posts via the one FBA-channel sender. */
+export function buildSyncFailedNotice(transferNumber: string, orderNumber: string, message: string): string {
+  const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return [
+    `⚠️ <b>${esc(transferNumber)} did not reach ShipHero</b>`,
+    `Order <code>${esc(orderNumber)}</code> could not be created, so no FBA shipment will be built for this transfer until it is fixed.`,
+    `Reason: ${esc(message.slice(0, 300))}`,
+    `Warehouse: no action. Office: this needs a look.`,
+  ].join('\n');
+}
+
+async function notifySyncFailed(transferNumber: string, orderNumber: string, message: string): Promise<void> {
+  try {
+    const { sendTelegram } = await import('./fba-post-process');
+    await sendTelegram(buildSyncFailedNotice(transferNumber, orderNumber, message));
+  } catch (err: any) {
+    console.error(`[shiphero-orders] sync-failed notice not delivered for ${transferNumber}: ${err?.message || err}`);
   }
 }
