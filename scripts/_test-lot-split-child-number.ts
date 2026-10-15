@@ -29,7 +29,9 @@ ok('lot name is sanitized the same way the old path did', !/[^A-Za-z0-9_-]/.test
 ok('Reference-override parent (no PLATFORM_SKU_TR shape) -> hard cut to 32, never throws', buildLotSplitChildNumber('SPECIAL HANDLING SPLIT B TR-00001 EXTRA LONG', 'L1').length <= 32);
 ok('absurdly long lot -> still <= 32', buildLotSplitChildNumber('AMZ_X_00001', 'L'.repeat(40)).length <= 32);
 const src = fs.readFileSync(path.join(__dirname, '../lib/shiphero-orders.ts'), 'utf8');
-ok('shiphero-orders uses buildLotSplitChildNumber for the child', /childNumber = buildLotSplitChildNumber\(input\.orderNumber, lot\.name\)/.test(src));
+// 2026-10-15: sync no longer creates lot-split children (one ShipHero order per transfer).
+// buildLotSplitChildNumber stays for resolving children that already exist in ShipHero.
+ok('🔴 shiphero-orders does NOT create lot-split child orders any more', !/buildLotSplitChildNumber\(/.test(src) && !/computeLotSplitPlan/.test(src));
 ok('no raw `${input.orderNumber}-${lotSuffix}` left', !/\$\{input\.orderNumber\}-\$\{lotSuffix\}/.test(src));
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

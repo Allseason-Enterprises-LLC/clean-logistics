@@ -328,6 +328,24 @@ export async function resolveLotChildOrder(
 }
 
 /** Pure: select the child order for a lot from a response_payload. */
+/** The ShipHero order number recorded on the bridge row for this transfer (null if none/unknown). */
+export async function resolveBridgeOrderNumber(cin7TransferNumber: string): Promise<string | null> {
+  try {
+    const tr = extractTransferNumber(cin7TransferNumber);
+    if (!tr) return null;
+    const { data } = await getSupabase()
+      .from('cin7_transfer_shiphero_orders')
+      .select('shiphero_order_number, status')
+      .eq('cin7_transfer_number', tr)
+      .maybeSingle();
+    if (!data || data.status !== 'synced' || !data.shiphero_order_number) return null;
+    return String(data.shiphero_order_number);
+  } catch (err: any) {
+    console.warn(`[fba-post-process] bridge order lookup failed for ${cin7TransferNumber}: ${err?.message || err}`);
+    return null;
+  }
+}
+
 export function pickLotChild(responsePayload: any, lot: string): { orderId: string; orderNumber: string } | null {
   const children = responsePayload?.child_orders;
   if (!Array.isArray(children)) return null;
@@ -754,6 +772,20 @@ export async function postProcessFbaShipment(
 
   if (!shOrder && input.shipheroOrderNumberOverride) {
     shOrder = await findShipheroOrder(shToken, input.shipheroOrderNumberOverride);
+  }
+  // One order per transfer (2026-10-15): the bridge row names THE order. Prefer
+  // it over the TR scan, which returns whichever live order matches the TR
+  // token first — ambiguous while legacy lot-children coexist with a parent.
+  if (!shOrder) {
+    const bridged = await resolveBridgeOrderNumber(input.cin7TransferNumber);
+    if (bridged) {
+      const live = await findShipheroOrder(shToken, bridged);
+      if (live) {
+        shOrder = live;
+        shOrderNumber = bridged;
+        console.log(`[fba-post-process] resolved ${input.cin7TransferNumber} → ${bridged} via bridge row`);
+      }
+    }
   }
   if (!shOrder) {
     if (input.shipheroOrderNumberOverride) {
