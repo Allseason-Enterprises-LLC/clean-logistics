@@ -86,3 +86,63 @@ export function allocateFefoByLot(
   }
   return allocations;
 }
+
+export interface FbaItem {
+  sku: string;
+  quantity: number;
+  lot?: string;
+}
+
+/**
+ * Collapse CIN7 lines of the same SKU into one item before lot allocation.
+ *
+ * CIN7 splits one SKU across several lines, usually one per lot the office
+ * picked. Allocating each line separately sends every line to the same oldest
+ * lot, and every line after the first is dropped by the (transfer, sku, lot)
+ * dedup index. That shipped TR-00533, TR-00535, TR-00566 and TR-00567 short.
+ *
+ * Keyed on (sku, lot): lines with an explicit `lot` (supplemental top-ups)
+ * stay separate per lot, so a pinned lot is never re-spread by FEFO.
+ * Order of first appearance is preserved. Non-positive quantities are dropped.
+ */
+export function mergeSameSkuItems(items: Array<{ sku: unknown; quantity: unknown; lot?: unknown }>): FbaItem[] {
+  const out: FbaItem[] = [];
+  const byKey = new Map<string, FbaItem>();
+  for (const raw of items) {
+    const sku = String(raw.sku);
+    const qty = Number(raw.quantity) || 0;
+    if (qty <= 0) continue;
+    const lot = raw.lot ? String(raw.lot) : undefined;
+    const key = `${sku}\u0000${lot ?? ''}`;
+    const seen = byKey.get(key);
+    if (seen) {
+      seen.quantity += qty;
+    } else {
+      const entry: FbaItem = lot ? { sku, quantity: qty, lot } : { sku, quantity: qty };
+      byKey.set(key, entry);
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+export interface Shortfall {
+  sku: string;
+  requested: number;
+  covered: number;
+  short: number;
+}
+
+/**
+ * Compare ordered units against units actually covered by an Amazon plan
+ * (created this run, or already done by an earlier run of the same payload).
+ * Any SKU short by one unit or more is a shortfall.
+ */
+export function findShortfalls(requested: Map<string, number>, covered: Map<string, number>): Shortfall[] {
+  const out: Shortfall[] = [];
+  for (const [sku, req] of requested) {
+    const cov = covered.get(sku) ?? 0;
+    if (cov < req) out.push({ sku, requested: req, covered: cov, short: req - cov });
+  }
+  return out;
+}

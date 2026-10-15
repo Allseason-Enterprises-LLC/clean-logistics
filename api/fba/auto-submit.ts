@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createClient } from '@supabase/supabase-js';
 import { getShipHeroProductData, getShipHeroToken, getLotBreakdown } from '../../lib/shiphero-product-data';
-import { allocateFefoByLot, sanitizeLotName, type LotAllocation } from '../../lib/lot-allocation';
+import { allocateFefoByLot, sanitizeLotName, mergeSameSkuItems, findShortfalls, type LotAllocation } from '../../lib/lot-allocation';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
 import { postProcessFbaShipment, sendTelegramMarkdown } from '../../lib/fba-post-process';
 import { PartneredUnavailableError } from '../../lib/fba-inbound';
@@ -84,6 +84,33 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
+    // ---- Merge same-SKU lines BEFORE lot allocation (2026-10-14) ----
+    // CIN7 splits one SKU across several transfer lines, usually one line per
+    // lot the office picked (TR-00566: 1080 + 1080 + 180). Every line came in
+    // here as its own item WITHOUT a lot, so every line ran FEFO from scratch,
+    // landed on the SAME oldest lot, and every line after the first hit the
+    // (transfer, sku, lot) dedup index -> 23505 -> `skipped`. The run still
+    // reported success and the floor got labels for line 1 only:
+    //   TR-00533  8 of 10 boxes   TR-00566 12 of 26
+    //   TR-00567 392 of 834       TR-00535  5 of 64
+    // Summing first means FEFO sees the real ordered quantity once and spreads
+    // it across lots correctly. Keyed on (sku, lot) so an explicit-lot
+    // supplemental run (items[].lot) still targets exactly the lot asked for.
+    const mergedItems = mergeSameSkuItems(items);
+    const linesMerged = items.length - mergedItems.length;
+    if (linesMerged > 0) {
+      console.log(
+        `[fba-auto] Merged ${linesMerged} same-SKU line(s) on ${cin7_transfer_number}: ` +
+          mergedItems.map((i) => `${i.sku}=${i.quantity}u${i.lot ? ` lot ${i.lot}` : ''}`).join(', ')
+      );
+    }
+    // What was ordered vs what this run actually covered, per SKU. Checked
+    // at the end so a shortfall can never again be silent.
+    const requestedBySku = new Map<string, number>();
+    for (const i of mergedItems) requestedBySku.set(i.sku, (requestedBySku.get(i.sku) ?? 0) + i.quantity);
+    const coveredBySku = new Map<string, number>();
+    const cover = (sku: string, qty: number) => coveredBySku.set(sku, (coveredBySku.get(sku) ?? 0) + qty);
+
     // ---- Multi-lot timeout guard (added 2026-08-01 after TR-00242/00283) ----
     // Each lot = a full Amazon inbound workflow (plan→pack→place→partnered→labels,
     // ~2-4 min). Running N lots sequentially blows the 300s maxDuration mid-lot,
@@ -110,7 +137,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     const results: any[] = [];
 
-    for (const item of items) {
+    for (const item of mergedItems) {
       console.log(`[fba-auto] Processing ${item.sku} x ${item.quantity}...`);
 
       // 1. Resolve CIN7 SKU → Amazon MSKU
@@ -282,6 +309,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               `[fba-auto] Skipping ${item.sku} lot ${lot.name} — active reservation exists ` +
                 `(id=${existing?.id} status=${existing?.status} plan=${existing?.plan_id})`
             );
+            // A lot finished by an earlier run of THIS payload (self-chain or
+            // reconciler re-fire) is covered. Counted so the shortfall check
+            // below doesn't false-alarm on a chained run.
+            cover(item.sku, totalQty);
             results.push({
               sku: item.sku,
               lot: lot.name,
@@ -619,6 +650,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.error('[fba-auto] post-process failed (non-fatal):', postErr?.message);
       }
 
+      cover(item.sku, totalQty);
       results.push({
         sku: item.sku,
         amazon_sku: skuMapping.amz_sku,
@@ -672,7 +704,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
               'Content-Type': 'application/json',
               Authorization: `Bearer ${process.env.CRON_SECRET}`,
             },
-            body: JSON.stringify({ cin7_transfer_number, items, chain_depth: chainDepth + 1, ...(includePickable ? { include_pickable: true } : {}) }),
+            body: JSON.stringify({ cin7_transfer_number, items: mergedItems, chain_depth: chainDepth + 1, ...(includePickable ? { include_pickable: true } : {}) }),
           }).then(
             (r) => console.log(`[fba-auto] Chained invocation returned ${r.status}`),
             (e) => console.warn(`[fba-auto] Chained invocation fetch error: ${e?.message}`)
@@ -689,6 +721,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
     }
 
+    // ---- Shortfall check (2026-10-14) ----
+    // Nothing used to compare what we planned with what was ordered. Four
+    // transfers in one week shipped short with every status green, and the
+    // floor found each one by counting labels. Only checked once the run is
+    // finished: a deferred lot is still being worked on by the chained run.
+    const shortfalls = deferredLots.length === 0 ? findShortfalls(requestedBySku, coveredBySku) : [];
+    if (shortfalls.length > 0) {
+      const msg =
+        `⚠️ *FBA SHORTFALL — ${cin7_transfer_number}*\n` +
+        shortfalls.map((s) => `\`${s.sku}\`: labels for *${s.covered}* of *${s.requested}* units (short *${s.short}*)`).join('\n') +
+        `\n\nThe labels already made are correct. The missing units were never created on Amazon, ` +
+        `and this will NOT fix itself. Freight needs to run a top-up for the remainder.`;
+      console.error(`[fba-auto] SHORTFALL on ${cin7_transfer_number}: ${JSON.stringify(shortfalls)}`);
+      await sendFbaAlert(msg);
+    }
+
     res.status(200).json({
       cin7_transfer_number,
       processed: results.length,
@@ -696,6 +744,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       failed: results.filter(r => r.status === 'failed').length,
       deferred: deferredLots.length,
       chain_depth: chainDepth,
+      lines_merged: linesMerged,
+      shortfalls,
       results,
     });
   } catch (error) {
