@@ -80,7 +80,13 @@ export async function applyPreflightGate(
   // marketing have already been told — refresh the hold silently.
   // (2026-10-03: TR-00484/00489 each got the ⏸ notice twice in 15 minutes.)
   const existingHold: MarketingHold | undefined = transfer.existingHold ?? undefined;
-  const sameHold = !!existingHold && JSON.stringify([...existingHold.codes].sort()) === JSON.stringify(merged.marketing.map((b) => b.code).sort());
+  const sameCodes = !!existingHold && JSON.stringify([...existingHold.codes].sort()) === JSON.stringify(merged.marketing.map((b) => b.code).sort());
+  // 2026-10-16 (TR-00543): dedupe ONLY a hold whose notice was DELIVERED. The
+  // hold is persisted whether or not the send succeeded, so deduping on codes
+  // alone turned one failed send into permanent silence — held 8 days, never in
+  // the channel. `notified === false` → retry every tick until it lands.
+  // Legacy holds (field absent) count as delivered: no re-ping on deploy.
+  const sameHold = sameCodes && existingHold!.notified !== false;
 
   // ── Marketing first: if the listing is the problem, a floor WO for data
   //    entry is still useful, but the FNSKU stage must wait. Post the notice
@@ -140,8 +146,10 @@ export async function applyPreflightGate(
 
   // ── Marketing-only hold: no WO. Park with a hold marker the reconciler
   //    honours; it clears itself when preflight passes on a later tick.
+  // Record delivery: sameHold → already delivered earlier; else this tick's result.
   await parkMarketingHold(deps.supabase, transfer.id, transfer.destinationName || '', {
     since: existingHold?.since ?? nowIso, codes: merged.marketing.map((b) => b.code), summary: merged.marketing.map((b) => b.summary).join('; '),
+    notified: sameHold ? true : marketingNotified,
   });
   return { gated: true, result: merged, marketingNotified, hold: 'marketing' };
 }
@@ -183,7 +191,12 @@ export function buildMarketingHoldNotice(args: { transferNumber: string; orderNu
   return L.join('\n');
 }
 
-export interface MarketingHold { since: string; codes: string[]; summary: string }
+export interface MarketingHold {
+  since: string; codes: string[]; summary: string;
+  /** Did the marketing notice for THESE codes reach the channel? false → retried
+   *  next tick. Absent on pre-2026-10-16 holds (treated as delivered). */
+  notified?: boolean;
+}
 
 export async function parkMarketingHold(supabase: SupabaseClient, cin7TransferId: string, cin7Destination: string, hold: MarketingHold): Promise<void> {
   const { data: row, error: readErr } = await supabase
