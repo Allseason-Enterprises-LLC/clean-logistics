@@ -112,6 +112,14 @@ export interface CIN7TransferSyncResult {
   } | null;
   duration_ms: number;
   modifiedSince: string | null;
+  /** HTTP requests this run sent to CIN7 (list pages + detail, retries included). */
+  cin7_calls: number;
+  /** How many of those came back rate-limited (429 or limit-text 200). */
+  cin7_rate_limited: number;
+  /** Total time spent waiting on CIN7 Retry-After this run. */
+  cin7_wait_ms: number;
+  /** True if CIN7 rate limiting stopped this run's CIN7 work early. */
+  cin7_deferred: boolean;
 }
 
 export interface ShipHeroTransferSyncSummary {

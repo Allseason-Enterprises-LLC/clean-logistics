@@ -37,6 +37,17 @@ const CIN7_BASE_URL = 'https://inventory.dearsystems.com/ExternalApi/v2';
  */
 const FBA_HANDOFF_STAGGER_MS = 8_000;
 const FBA_HANDOFF_DRAIN_BUDGET_MS = 230_000;
+/**
+ * Run-relative limits (2026-10-19, CIN7 429 retry). A CIN7 rate-limit wait is
+ * 60–65s, so the CIN7 phase can now take minutes. Two consequences:
+ *  - CIN7 waits are only taken if they end within CIN7_PHASE_BUDGET_MS of run
+ *    start; otherwise the call is deferred (transfer skipped, nothing written).
+ *  - The handoff drain may not START a handoff after RUN_HANDOFF_CUTOFF_MS from
+ *    run start (each blocks ≤30s; 255+30+slack < 300 maxDuration). Leftovers go
+ *    to the reconciler, exactly like a spent drain budget.
+ */
+export const CIN7_PHASE_BUDGET_MS = 170_000;
+const RUN_HANDOFF_CUTOFF_MS = 255_000;
 const CIN7_ACCOUNT_ID = process.env.CIN7_ACCOUNT_ID!;
 const CIN7_API_KEY = process.env.CIN7_API_KEY!;
 
@@ -98,7 +109,106 @@ function assertCin7Credentials() {
   }
 }
 
-async function executeCIN7Request<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
+/**
+ * CIN7 rate limit (2026-10-19). The CIN7 key is ACCOUNT-WIDE: 60 calls / 60s
+ * shared by this repo's crons, checkoutchamp-cin7-sync (*\/5), brandmind-api,
+ * and V100-1 scripts. Bursts happen whenever those coincide. CIN7 signals the
+ * limit two ways: HTTP 429, or (seen in the wild) HTTP 200 whose body is the
+ * text "... calls per 60 seconds API limit". Both are treated as 429.
+ *
+ * On a rate limit we wait Retry-After (CIN7 sends "60 Seconds"; default 60,
+ * cap 65) and retry up to CIN7_RATE_LIMIT_MAX_RETRIES times, then throw a
+ * Cin7RateLimitError. 401/403/5xx/other errors are NOT retried (unchanged).
+ *
+ * A wait is only taken if it ends before the caller's `deadline` (epoch ms).
+ * If it would not, we throw immediately instead — the caller stops calling
+ * CIN7 for the rest of the run and leaves the work for the next tick, rather
+ * than being killed by Vercel maxDuration mid-run.
+ */
+export const CIN7_RATE_LIMIT_MAX_RETRIES = 2;
+export const CIN7_RETRY_AFTER_DEFAULT_S = 60;
+export const CIN7_RETRY_AFTER_CAP_S = 65;
+const CIN7_RATE_LIMIT_BODY = /calls per 60 seconds API limit/i;
+
+export class Cin7RateLimitError extends Error {
+  readonly rateLimited = true;
+  constructor(message: string, readonly attempts: number, readonly deferred: boolean) {
+    super(message);
+    this.name = 'Cin7RateLimitError';
+  }
+}
+
+export function isCin7RateLimitError(err: unknown): err is Cin7RateLimitError {
+  return !!err && (err as any).rateLimited === true;
+}
+
+/** "60 Seconds" → 60; missing/garbage → 60; capped at 65. */
+export function parseCin7RetryAfterSeconds(header: string | null | undefined): number {
+  const m = /^\s*(\d+)/.exec(header || '');
+  const n = m ? Number(m[1]) : CIN7_RETRY_AFTER_DEFAULT_S;
+  return Math.min(Number.isFinite(n) && n > 0 ? n : CIN7_RETRY_AFTER_DEFAULT_S, CIN7_RETRY_AFTER_CAP_S);
+}
+
+/**
+ * A 200 body that is really CIN7's rate-limit message: plain text, or a DEAR
+ * error envelope ({Exception|Message|ErrorCode} / array of them) carrying the
+ * phrase. A real transfer payload whose free-text Note happens to contain the
+ * phrase is NOT a rate limit.
+ */
+export function isCin7RateLimitBody(bodyText: string): boolean {
+  if (!CIN7_RATE_LIMIT_BODY.test(bodyText)) return false;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return true; // plain text
+  }
+  if (typeof parsed === 'string') return true;
+  const entries = Array.isArray(parsed) ? parsed : [parsed];
+  return entries.some(
+    (e) =>
+      e && typeof e === 'object' &&
+      ['Exception', 'Message', 'message', 'error', 'Error'].some(
+        (k) => typeof e[k] === 'string' && CIN7_RATE_LIMIT_BODY.test(e[k])
+      )
+  );
+}
+
+// Process-wide CIN7 HTTP call meter (every request to dearsystems, retries
+// included). The sync reports its own per-run meter as `cin7_calls`.
+const cin7Meter = { calls: 0, rateLimited: 0, waitedMs: 0 };
+export function readCin7Meter() {
+  return { ...cin7Meter };
+}
+
+let cin7Sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Tests only: replace the wait so retry tests don't sleep 60s. */
+export function __setCin7SleepForTests(fn: (ms: number) => Promise<void>) {
+  cin7Sleep = fn;
+}
+
+export interface Cin7CallMeter {
+  calls: number;
+  rateLimited: number;
+  waitedMs: number;
+}
+export const newCin7Meter = (): Cin7CallMeter => ({ calls: 0, rateLimited: 0, waitedMs: 0 });
+
+export interface Cin7RequestOptions {
+  /** Epoch ms. A rate-limit wait that would end after this is not taken. */
+  deadline?: number;
+  /** Override retry count (0 = never retry on 429). */
+  maxRetries?: number;
+  /** Per-run meter (a warm instance may serve overlapping runs, so the
+   *  process-wide meter alone can't attribute calls to one run). */
+  meter?: Cin7CallMeter;
+}
+
+export async function executeCIN7Request<T>(
+  endpoint: string,
+  params: Record<string, string> = {},
+  opts: Cin7RequestOptions = {}
+): Promise<T> {
   assertCin7Credentials();
 
   const url = new URL(`${CIN7_BASE_URL}${endpoint}`);
@@ -108,54 +218,103 @@ async function executeCIN7Request<T>(endpoint: string, params: Record<string, st
     }
   });
 
-  const response = await fetch(url.toString(), {
-    method: 'GET',
-    headers: {
-      'api-auth-accountid': CIN7_ACCOUNT_ID,
-      'api-auth-applicationkey': CIN7_API_KEY,
-      'Content-Type': 'application/json',
-    },
-  });
+  const maxRetries = opts.maxRetries ?? CIN7_RATE_LIMIT_MAX_RETRIES;
+  for (let attempt = 1; ; attempt++) {
+    cin7Meter.calls++;
+    if (opts.meter) opts.meter.calls++;
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: {
+        'api-auth-accountid': CIN7_ACCOUNT_ID,
+        'api-auth-applicationkey': CIN7_API_KEY,
+        'Content-Type': 'application/json',
+      },
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`CIN7 transfer API error: ${response.status} - ${errorText}`);
+    const bodyText = await response.text();
+    const rateLimited = response.status === 429 || (response.ok && isCin7RateLimitBody(bodyText));
+
+    if (rateLimited) {
+      cin7Meter.rateLimited++;
+      if (opts.meter) opts.meter.rateLimited++;
+      const waitS = parseCin7RetryAfterSeconds(response.headers.get('retry-after'));
+      const summary = `CIN7 transfer API error: 429 (rate limited) on ${endpoint} - ${bodyText.slice(0, 200)}`;
+      if (attempt > maxRetries) {
+        throw new Cin7RateLimitError(`${summary} [gave up after ${attempt} calls]`, attempt, false);
+      }
+      if (opts.deadline !== undefined && Date.now() + waitS * 1000 > opts.deadline) {
+        throw new Cin7RateLimitError(
+          `${summary} [deferred to next tick: a ${waitS}s wait would overrun this run's time budget]`,
+          attempt,
+          true
+        );
+      }
+      console.warn(`[CIN7 Transfer] 429 on ${endpoint} (call ${attempt}) — waiting ${waitS}s (Retry-After) then retrying`);
+      cin7Meter.waitedMs += waitS * 1000;
+      if (opts.meter) opts.meter.waitedMs += waitS * 1000;
+      await cin7Sleep(waitS * 1000);
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`CIN7 transfer API error: ${response.status} - ${bodyText}`);
+    }
+
+    return JSON.parse(bodyText) as T;
   }
+}
 
-  return response.json() as Promise<T>;
+/**
+ * CIN7 v2 is inconsistent about casing, so detail fetch can try up to four
+ * paths. The path that last worked is remembered for the life of the process
+ * and tried first, so a warm run spends one call per transfer, not up to four.
+ */
+export const CIN7_DETAIL_ENDPOINTS = [
+  '/stockTransfer',
+  '/StockTransfer',
+  '/stockTransferOrder',
+  '/StockTransferOrder',
+] as const;
+let workingDetailEndpoint: string | null = null;
+/** Tests only. */
+export function __resetCin7DetailPathCache() {
+  workingDetailEndpoint = null;
 }
 
 /**
  * Fetch a single stock transfer's full detail (including line items / products)
  * via GET /StockTransfer?TaskID=xxx
  */
-export async function fetchCIN7TransferDetail(taskId: string): Promise<Record<string, any>> {
+export async function fetchCIN7TransferDetail(
+  taskId: string,
+  opts: Cin7RequestOptions = {}
+): Promise<Record<string, any>> {
   console.log(`[CIN7 Transfer] Fetching detail for TaskID ${taskId}`);
-  
-  // Try multiple endpoint paths — CIN7 v2 API is inconsistent with casing
-  const endpointsToTry = [
-    '/stockTransfer',
-    '/StockTransfer', 
-    '/stockTransferOrder',
-    '/StockTransferOrder',
-  ];
-  
+
+  const endpointsToTry = workingDetailEndpoint
+    ? [workingDetailEndpoint, ...CIN7_DETAIL_ENDPOINTS.filter((e) => e !== workingDetailEndpoint)]
+    : [...CIN7_DETAIL_ENDPOINTS];
+
   let lastError: Error | null = null;
   for (const endpoint of endpointsToTry) {
     try {
-      const response = await executeCIN7Request<Record<string, any>>(endpoint, { TaskID: taskId });
+      const response = await executeCIN7Request<Record<string, any>>(endpoint, { TaskID: taskId }, opts);
       // If we got a valid object back (not HTML), return it
       if (response && typeof response === 'object') {
         console.log(`[CIN7 Transfer] Detail fetch succeeded via ${endpoint}`);
+        workingDetailEndpoint = endpoint;
         return response;
       }
     } catch (err) {
+      // A rate limit is account-wide: another casing would only burn more of
+      // the shared quota. Stop here.
+      if (isCin7RateLimitError(err)) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
       console.log(`[CIN7 Transfer] Detail fetch failed via ${endpoint}: ${lastError.message}`);
       // Try next endpoint
     }
   }
-  
+
   throw lastError || new Error(`All detail endpoints failed for TaskID ${taskId}`);
 }
 
@@ -368,7 +527,8 @@ function mapRawTransfer(raw: Record<string, any>): CIN7TransferOrder {
 
 export async function fetchCIN7TransferOrdersPage(
   page = 1,
-  options: Pick<CIN7TransferSyncOptions, 'modifiedSince' | 'limit' | 'status'> = {}
+  options: Pick<CIN7TransferSyncOptions, 'modifiedSince' | 'limit' | 'status'> = {},
+  reqOpts: Cin7RequestOptions = {}
 ): Promise<CIN7TransferOrder[]> {
   const params: Record<string, string> = {
     Page: String(page),
@@ -382,7 +542,8 @@ export async function fetchCIN7TransferOrdersPage(
 
   const response = await executeCIN7Request<CIN7TransferListResponse>(
     CIN7_TRANSFER_ASSUMPTIONS.endpoint,
-    params
+    params,
+    reqOpts
   );
 
   const rawTransfers = extractTransferList(response);
@@ -390,7 +551,8 @@ export async function fetchCIN7TransferOrdersPage(
 }
 
 export async function fetchCIN7TransferOrders(
-  options: Pick<CIN7TransferSyncOptions, 'modifiedSince' | 'limit' | 'status' | 'maxPages'> = {}
+  options: Pick<CIN7TransferSyncOptions, 'modifiedSince' | 'limit' | 'status' | 'maxPages'> = {},
+  reqOpts: Cin7RequestOptions = {}
 ): Promise<CIN7TransferOrder[]> {
   const pageSize = options.limit || CIN7_TRANSFER_ASSUMPTIONS.defaultPageSize;
   const maxPages = options.maxPages || 20;
@@ -401,7 +563,7 @@ export async function fetchCIN7TransferOrders(
       modifiedSince: options.modifiedSince,
       limit: pageSize,
       status: options.status,
-    });
+    }, reqOpts);
 
     transfers.push(...pageResults);
 
@@ -586,6 +748,20 @@ export async function syncCIN7LasVegasTransferOrders(
   // don't stampede the Amazon SP-API quota (2026-09-21 incident — see the
   // drain block below).
   const pendingFbaHandoffs: FbaHandoffInput[] = [];
+  // Every CIN7 HTTP call this run makes (list pages + detail, retries
+  // included) is counted here and reported as `cin7_calls`. Rate-limit waits
+  // are only taken if they end inside the CIN7 phase budget.
+  const cin7: Cin7RequestOptions = { meter: newCin7Meter(), deadline: startedAt + CIN7_PHASE_BUDGET_MS };
+  // Set when CIN7 rate-limits us past the retries/budget: the rest of this run
+  // makes NO more CIN7 calls (the key is shared account-wide; hammering it only
+  // hurts the other integrations). Untouched transfers are listed in errors.
+  let cin7RateLimited: string | null = null;
+  const cin7Stats = () => ({
+    cin7_calls: cin7.meter!.calls,
+    cin7_rate_limited: cin7.meter!.rateLimited,
+    cin7_wait_ms: cin7.meter!.waitedMs,
+    cin7_deferred: cin7RateLimited !== null,
+  });
 
   try {
     const allowedStatuses = (options.allowedStatuses || [...CIN7_TRANSFER_ASSUMPTIONS.defaultEligibleStatuses]).map((s) => normalizeStatus(s));
@@ -599,7 +775,7 @@ export async function syncCIN7LasVegasTransferOrders(
       limit: options.limit,
       maxPages: options.maxPages,
       status: options.status,
-    });
+    }, cin7);
 
     fetched = transfers.length;
 
@@ -620,9 +796,15 @@ export async function syncCIN7LasVegasTransferOrders(
       try {
         // Fetch transfer detail to get line items (SKUs + quantities)
         if (transfer.id && transfer.lines.length === 0) {
+          if (cin7RateLimited) {
+            // Stop cleanly: nothing has been written for this transfer.
+            errors.push(`Transfer ${transfer.transferNumber}: not attempted — CIN7 rate limit earlier in this run (${cin7RateLimited})`);
+            skipped++;
+            continue;
+          }
           console.log(`[CIN7 Transfer] Fetching detail for ${transfer.transferNumber} (TaskID: ${transfer.id})`);
           try {
-            const detail = await fetchCIN7TransferDetail(transfer.id);
+            const detail = await fetchCIN7TransferDetail(transfer.id, cin7);
             const detailLines = extractDetailLines(detail, transfer.transferNumber);
             if (detailLines.length > 0) {
               transfer.lines = detailLines;
@@ -634,6 +816,9 @@ export async function syncCIN7LasVegasTransferOrders(
             await new Promise((resolve) => setTimeout(resolve, 200));
           } catch (detailError) {
             const msg = detailError instanceof Error ? detailError.message : 'Unknown';
+            if (isCin7RateLimitError(detailError)) {
+              cin7RateLimited = detailError.deferred ? 'time budget for a Retry-After wait spent' : `still limited after ${detailError.attempts} calls`;
+            }
             console.error(`[CIN7 Transfer] DETAIL FETCH FAILED for ${transfer.transferNumber}: ${msg}`);
             // DO NOT create order without line items — skip and retry next cycle
             errors.push(`Transfer ${transfer.transferNumber}: Detail fetch failed (no line items) - ${msg}`);
@@ -910,7 +1095,7 @@ export async function syncCIN7LasVegasTransferOrders(
           `serially, ${FBA_HANDOFF_STAGGER_MS}ms apart`
       );
       for (let i = 0; i < pendingFbaHandoffs.length; i++) {
-        if (Date.now() - drainStart > FBA_HANDOFF_DRAIN_BUDGET_MS) {
+        if (Date.now() - drainStart > FBA_HANDOFF_DRAIN_BUDGET_MS || Date.now() - startedAt > RUN_HANDOFF_CUTOFF_MS) {
           const left = pendingFbaHandoffs.slice(i).map((h) => h.cin7TransferNumber);
           console.warn(
             `[CIN7 Transfer] Handoff drain budget spent — deferring ${left.length} ` +
@@ -948,6 +1133,7 @@ export async function syncCIN7LasVegasTransferOrders(
       },
       duration_ms: Date.now() - startedAt,
       modifiedSince: options.modifiedSince || null,
+      ...cin7Stats(),
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -964,6 +1150,8 @@ export async function syncCIN7LasVegasTransferOrders(
       shipHeroWarehouse: null,
       duration_ms: Date.now() - startedAt,
       modifiedSince: options.modifiedSince || null,
+      ...cin7Stats(),
+      cin7_deferred: cin7RateLimited !== null || isCin7RateLimitError(error),
     };
   }
 }

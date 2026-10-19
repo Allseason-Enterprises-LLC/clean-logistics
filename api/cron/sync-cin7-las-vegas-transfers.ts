@@ -73,6 +73,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       created: result.created,
       skipped: result.skipped,
       errors: result.errors.length,
+      cin7_calls: result.cin7_calls,
+      cin7_rate_limited: result.cin7_rate_limited,
+      cin7_wait_ms: result.cin7_wait_ms,
+      cin7_deferred: result.cin7_deferred,
     });
 
     return res.status(result.success ? 200 : 500).json({

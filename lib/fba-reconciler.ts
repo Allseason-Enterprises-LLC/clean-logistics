@@ -53,7 +53,11 @@ export function isCin7StatusFireable(status: string | null | undefined): boolean
  * Live CIN7 status for a bridge row, or null if it cannot be read.
  * Injected for tests via `deps`. Fail CLOSED: null → do not fire.
  */
-export async function readLiveCin7Status(row: { request_payload?: any; cin7_transfer_id?: string | null }, fetchDetail = fetchCIN7TransferDetail): Promise<string | null> {
+// maxRetries 0: the reconciler must not spend 60s+ of its own 300s budget per
+// row on a CIN7 Retry-After. A 429 here reads as null → fail CLOSED → next tick
+// (behaviour unchanged by the 2026-10-19 sync retry).
+const readDetailNoWait = (taskId: string) => fetchCIN7TransferDetail(taskId, { maxRetries: 0 });
+export async function readLiveCin7Status(row: { request_payload?: any; cin7_transfer_id?: string | null }, fetchDetail: (taskId: string) => Promise<Record<string, any>> = readDetailNoWait): Promise<string | null> {
   const taskId = row?.request_payload?.rawTransfer?.TaskID || row?.cin7_transfer_id;
   if (!taskId) return null;
   try {
