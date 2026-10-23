@@ -146,6 +146,11 @@ export async function getShipHeroProductData(
   sku: string
 ): Promise<ProductData> {
   // Pull product details, kit info, and (if non-kit) lots in one round-trip.
+  // ⚠️ expiration_lots page size is 100, NOT 10 (TR-00594, 2026-10-20). Inactive
+  // (quarantined/expired) lots stay listed, oldest first. Once a SKU had 10 dead
+  // lots, its only ACTIVE lot was row 11 -> never seen -> expirationDate=null ->
+  // every auto-submit for the SKU failed "No expiration date found in ShipHero".
+  // Guard: scripts/_test-expiration-lot-page-size.ts.
   const productQuery = `{
     products(sku: "${sku}") {
       data(first: 1) {
@@ -171,7 +176,7 @@ export async function getShipHeroProductData(
       }
     }
     expiration_lots(sku: "${sku}") {
-      data(first: 10) {
+      data(first: 100) {
         edges {
           node {
             name
@@ -226,7 +231,7 @@ export async function getShipHeroProductData(
       if (!comp?.sku) continue;
       const compQuery = `{
         expiration_lots(sku: "${comp.sku}") {
-          data(first: 10) {
+          data(first: 100) {
             edges {
               node {
                 name
