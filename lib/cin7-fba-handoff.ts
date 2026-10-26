@@ -14,6 +14,8 @@
 export interface FbaTransferItem {
   sku: string;
   quantity: number;
+  /** CIN7 lot on the transfer line. When present auto-submit labels exactly this lot. */
+  lot?: string;
 }
 
 export interface FbaHandoffInput {
@@ -186,6 +188,7 @@ async function triggerFbaAutoSubmit(input: FbaHandoffInput): Promise<void> {
     items: input.items.map((i) => ({
       sku: i.sku,
       quantity: i.quantity,
+      ...(i.lot ? { lot: i.lot } : {}),
     })),
   };
 

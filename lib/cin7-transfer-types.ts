@@ -15,6 +15,13 @@ export interface CIN7TransferOrderLine {
   sku: string;
   name: string;
   quantity: number;
+  /**
+   * Lot (CIN7 `BatchSN`) the office allocated on this line, when it has one.
+   * The FBA pipeline labels EXACTLY this lot — see lib/transfer-lots.ts.
+   */
+  lot?: string | null;
+  /** Lot expiry as written on the CIN7 line (YYYY-MM-DD), when present. */
+  lotExpiry?: string | null;
   receivedQuantity?: number;
   unitCost?: number;
   notes?: string | null;
@@ -57,6 +64,9 @@ export interface ShipHeroOrderLineItemInput {
   quantity: number;
   name?: string;
   note?: string;
+  /** CIN7 lot for this line. Persisted on the bridge row; NOT sent to ShipHero. */
+  lot?: string;
+  lotExpiry?: string;
 }
 
 export interface ShipHeroTransferOrderInput {

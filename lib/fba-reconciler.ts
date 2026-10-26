@@ -28,7 +28,9 @@ import { autoResolveAmazonSku } from './amazon-auto-map';
 import { getShipHeroToken } from './shiphero-product-data';
 import { attemptTransportRecovery } from './fba-transport-recovery';
 import { callAmazonSpApi } from './amazon-sp-api-client';
-import { fetchCIN7TransferDetail } from './cin7-transfer-sync';
+import { fetchCIN7TransferDetail, extractDetailLines } from './cin7-transfer-sync';
+import { planTopUp, toLotItems, type ActiveRow } from './transfer-lots';
+import { extractTransferNumber } from './order-naming';
 
 /**
  * CIN7 statuses a transfer must be in for the reconciler to (re)fire it.
@@ -67,6 +69,68 @@ export async function readLiveCin7Status(row: { request_payload?: any; cin7_tran
   } catch {
     return null;
   }
+}
+
+/**
+ * Live CIN7 read for the top-up path: status AND the lot-bearing lines, from ONE
+ * detail call. Lots come from CIN7 at the fire decision (never from a cached
+ * bridge row) — the transfer goes out exactly as it is written right now.
+ * Fail CLOSED: any error → null.
+ */
+export async function readLiveCin7Transfer(
+  row: { request_payload?: any; cin7_transfer_id?: string | null; cin7_transfer_number?: string },
+  fetchDetail: (taskId: string) => Promise<Record<string, any>> = readDetailNoWait
+): Promise<{ status: string | null; lines: Array<{ sku: string; quantity: number; lot?: string | null }> } | null> {
+  const taskId = row?.request_payload?.rawTransfer?.TaskID || row?.cin7_transfer_id;
+  if (!taskId) return null;
+  try {
+    const d = await fetchDetail(String(taskId));
+    const status = d?.Status ?? d?.status ?? null;
+    const lines = extractDetailLines(d, row?.cin7_transfer_number || String(taskId)).map((l) => ({ sku: l.sku, quantity: l.quantity, lot: l.lot ?? null }));
+    return { status: status ? String(status) : null, lines };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Active fba_shipments rows for a transfer — EVERY naming form, matched the
+ * same way lib/fba-coverage.ts does: TR-00665, CIN7-TR-00665, and top-up rows
+ * like CIN7-CIN7-TR-00665-S1 (an exact `.in()` match missed these and read a
+ * whole transfer as short). Units = Amazon plan items (authoritative); falls
+ * back to the stored label_set.units; null = not labelled yet.
+ */
+async function activeRowsFor(
+  db: SupabaseClient,
+  transferNumber: string,
+  unitsForPlan: (planId: string) => Promise<number | null> = amazonPlanUnits
+): Promise<ActiveRow[]> {
+  const tr = extractTransferNumber(transferNumber) || transferNumber;
+  const { data, error } = await db
+    .from('fba_shipments')
+    .select('cin7_transfer_number, cin7_sku, cin7_lot, status, plan_id, amazon_shipment_ids, prep_instructions, updated_at')
+    .like('cin7_transfer_number', `%${tr}%`)
+    .not('status', 'in', '("failed","voided","cancelled")');
+  if (error) throw new Error(`active-row query failed: ${error.message}`);
+  const out: ActiveRow[] = [];
+  for (const r of data || []) {
+    if (extractTransferNumber((r as any).cin7_transfer_number) !== tr) continue; // %TR-00591% must not match TR-005910
+    let units: number | null = null;
+    const hasShipments = Array.isArray((r as any).amazon_shipment_ids) && (r as any).amazon_shipment_ids.length > 0;
+    if ((r as any).plan_id && hasShipments) units = await unitsForPlan((r as any).plan_id).catch(() => null);
+    if (units == null && hasShipments) {
+      const u = (r as any)?.prep_instructions?.label_set?.units;
+      if (u != null) units = Number(u);
+    }
+    out.push({ cin7_sku: (r as any).cin7_sku, cin7_lot: (r as any).cin7_lot, status: (r as any).status, units, updated_at: (r as any).updated_at });
+  }
+  return out;
+}
+
+async function amazonPlanUnits(planId: string): Promise<number | null> {
+  const r = await callAmazonSpApi<any>({ method: 'GET', path: `/inbound/fba/2024-03-20/inboundPlans/${planId}/items` });
+  const items = (r as any)?.data?.items ?? (r as any)?.items;
+  return Array.isArray(items) ? items.reduce((n: number, i: any) => n + Number(i?.quantity || 0), 0) : null;
 }
 
 const FBA_INBOUND_BASE = '/inbound/fba/2024-03-20';
@@ -495,6 +559,172 @@ async function sendTelegramAlert(message: string): Promise<void> {
   }
 }
 
+/**
+ * Partial-transfer top-up decision (2026-10-26, TR-00678). Called only for a
+ * transfer that already has ≥1 active fba_shipments row. Every gate a
+ * first-time fire has applies here too, and all of them fail CLOSED:
+ *   - the work-order gate already ran above (no top-up before kits exist);
+ *   - lots + quantities come from the LIVE CIN7 transfer at this moment;
+ *   - live CIN7 status must be fireable;
+ *   - CIN7 totals must equal the bridge row's (a transfer edited after sync is
+ *     a human decision, never auto-topped);
+ *   - labelled must be < ordered, and the un-labelled WRITTEN lots must equal
+ *     the shortfall exactly (planTopUp) — so a top-up can never over-label;
+ *   - the stale-cancelled-plan duplicate gate must pass.
+ */
+export async function planPartialTopUp(
+  db: SupabaseClient,
+  row: BridgeRow & { cin7_transfer_id?: string | null },
+  deps: { readCin7Transfer?: (row: any) => Promise<{ status: string | null; lines: Array<{ sku: string; quantity: number; lot?: string | null }> } | null> } = {}
+): Promise<ReturnType<typeof planTopUp>> {
+  const lines: Array<{ sku: string; quantity: number }> = row.request_payload?.partnerLineItems ?? [];
+  const ordered: Record<string, number> = {};
+  for (const l of lines) ordered[l.sku] = (ordered[l.sku] ?? 0) + (Number(l.quantity) || 0);
+  if (!Object.keys(ordered).length) return { kind: 'skip', detail: 'bridge row has no partnerLineItems' };
+
+  let active: ActiveRow[];
+  try {
+    active = await activeRowsFor(db, row.cin7_transfer_number);
+  } catch (e: any) {
+    return { kind: 'skip', detail: `fail-closed: ${e?.message || e}` };
+  }
+  // Cheap pre-check on cached data — whole/over/in-flight need no CIN7 call.
+  const pre = planTopUp(ordered, [], active);
+  if (pre.kind === 'whole' || pre.kind === 'over' || pre.kind === 'in_flight') return pre;
+
+  const live = await (deps.readCin7Transfer ?? readLiveCin7Transfer)(row);
+  if (!live) return { kind: 'skip', detail: 'fail-closed: live CIN7 transfer unreadable' };
+  if (!isCin7StatusFireable(live.status)) {
+    return { kind: 'skip', detail: `CIN7 says ${live.status ?? 'UNREADABLE'} — not topping up` };
+  }
+  const liveOrdered: Record<string, number> = {};
+  for (const l of live.lines) liveOrdered[l.sku] = (liveOrdered[l.sku] ?? 0) + (Number(l.quantity) || 0);
+  const same =
+    Object.keys(liveOrdered).length === Object.keys(ordered).length &&
+    Object.entries(ordered).every(([k, v]) => liveOrdered[k] === v);
+  if (!same) {
+    return {
+      kind: 'mismatch',
+      detail: `CIN7 transfer now ${JSON.stringify(liveOrdered)} but it was synced as ${JSON.stringify(ordered)} — edited after sync; a human decides`,
+    };
+  }
+  const verdict = planTopUp(ordered, toLotItems(live.lines), active);
+  if (verdict.kind !== 'top_up') return verdict;
+
+  try {
+    const stale = await findLivePlanForMissingLots(db, row.cin7_transfer_number, verdict.items);
+    if (stale) {
+      return { kind: 'mismatch', detail: `cancelled row for lot ${stale.lot} points at plan ${stale.planId} with ${stale.liveShipments} live shipment(s) — bind, do not top up` };
+    }
+  } catch (e: any) {
+    return { kind: 'skip', detail: `duplicate gate unavailable — fail-closed: ${e?.message || e}` };
+  }
+  return verdict;
+}
+
+/**
+ * Top-up duplicate gate. findLivePlanOnCancelledRows looks at EVERY plan on the
+ * transfer, which on a partial transfer always includes the lot that is already
+ * labelled — so it would block every top-up. Here: only cancelled/failed/voided
+ * rows FOR THE LOTS ABOUT TO BE TOPPED UP. If any of those plans is in fact
+ * live on Amazon, a previous attempt for that lot succeeded → never re-create.
+ * Throws on verification failure (caller fails CLOSED).
+ */
+async function findLivePlanForMissingLots(
+  db: SupabaseClient,
+  transferNumber: string,
+  items: Array<{ sku: string; lot?: string }>
+): Promise<{ lot: string; planId: string; liveShipments: number } | null> {
+  const tr = extractTransferNumber(transferNumber) || transferNumber;
+  const lots = items.map((i) => i.lot).filter(Boolean) as string[];
+  if (!lots.length) return null;
+  const { data, error } = await db
+    .from('fba_shipments')
+    .select('cin7_transfer_number, cin7_sku, cin7_lot, plan_id, status')
+    .like('cin7_transfer_number', `%${tr}%`)
+    .in('cin7_lot', lots)
+    .in('status', ['cancelled', 'failed', 'voided'])
+    .not('plan_id', 'is', null);
+  if (error) throw new Error(`top-up duplicate-gate query failed: ${error.message}`);
+  for (const r of (data || []) as any[]) {
+    if (extractTransferNumber(r.cin7_transfer_number) !== tr) continue;
+    if (!items.some((i) => i.sku === r.cin7_sku && i.lot === r.cin7_lot)) continue;
+    const resp = await callAmazonSpApi<any>({ method: 'GET', path: `${FBA_INBOUND_BASE}/inboundPlans/${r.plan_id}` });
+    const plan = resp?.data;
+    const planStatus = String(plan?.status || '').toUpperCase();
+    if (planStatus === 'VOIDED' || planStatus === 'CANCELLED') continue;
+    const live = (plan?.shipments || []).filter((s: any) => String(s?.status || '').toUpperCase() !== 'CANCELLED');
+    if (live.length > 0) return { lot: r.cin7_lot, planId: r.plan_id, liveShipments: live.length };
+  }
+  return null;
+}
+
+/** Alert the FBA channel ONCE per (transfer, verdict) for a partial transfer a
+ *  human must resolve. Recorded on request_payload.partial_alert (no DDL). */
+async function alertPartialOnce(db: SupabaseClient, row: BridgeRow, kind: string, detail: string): Promise<void> {
+  // Only transfers synced inside the lookback window alert — August history
+  // that is already over/short is in the skipped[] ledger, not the channel.
+  if (!row.synced_at || Date.now() - new Date(row.synced_at).getTime() > LOOKBACK_HOURS * 3600e3) return;
+  const key = `${kind}:${detail}`.slice(0, 300);
+  if (row.request_payload?.partial_alert === key) return;
+  await sendTelegramAlert(
+    `⚠️ *FBA: ${row.cin7_transfer_number} is not fully labelled and will NOT be auto-topped*\n\n${detail}\n\n` +
+      `Labels already made are correct. Nothing new was created on Amazon.`
+  );
+  try {
+    await db
+      .from('cin7_transfer_shiphero_orders')
+      .update({ request_payload: { ...(row.request_payload ?? {}), partial_alert: key } })
+      .eq('id', row.id);
+  } catch { /* best-effort */ }
+}
+
+/**
+ * The reconciler's branch for a transfer that already has ≥1 active
+ * fba_shipments row. Returns:
+ *   'whole'   → caller ledgers 'already_has_active_shipment_row' (unchanged)
+ *   'fired'   → only the missing written lot(s) were sent to auto-submit
+ *   'skipped' → a named partial_* disposition was pushed to result.skipped
+ */
+async function handlePartialTransfer(
+  db: SupabaseClient,
+  row: BridgeRow,
+  deps: { readCin7Transfer?: (row: any) => Promise<any> },
+  result: ReconcileResult,
+  options: { dryRun?: boolean }
+): Promise<'whole' | 'fired' | 'skipped'> {
+  const topUp = await planPartialTopUp(db, row, deps);
+  if (topUp.kind === 'whole') return 'whole';
+  if (topUp.kind !== 'top_up') {
+    result.skipped.push({ transfer: row.cin7_transfer_number, reason: `partial_${topUp.kind}`, detail: topUp.detail });
+    if (!options.dryRun && (topUp.kind === 'over' || topUp.kind === 'mismatch' || topUp.kind === 'unknown_lots')) {
+      await alertPartialOnce(db, row, topUp.kind, topUp.detail);
+    }
+    return 'skipped';
+  }
+  // Same backoff as first-time fires.
+  if (!shouldRetryNow(row).retry) {
+    result.throttled++;
+    result.skipped.push({ transfer: row.cin7_transfer_number, reason: 'partial_top_up_throttled', detail: topUp.detail });
+    return 'skipped';
+  }
+  console.log(`[reconciler] TOP-UP ${row.cin7_transfer_number}: ${topUp.detail}`);
+  if (!options.dryRun) {
+    if (result.reFired > 0) await new Promise((r) => setTimeout(r, RE_FIRE_STAGGER_MS));
+    try {
+      await fireFbaAutoSubmit({ cin7TransferNumber: row.cin7_transfer_number, items: topUp.items });
+    } catch (err: any) {
+      console.warn(`[reconciler] top-up handoff threw for ${row.cin7_transfer_number}: ${err?.message || err}`);
+    }
+    await db
+      .from('cin7_transfer_shiphero_orders')
+      .update({ last_fba_handoff_at: new Date().toISOString(), fba_handoff_attempts: row.fba_handoff_attempts + 1 })
+      .eq('id', row.id);
+  }
+  result.reFired++;
+  return 'fired';
+}
+
 /** Same rule as lookupSkuMapping (fba-orchestrator) but on the reconciler's own
  *  client — that module instantiates Supabase at import time and cannot be
  *  loaded offline. Prefer a non-FBM amazon_seller_sku; FNSKU from amazon_products. */
@@ -550,6 +780,8 @@ export async function reconcileFbaHandoffs(
     supabase?: SupabaseClient;
     dryRun?: boolean;
     readCin7Status?: (row: any) => Promise<string | null>;
+    /** Live CIN7 status + lot lines for the partial top-up path (tests inject). */
+    readCin7Transfer?: (row: any) => Promise<{ status: string | null; lines: Array<{ sku: string; quantity: number; lot?: string | null }> } | null>;
     /** Re-run preflight for a row at the fire decision. Default = live gate;
      *  pass `null` to disable (tests of unrelated paths). */
     preflight?: ((row: any) => Promise<PreflightGateResult | null>) | null;
@@ -559,6 +791,7 @@ export async function reconcileFbaHandoffs(
   const db = getSupabase(options.supabase);
   const deps = {
     readCin7Status: options.readCin7Status,
+    readCin7Transfer: options.readCin7Transfer,
     preflight: options.preflight === null ? undefined : (options.preflight ?? ((row: any) => livePreflight(db, row))),
   };
   const result: ReconcileResult = {
@@ -606,13 +839,24 @@ export async function reconcileFbaHandoffs(
         continue;
       }
 
-      // Has an active fba_shipments row? If yes, skip — pipeline already ran.
+      // Has an active fba_shipments row? Before 2026-10-26 that alone meant
+      // "pipeline already ran, skip" — so a transfer with ONE lot labelled and
+      // another lost (TR-00678: 7,380 of 10,080; the chained run for lot
+      // CN92572601 never happened) was skipped forever. Now a whole transfer
+      // is skipped as before; a PARTIAL one is handed to handlePartialTransfer
+      // (lib/transfer-lots.ts rules: only the written lots with no row, never
+      // more than the CIN7 transfer, every gate fail-closed).
       const exists = await fbaRecordExists(db, row.cin7_transfer_number);
       if (exists) {
-        result.skipped.push({
-          transfer: row.cin7_transfer_number,
-          reason: 'already_has_active_shipment_row',
-        });
+        const partial = await handlePartialTransfer(db, row, deps, result, options);
+        if (partial === 'whole') {
+          result.skipped.push({
+            transfer: row.cin7_transfer_number,
+            reason: 'already_has_active_shipment_row',
+          });
+        } else if (partial === 'fired') {
+          processed++; // ledgered as reFired (non-whole skips are pushed by the helper)
+        }
         continue;
       }
 
@@ -757,10 +1001,9 @@ export async function reconcileFbaHandoffs(
         continue;
       }
 
-      const fbaItems = items.map((it: any) => ({
-        sku: it.sku,
-        quantity: it.quantity,
-      }));
+      // Lots as written (bridge rows synced after 2026-10-26 carry them; older
+      // rows have none and fall back to FEFO exactly as before).
+      const fbaItems = toLotItems(items.map((it: any) => ({ sku: it.sku, quantity: it.quantity, lot: it.lot ?? null })));
 
       console.log(
         `[reconciler] Re-firing FBA handoff for ${row.cin7_transfer_number} ` +

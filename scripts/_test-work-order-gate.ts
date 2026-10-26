@@ -207,7 +207,9 @@ async function main() {
     const a = sync.indexOf('applyKitWorkOrderGate('); const b = sync.indexOf('if (!gated) {'); const c = sync.indexOf('pendingFbaHandoffs.push', b);
     return a > 0 && b > a && c > b; })());
   ok('gate failure path marks work_order_failed AND sets gated=true (no fire)', /work_order_failed[\s\S]{0,400}gated = true/.test(sync));
-  ok('non-kit path pushes the SAME handoff shape as before', /pendingFbaHandoffs\.push\(\{\s*cin7TransferNumber: transfer\.transferNumber,\s*items: transfer\.lines\.map/.test(sync));
+  // 2026-10-26: items now carry the CIN7 line lot (toLotItems) so transfers
+  // are labelled exactly as written — same {cin7TransferNumber, items} shape.
+  ok('non-kit path pushes the handoff with the transfer\'s lines (lots as written)', /pendingFbaHandoffs\.push\(\{\s*cin7TransferNumber: transfer\.transferNumber,\s*items: toLotItems\(transfer\.lines\)/.test(sync));
   ok('buildWorkOrderText is warehouse-facing (no engineering words)', !/reconciler|jsonb|PostgREST|bridge row/i.test(buildWorkOrderText({ transferNumber: 'TR-1', kitSku: 'S', qty: 1 }).instructions));
   ok('no order number -> falls back to TR (never a blank name)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: null, kitSku: 'S', qty: 1 }).name.startsWith('TR-1 ·'));
   ok('CIN7 Reference override flows through verbatim (order-naming escape hatch)', buildWorkOrderText({ transferNumber: 'TR-1', orderNumber: 'AMZ_SPLIT-B_00001', kitSku: 'S', qty: 1 }).name.startsWith('AMZ_SPLIT-B_00001 ·'));

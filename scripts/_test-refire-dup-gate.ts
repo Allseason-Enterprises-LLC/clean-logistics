@@ -12,9 +12,21 @@ const ok = (l: string, c: boolean, x = '') => { if (!c) fails++; console.log(`${
 const src = fs.readFileSync(path.join(__dirname, '../lib/fba-reconciler.ts'), 'utf8');
 
 ok('helper exists', src.includes('async function findLivePlanOnCancelledRows'));
-ok('gate runs BEFORE fireFbaAutoSubmit',
-   src.indexOf('findLivePlanOnCancelledRows(db, row.cin7_transfer_number)') < src.indexOf('fireFbaAutoSubmit(')
-   && src.indexOf('findLivePlanOnCancelledRows(db, row.cin7_transfer_number)') > -1);
+// The main re-fire: its dup gate precedes its fire INSIDE the candidate loop.
+{
+  const loop = src.indexOf('for (const row of candidates)');
+  const gate = src.indexOf('findLivePlanOnCancelledRows(db, row.cin7_transfer_number)', loop);
+  const mainFire = src.indexOf('items: fbaItems', loop);
+  ok('gate runs BEFORE fireFbaAutoSubmit', gate > loop && mainFire > gate, `gate=${gate} fire=${mainFire}`);
+}
+// 2026-10-26: the partial top-up fire (handlePartialTransfer) has its OWN
+// per-lot dup gate inside planPartialTopUp, which must run before that fire.
+{
+  const top = src.slice(src.indexOf('export async function planPartialTopUp('), src.indexOf('async function alertPartialOnce('));
+  const h = src.slice(src.indexOf('async function handlePartialTransfer('), src.indexOf('/** Same rule as lookupSkuMapping'));
+  ok('top-up: per-lot dup gate is part of the decision', /findLivePlanForMissingLots\(db, row\.cin7_transfer_number, verdict\.items\)/.test(top));
+  ok('top-up: fire only after the decision returns top_up', h.indexOf('planPartialTopUp(db, row, deps)') < h.indexOf('fireFbaAutoSubmit(') && /if \(topUp\.kind !== 'top_up'\)/.test(h));
+}
 ok('reuses the shared SP-API client', src.includes("callAmazonSpApi") && src.includes('/inboundPlans/${planId}'));
 ok('queries BOTH transfer-number forms (CIN7- prefix quirk)',
    /startsWith\('CIN7-'\) \? transferNumber\.slice\(5\) : `CIN7-\$\{transferNumber\}`/.test(src));
