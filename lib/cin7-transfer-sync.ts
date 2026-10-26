@@ -9,6 +9,7 @@ import {
 } from './cin7-transfer-types';
 import { createShipHeroOrderFromCIN7Transfer } from './shiphero-orders';
 import { fireFbaAutoSubmit, isFbaDestination, type FbaHandoffInput } from './cin7-fba-handoff';
+import { readCin7LineLot, readCin7LineExpiry, toLotItems } from './transfer-lots';
 import { applyKitWorkOrderGate, buildWorkOrdersDigestNotice, type WorkOrderState } from './kit-work-order-gate';
 import { applyPreflightGate } from './fba-preflight-gate';
 import { gatherPreflightFacts, hasPriorFbaShipmentRow } from './fba-preflight-facts';
@@ -322,7 +323,7 @@ export async function fetchCIN7TransferDetail(
  * Extract line items from a transfer detail response.
  * The detail endpoint returns product/line data under various possible keys.
  */
-function extractDetailLines(detail: Record<string, any>, transferRef: string): CIN7TransferOrderLine[] {
+export function extractDetailLines(detail: Record<string, any>, transferRef: string): CIN7TransferOrderLine[] {
   // Try multiple possible keys for the line items array
   const lineKeys = ['Lines', 'OrderLines', 'TransferOrderLines', 'Products', 'Items', 'Line'];
   let rawLines: any[] | null = null;
@@ -378,6 +379,8 @@ function extractDetailLines(detail: Record<string, any>, transferRef: string): C
       receivedQuantity: coerceNumber(line.ReceivedQuantity ?? line.ReceivedQty ?? line.QuantityReceived),
       unitCost: coerceNumber(line.Price ?? line.UnitCost ?? line.Cost ?? line.AverageCost, 0),
       notes: pickFirstString(line, ['Comment', 'Notes', 'Note']),
+      lot: readCin7LineLot(line),
+      lotExpiry: readCin7LineExpiry(line),
       raw: line,
     };
   }).filter(Boolean) as CIN7TransferOrderLine[];
@@ -469,6 +472,8 @@ function extractTransferLines(raw: Record<string, any>, transferRef: string): CI
       receivedQuantity: coerceNumber(line.ReceivedQuantity ?? line.ReceivedQty ?? line.QuantityReceived),
       unitCost: coerceNumber(line.Price ?? line.UnitCost ?? line.Cost, 0),
       notes: pickFirstString(line, ['Comment', 'Notes', 'Note']),
+      lot: readCin7LineLot(line),
+      lotExpiry: readCin7LineExpiry(line),
       raw: line,
     };
   }).filter(Boolean) as CIN7TransferOrderLine[];
@@ -648,11 +653,16 @@ function buildShipHeroTransferOrderInput(transfer: CIN7TransferOrder): ShipHeroT
     orderNumber,
     customerAccountId: null,
     profile: 'normal',
+    // lot/lotExpiry are kept on the bridge row (request_payload) so the
+    // reconciler and coverage check know which lots the office wrote. They are
+    // NOT sent to ShipHero (lib/shiphero-orders.ts maps sku/qty only).
     partnerLineItems: transfer.lines.map((line) => ({
       sku: line.sku,
       quantity: line.quantity,
       name: line.name,
       note: line.notes || undefined,
+      ...(line.lot ? { lot: line.lot } : {}),
+      ...(line.lotExpiry ? { lotExpiry: line.lotExpiry } : {}),
     })),
     shippingAddress: {
       first_name: 'ASE',
@@ -1056,12 +1066,12 @@ export async function syncCIN7LasVegasTransferOrders(
             }
 
             if (!gated) {
+              // Lots AS WRITTEN on the CIN7 lines (lib/transfer-lots.ts):
+              // auto-submit labels exactly these lots instead of re-running
+              // FEFO. Lines with no lot fall back to FEFO as before.
               pendingFbaHandoffs.push({
                 cin7TransferNumber: transfer.transferNumber,
-                items: transfer.lines.map((line) => ({
-                  sku: line.sku,
-                  quantity: line.quantity,
-                })),
+                items: toLotItems(transfer.lines),
               });
             }
           }
