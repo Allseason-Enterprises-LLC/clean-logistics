@@ -16,6 +16,7 @@ ok('TR-00331 shape (synced 08-08, awaiting_work_order) is stale', isStaleUnresol
 ok('9-day-old awaiting_work_order (Wendy\'s TR-00490 case) is NOT stale — still fires', !isStaleUnresolved({ synced_at: d(9), last_fba_handoff_status: 'awaiting_work_order' }, NOW));
 ok('exactly at the boundary is not stale; one day past is', !isStaleUnresolved({ synced_at: d(STALE_UNRESOLVED_DAYS), last_fba_handoff_status: 'pending' }, NOW) && isStaleUnresolved({ synced_at: d(STALE_UNRESOLVED_DAYS + 1), last_fba_handoff_status: 'pending' }, NOW));
 ok('every unresolved status is eligible', UNRESOLVED_HANDOFF_STATUSES.every((s) => isStaleUnresolved({ synced_at: d(60), last_fba_handoff_status: s }, NOW)));
+ok('work_order_failed (WO cancelled, TR-00331 after 10/28) ages out too', isStaleUnresolved({ synced_at: d(80), last_fba_handoff_status: 'work_order_failed' }, NOW));
 ok('resolved rows are never retired, however old', !isStaleUnresolved({ synced_at: d(400), last_fba_handoff_status: 'dispatched' }, NOW) && !isStaleUnresolved({ synced_at: d(400), last_fba_handoff_status: 'stale_retired' }, NOW));
 ok('missing synced_at is never retired', !isStaleUnresolved({ synced_at: null, last_fba_handoff_status: 'pending' }, NOW));
 

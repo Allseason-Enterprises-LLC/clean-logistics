@@ -352,9 +352,12 @@ export const UNRESOLVED_HANDOFF_STATUSES = ['pending', 'awaiting_work_order', 'a
  */
 export const STALE_UNRESOLVED_DAYS = 30;
 
+/** Terminal-but-unshipped statuses that also age out (TR-00331: WO cancelled → work_order_failed, still re-queried every tick). */
+const STALE_ELIGIBLE_STATUSES: readonly string[] = [...UNRESOLVED_HANDOFF_STATUSES, 'work_order_failed', 'voided_by_user'];
+
 export function isStaleUnresolved(row: { synced_at: string | null; last_fba_handoff_status: string | null }, now = Date.now()): boolean {
   if (!row.synced_at) return false;
-  if (!(UNRESOLVED_HANDOFF_STATUSES as readonly string[]).includes(String(row.last_fba_handoff_status))) return false;
+  if (!STALE_ELIGIBLE_STATUSES.includes(String(row.last_fba_handoff_status))) return false;
   return now - new Date(row.synced_at).getTime() > STALE_UNRESOLVED_DAYS * 24 * 3600 * 1000;
 }
 
