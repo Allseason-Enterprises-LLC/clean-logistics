@@ -336,6 +336,56 @@ async function fbaRecordExists(
 /** Handoff statuses that mean "this row is still waiting on us or the floor". */
 export const UNRESOLVED_HANDOFF_STATUSES = ['pending', 'awaiting_work_order', 'awaiting_listing', 'handoff_failed', 'dispatch_failed'] as const;
 
+/**
+ * Unresolved rows older than this are RETIRED, not worked. 2026-10-06 widened
+ * the view to every unresolved row regardless of age so nine-day kit WOs
+ * would fire; the same change surfaced June/August rows whose transfers had
+ * long since shipped by other means. The reconciler re-preflighted them,
+ * found (of course) no bulk stock / no case pack for a product nobody ships
+ * any more, and raised MOVE STOCK / DATA FIX work orders to the floor:
+ * WOs 173636/37/39/40 (Mike, 2026-10-15) and WO 179440 for TR-00331
+ * (Weston, 2026-10-28: "stop trying to process this work order — shipped
+ * back in August"). A transfer that has waited this long is not waiting on
+ * the floor; it is dead. Mark it `stale_retired` with the reason, once, and
+ * never raise anything for it. The office can set it back to `pending` if
+ * it is genuinely live.
+ */
+export const STALE_UNRESOLVED_DAYS = 30;
+
+export function isStaleUnresolved(row: { synced_at: string | null; last_fba_handoff_status: string | null }, now = Date.now()): boolean {
+  if (!row.synced_at) return false;
+  if (!(UNRESOLVED_HANDOFF_STATUSES as readonly string[]).includes(String(row.last_fba_handoff_status))) return false;
+  return now - new Date(row.synced_at).getTime() > STALE_UNRESOLVED_DAYS * 24 * 3600 * 1000;
+}
+
+async function retireStaleRows(db: SupabaseClient, rows: BridgeRow[]): Promise<BridgeRow[]> {
+  const keep: BridgeRow[] = [];
+  const retired: string[] = [];
+  for (const r of rows as any[]) {
+    if (!isStaleUnresolved(r)) { keep.push(r); continue; }
+    const ageDays = Math.round((Date.now() - new Date(r.synced_at).getTime()) / 86400000);
+    const { error } = await db
+      .from('cin7_transfer_shiphero_orders')
+      .update({
+        last_fba_handoff_status: 'stale_retired',
+        last_fba_handoff_detail: `retired by reconciler ${new Date().toISOString().slice(0, 10)}: unresolved (${r.last_fba_handoff_status}) ${ageDays} days after sync — not worked, no work orders raised. Set last_fba_handoff_status='pending' to revive.`,
+      })
+      .eq('id', r.id)
+      .eq('last_fba_handoff_status', r.last_fba_handoff_status);
+    if (error) { console.warn(`[reconciler] could not retire stale ${r.cin7_transfer_number}: ${error.message}`); keep.push(r); continue; }
+    retired.push(`${r.cin7_transfer_number} (${ageDays}d, ${r.last_fba_handoff_status})`);
+  }
+  if (retired.length) {
+    console.log(`[reconciler] retired ${retired.length} stale unresolved bridge(s): ${retired.join(', ')}`);
+    await sendFbaTelegram(
+      `🗄 <b>Reconciler retired ${retired.length} stale transfer${retired.length === 1 ? '' : 's'}</b>\n` +
+      `Unresolved for over ${STALE_UNRESOLVED_DAYS} days — treated as shipped by other means. No work orders raised; nothing to do.\n` +
+      retired.slice(0, 20).map((x) => `• ${x}`).join('\n') + (retired.length > 20 ? `\n… +${retired.length - 20} more` : '')
+    );
+  }
+  return keep;
+}
+
 const SELECT_COLS =
   'id, cin7_transfer_number, cin7_transfer_id, cin7_destination, synced_at, last_fba_handoff_at, last_fba_handoff_detail, fba_handoff_attempts, request_payload, shiphero_order_number, last_fba_handoff_status';
 
@@ -381,8 +431,10 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
     console.log(`[reconciler] +${unresolved.data!.length} unresolved FBA bridge(s) older than ${LOOKBACK_HOURS}h kept in view: ${unresolved.data!.map((r: any) => r.cin7_transfer_number).join(', ')}`);
   }
 
-  // Filter to FBA-bound transfers only (cin7_destination contains amazon/fba)
-  return all.filter((row: any) => isFbaDestination(row.cin7_destination));
+  // Filter to FBA-bound transfers only (cin7_destination contains amazon/fba),
+  // then retire anything unresolved for > STALE_UNRESOLVED_DAYS before it can
+  // be preflighted or fired.
+  return retireStaleRows(db, all.filter((row: any) => isFbaDestination(row.cin7_destination)));
 }
 
 /**
