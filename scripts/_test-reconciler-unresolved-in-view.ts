@@ -14,7 +14,9 @@ const src = fs.readFileSync(path.join(__dirname, '../lib/fba-reconciler.ts'), 'u
 const fn = src.slice(src.indexOf('async function findCandidates'), src.indexOf('\n}\n', src.indexOf('async function findCandidates')) + 3);
 
 ok('🔴 findCandidates runs a SECOND query for rows OLDER than the lookback', /\.lt\('synced_at', since\)/.test(fn));
-ok('…restricted to unresolved handoff statuses', /\.in\('last_fba_handoff_status', \[\.\.\.UNRESOLVED_HANDOFF_STATUSES\]\)/.test(fn));
+// 2026-10-29: widened to STALE_ELIGIBLE (= UNRESOLVED + work_order_failed/voided_by_user) so
+// retireStaleRows can age those out too; the WO gate stops any of them from firing.
+ok('…restricted to unresolved-or-stale-eligible handoff statuses (never resolved ones)', /\.in\('last_fba_handoff_status', \[\.\.\.STALE_ELIGIBLE_STATUSES\]\)/.test(fn));
 ok('unresolved set covers the states a parked/released/failed row can be in', ['pending', 'awaiting_work_order', 'awaiting_listing', 'handoff_failed', 'dispatch_failed'].every((s) => (UNRESOLVED_HANDOFF_STATUSES as readonly string[]).includes(s)));
 ok('unresolved set does NOT include dispatched/handoff_ok (resolved rows must age out normally)', !['dispatched', 'handoff_ok', 'ok'].some((s) => (UNRESOLVED_HANDOFF_STATUSES as readonly string[]).includes(s)));
 ok('results are de-duplicated by row id before the FBA-destination filter', /seen\.has\(r\.id\)/.test(fn) && fn.indexOf('seen.has') < fn.indexOf('isFbaDestination'));

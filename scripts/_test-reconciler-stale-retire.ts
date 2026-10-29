@@ -21,6 +21,7 @@ ok('resolved rows are never retired, however old', !isStaleUnresolved({ synced_a
 ok('missing synced_at is never retired', !isStaleUnresolved({ synced_at: null, last_fba_handoff_status: 'pending' }, NOW));
 
 const src = fs.readFileSync(path.join(__dirname, '../lib/fba-reconciler.ts'), 'utf8');
+ok('unresolved query selects STALE_ELIGIBLE statuses so work_order_failed rows reach the retire step', /\.lt\('synced_at', since\)[\s\S]{0,400}\.in\('last_fba_handoff_status', \[\.\.\.STALE_ELIGIBLE_STATUSES\]\)/.test(src));
 ok('🔴 findCandidates passes its result through retireStaleRows (retire BEFORE preflight/fire)', /return retireStaleRows\(db, all\.filter/.test(src));
 ok('retire writes stale_retired with a revive instruction, guarded on the status it read', /last_fba_handoff_status: 'stale_retired'[\s\S]{0,400}\.eq\('last_fba_handoff_status', r\.last_fba_handoff_status\)/.test(src) && /pending' to revive/.test(src));
 ok('retire notice goes through the ONE sender and says no work orders raised', /sendFbaTelegram\([\s\S]{0,300}No work orders raised/.test(src));

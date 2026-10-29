@@ -353,7 +353,7 @@ export const UNRESOLVED_HANDOFF_STATUSES = ['pending', 'awaiting_work_order', 'a
 export const STALE_UNRESOLVED_DAYS = 30;
 
 /** Terminal-but-unshipped statuses that also age out (TR-00331: WO cancelled → work_order_failed, still re-queried every tick). */
-const STALE_ELIGIBLE_STATUSES: readonly string[] = [...UNRESOLVED_HANDOFF_STATUSES, 'work_order_failed', 'voided_by_user'];
+export const STALE_ELIGIBLE_STATUSES: readonly string[] = [...UNRESOLVED_HANDOFF_STATUSES, 'work_order_failed', 'voided_by_user'];
 
 export function isStaleUnresolved(row: { synced_at: string | null; last_fba_handoff_status: string | null }, now = Date.now()): boolean {
   if (!row.synced_at) return false;
@@ -419,7 +419,10 @@ async function findCandidates(db: SupabaseClient): Promise<BridgeRow[]> {
     .select(SELECT_COLS)
     .eq('status', 'synced')
     .lt('synced_at', since)
-    .in('last_fba_handoff_status', [...UNRESOLVED_HANDOFF_STATUSES])
+    // STALE_ELIGIBLE (not just UNRESOLVED) so retireStaleRows actually sees
+    // work_order_failed / voided_by_user rows; they are retired, never fired
+    // (the fire path below still requires an UNRESOLVED status).
+    .in('last_fba_handoff_status', [...STALE_ELIGIBLE_STATUSES])
     .order('synced_at', { ascending: false })
     .limit(50);
   if (unresolved.error) throw new Error(`bridge query (unresolved) failed: ${unresolved.error.message}`);
