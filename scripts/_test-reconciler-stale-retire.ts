@@ -24,8 +24,8 @@ const src = fs.readFileSync(path.join(__dirname, '../lib/fba-reconciler.ts'), 'u
 ok('unresolved query selects STALE_ELIGIBLE statuses so work_order_failed rows reach the retire step', /\.lt\('synced_at', since\)[\s\S]{0,400}\.in\('last_fba_handoff_status', \[\.\.\.STALE_ELIGIBLE_STATUSES\]\)/.test(src));
 ok('🔴 findCandidates passes its result through retireStaleRows (retire BEFORE preflight/fire)', /return retireStaleRows\(db, all\.filter/.test(src));
 ok('retire writes stale_retired with a revive instruction, guarded on the status it read', /last_fba_handoff_status: 'stale_retired'[\s\S]{0,400}\.eq\('last_fba_handoff_status', r\.last_fba_handoff_status\)/.test(src) && /pending' to revive/.test(src));
-ok('retire notice goes through the ONE sender and says no work orders raised', /sendFbaTelegram\([\s\S]{0,300}No work orders raised/.test(src));
 const fn = src.slice(src.indexOf('async function retireStaleRows'), src.indexOf('async function findCandidates'));
+ok('🔴 retirement does NOT post to the channel (bookkeeping; three 🗄 posts in one afternoon on 10/29)', !/Reconciler retired/.test(fn) && !/sendFbaTelegram\(/.test(fn));
 ok('retired rows are not returned as candidates (only kept on update error)', /if \(!isStaleUnresolved\(r\)\) \{ keep\.push\(r\); continue; \}/.test(fn) && /if \(error\) \{[^\n]*keep\.push\(r\); continue; \}/.test(fn) && /retired\.push\(/.test(fn) && /return keep;/.test(fn) && !/retired\.push[\s\S]*keep\.push\(r\)/.test(fn));
 
 console.log(`\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);

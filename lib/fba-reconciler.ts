@@ -379,12 +379,11 @@ async function retireStaleRows(db: SupabaseClient, rows: BridgeRow[]): Promise<B
     retired.push(`${r.cin7_transfer_number} (${ageDays}d, ${r.last_fba_handoff_status})`);
   }
   if (retired.length) {
+    // Log only. Retirement is bookkeeping, not news: the first sweep posted
+    // three 🗄 messages in one afternoon (Weston, 2026-10-29). Rows crossing
+    // 30 days on their own clock would otherwise post daily forever. The
+    // retire reason stays on each row; the noon digest reports counts.
     console.log(`[reconciler] retired ${retired.length} stale unresolved bridge(s): ${retired.join(', ')}`);
-    await sendFbaTelegram(
-      `🗄 <b>Reconciler retired ${retired.length} stale transfer${retired.length === 1 ? '' : 's'}</b>\n` +
-      `Unresolved for over ${STALE_UNRESOLVED_DAYS} days — treated as shipped by other means. No work orders raised; nothing to do.\n` +
-      retired.slice(0, 20).map((x) => `• ${x}`).join('\n') + (retired.length > 20 ? `\n… +${retired.length - 20} more` : '')
-    );
   }
   return keep;
 }
