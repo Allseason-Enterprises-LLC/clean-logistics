@@ -41,6 +41,10 @@
     {
       "path": "/api/cron/sync-fba-amazon-status",
       "schedule": "7,37 * * * *"
+    },
+    {
+      "path": "/api/cron/cin7-closeout",
+      "schedule": "10,30,50 * * * *"
     }
   ],
   "functions": {
