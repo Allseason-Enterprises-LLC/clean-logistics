@@ -54,7 +54,7 @@ export type CloseoutDecision =
 /** Pure. */
 export function decideCloseout(f: CloseoutFacts): CloseoutDecision {
   if (f.cin7Status && !CIN7_OPEN_STATUSES.has(f.cin7Status.toUpperCase())) {
-    return f.cin7Status.toUpperCase() === 'COMPLETED' ? { action: 'already_complete' } : { action: 'hold', reason: `CIN7 status ${f.cin7Status} is not open and not completed` };
+    return f.cin7Status.toUpperCase() === 'COMPLETED' ? { action: 'already_complete' } : { action: 'hold', reason: `CIN7 status ${f.cin7Status} — nothing to close` };
   }
   if (!f.shipheroFulfilled) return { action: 'wait', reason: 'ShipHero order not fulfilled' };
   if (!f.lots.length) return { action: 'wait', reason: 'no active FBA shipment rows' };
@@ -63,9 +63,19 @@ export function decideCloseout(f: CloseoutFacts): CloseoutDecision {
   // CIN7 by hand or leaves it), not WAIT forever (which would re-read CIN7 every tick).
   const legacy = f.lots.filter((l) => !l.lot || l.units === 0);
   if (legacy.length === f.lots.length) return { action: 'hold', reason: 'pre-lot-tracking shipment: no lot/units on record — close in CIN7 by hand if desired' };
-  const notShipped = f.lots.filter((l) => !l.amazonStatus || !AMAZON_SHIPPED_STATUSES.has(l.amazonStatus.toUpperCase()));
-  if (notShipped.length) return { action: 'wait', reason: `Amazon not shipped for lot(s) ${notShipped.map((l) => `${l.lot}=${l.amazonStatus ?? 'unknown'}`).join(', ')}` };
-  if (f.coverageWhole !== true) return { action: 'hold', reason: f.coverageWhole === false ? 'coverage not whole (short transfer) — complete partial or top up, by hand' : 'coverage never computed' };
+  // Amazon status: WORKING/READY_TO_SHIP = freight still on our dock → wait. A row with NO recorded
+  // status (pre-status-sync, ~80 of them) is not "not shipped": ShipHero fulfilled + ship date older
+  // than 7 days is the physical fact. Only a KNOWN pre-ship status blocks.
+  const PRE_SHIP = new Set(['WORKING', 'READY_TO_SHIP', 'CANCELLED', 'VOIDED', 'DELETED', 'ERROR']);
+  const stillHere = f.lots.filter((l) => l.amazonStatus && PRE_SHIP.has(l.amazonStatus.toUpperCase()));
+  if (stillHere.length) return { action: 'wait', reason: `Amazon not shipped for lot(s) ${stillHere.map((l) => `${l.lot}=${l.amazonStatus}`).join(', ')}` };
+  const unknown = f.lots.filter((l) => !l.amazonStatus);
+  if (unknown.length && f.shipheroShipDate && Date.now() - Date.parse(f.shipheroShipDate) < 7 * 86400000) {
+    return { action: 'wait', reason: `Amazon status not yet recorded for lot(s) ${unknown.map((l) => l.lot).join(', ')} (shipped < 7d ago)` };
+  }
+  // Coverage: the stored verdict exists only for transfers fired after 2026-10-15. Before that,
+  // compute it here from the same facts (Σ lot units vs CIN7 ordered). Never hold on a missing record.
+  if (f.coverageWhole === false) return { action: 'hold', reason: 'coverage not whole (short/over transfer) — complete partial or top up, by hand' };
 
   // Per-SKU: CIN7 ordered == ShipHero shipped == sum of lot units.
   const orderedBySku = new Map<string, number>();
@@ -248,8 +258,11 @@ export async function runCin7Closeout(db: SupabaseClient, shToken: string, opts:
         res.held.push({ transfer: tr, reason: d.reason });
         const prev = row.request_payload?.cin7_closeout;
         await mark('hold', { reason: d.reason });
-        const legacyHold = /pre-lot-tracking/.test(d.reason);
-        if ((!prev || prev.state !== 'hold') && !legacyHold) await opts.notify?.(`🗂 <b>${tr} not closed in CIN7</b>\nShipped, but the records do not line up: ${d.reason}.\nOffice: resolve, then the next tick completes it. Warehouse: no action.`);
+        // LOG ONLY. 2026-11-11: eleven 🗂 posts in one tick for transfers that shipped fine months ago
+        // (Weston: "why are you sending notifications?"). A hold is bookkeeping; the reason is on the row
+        // and in ?dry=1 output. Nobody on the floor acts on it.
+        void prev;
+        console.log(`[cin7-closeout] hold ${tr}: ${d.reason}`);
         continue;
       }
       if (opts.dryRun) { res.completed.push(`${tr} (dry-run: ${d.lines.map((l) => `${l.sku} ${l.qty}@${l.lot}`).join(', ')} on ${d.completionDate.slice(0, 10)})`); continue; }
