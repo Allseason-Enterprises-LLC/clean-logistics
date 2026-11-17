@@ -254,7 +254,10 @@ export async function runCin7Closeout(db: SupabaseClient, shToken: string, opts:
     if (!c) return true;
     if (c.state === 'completed' || c.state === 'already_complete') return false;
     if (c.state === 'hold' && !opts.only) return false;        // held rows wait for a human (or an explicit ?only=)
-    if (c.state === 'wait' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS) return false; // re-check waiting rows every 6h, not every tick
+    if (c.state === 'wait' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS) return false;
+    // 2026-11-17: errored rows (e.g. CIN7 400 'Available quantity ... cannot transfer') were retried every
+    // tick, oldest-first, and filled the per-tick limit - newer shippable transfers never got a turn.
+    if (c.state === 'error' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS) return false; // re-check waiting rows every 6h, not every tick
     return true;
   }).slice(0, opts.limit ?? CLOSEOUT_PER_TICK);
 
