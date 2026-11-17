@@ -56,6 +56,8 @@ ok('ONE write: header PUT carries Lines with BatchSN/ExpiryDate; /order is NOT w
 ok('candidates are chosen by an ACTIVE labelled FBA row, not by handoff status (TR-00699 was work_order_failed yet shipped)', src.includes('labelledTrs.has(r.cin7_transfer_number)') && !src.includes(".in('last_fba_handoff_status', ['dispatched'"));
 ok('held rows are not retried automatically (wait for a human or ?only=)', src.includes("if (c.state === 'hold' && !opts.only) return false;"));
 
+const runFn = src.slice(src.indexOf('export async function runCin7Closeout'));
+ok('🔴 candidate queries PAGINATE (11/13-11/17: .limit(500) on oldest-first rows → considered 0, silent 200 OK)', !runFn.includes('.limit(500)') && !runFn.includes('.limit(5000)') && runFn.split('.range(from, from + 999)').length - 1 >= 2);
 ok('429 defers the tick instead of hammering the shared key', src.includes('instanceof Cin7RateLimitError) { res.deferred = true; break; }'));
 const vercel = JSON.parse(fs.readFileSync(path.join(__dirname, '../vercel.json'), 'utf8'));
 const cron = vercel.crons.find((c: any) => c.path === '/api/cron/cin7-closeout');

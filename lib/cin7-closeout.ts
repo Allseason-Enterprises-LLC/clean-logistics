@@ -219,18 +219,34 @@ export async function runCin7Closeout(db: SupabaseClient, shToken: string, opts:
   // last_fba_handoff_status=work_order_failed (WO cancelled after a hand-built
   // shipment). Rows with no labelled lot never qualify; decideCloseout gates
   // the rest on ShipHero/Amazon/coverage facts.
-  const { data: lotRows, error: lotErr } = await db.from('fba_shipments')
-    .select('cin7_transfer_number').in('status', ['labels_ready', 'shipped', 'in_transit', 'complete']).neq('status', 'cancelled').limit(5000);
-  if (lotErr) throw new Error(`fba_shipments query failed: ${lotErr.message}`);
+  // Paginated too: PostgREST caps a response at 1000 rows whatever limit you ask for.
+  const lotRows: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data: page, error: lotErr } = await db.from('fba_shipments')
+      .select('cin7_transfer_number').in('status', ['labels_ready', 'shipped', 'in_transit', 'complete'])
+      .order('id', { ascending: true }).range(from, from + 999);
+    if (lotErr) throw new Error(`fba_shipments query failed: ${lotErr.message}`);
+    lotRows.push(...(page ?? []));
+    if (!page || page.length < 1000) break;
+  }
   const labelledTrs = new Set((lotRows ?? []).map((r: any) => extractTransferNumber(r.cin7_transfer_number)).filter(Boolean));
-  let q = db.from('cin7_transfer_shiphero_orders')
-    .select('id, cin7_transfer_number, cin7_transfer_id, cin7_destination, shiphero_order_id, shiphero_order_number, request_payload, last_fba_handoff_status, synced_at')
-    .eq('status', 'synced')
-    .order('synced_at', { ascending: true })
-    .limit(500);
-  if (opts.only) q = q.eq('cin7_transfer_number', opts.only);
-  const { data, error } = await q;
-  if (error) throw new Error(`bridge query failed: ${error.message}`);
+  // PAGINATE. 2026-11-17: this was oldest-first with a 500-row limit. Once the
+  // bridge passed 500 synced rows the window held only the OLDEST 500 — all
+  // already completed/held — so every tick considered 0 and returned 200 OK.
+  // Silent from 11/13 01:30 UTC; ~80 shipped transfers stayed open in CIN7.
+  const data: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    let q = db.from('cin7_transfer_shiphero_orders')
+      .select('id, cin7_transfer_number, cin7_transfer_id, cin7_destination, shiphero_order_id, shiphero_order_number, request_payload, last_fba_handoff_status, synced_at')
+      .eq('status', 'synced')
+      .order('synced_at', { ascending: true })
+      .range(from, from + 999);
+    if (opts.only) q = q.eq('cin7_transfer_number', opts.only);
+    const { data: page, error } = await q;
+    if (error) throw new Error(`bridge query failed: ${error.message}`);
+    data.push(...(page ?? []));
+    if (!page || page.length < 1000) break;
+  }
   const candidates = (data ?? []).filter((r: any) => {
     if (!labelledTrs.has(r.cin7_transfer_number)) return false;
     if (!/amazon|fba/i.test(String(r.cin7_destination || ''))) return false;
