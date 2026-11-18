@@ -97,6 +97,21 @@ export async function getTikTokCredentials(): Promise<TikTokCredentials> {
   };
 }
 
+/**
+ * TikTok's `access_token_expire_in` is an ABSOLUTE unix timestamp (seconds),
+ * ~7 days out — not a duration. The old code only treated it as absolute when
+ * > now+1yr, so a real 7-day value was added to Date.now() → expires_at≈2082 →
+ * token never refreshed → order bridge dead since 2026-05/06 (105002).
+ * Anything ≥ 1e9 (Sep 2001) is a timestamp; smaller values are treated as a
+ * duration defensively. Exported for scripts/_test-tiktok-token-expiry.ts.
+ */
+export function tiktokExpiryToDate(expireIn: number, nowMs: number = Date.now()): Date {
+  if (!Number.isFinite(expireIn) || expireIn <= 0) {
+    throw new Error(`TikTok refresh returned invalid access_token_expire_in: ${expireIn}`);
+  }
+  return expireIn >= 1_000_000_000 ? new Date(expireIn * 1000) : new Date(nowMs + expireIn * 1000);
+}
+
 async function refreshAccessToken(
   appKey: string,
   appSecret: string,
@@ -116,14 +131,7 @@ async function refreshAccessToken(
   }
 
   const { access_token, refresh_token, access_token_expire_in } = json.data;
-  // TikTok's `access_token_expire_in` field is a unix timestamp (seconds),
-  // NOT a duration. If the value is greater than ~1 year from now we treat
-  // it as an absolute timestamp; otherwise fall back to "seconds from now".
-  const nowSec = Math.floor(Date.now() / 1000);
-  const expiresAt =
-    access_token_expire_in > nowSec + 365 * 24 * 60 * 60
-      ? new Date(access_token_expire_in * 1000)
-      : new Date(Date.now() + access_token_expire_in * 1000);
+  const expiresAt = tiktokExpiryToDate(access_token_expire_in);
 
   await supabase
     .from('platform_credentials')
