@@ -59,6 +59,7 @@ ok('held rows are not retried automatically (wait for a human or ?only=)', src.i
 const runFn = src.slice(src.indexOf('export async function runCin7Closeout'));
 ok('🔴 candidate queries PAGINATE (11/13-11/17: .limit(500) on oldest-first rows → considered 0, silent 200 OK)', !runFn.includes('.limit(500)') && !runFn.includes('.limit(5000)') && runFn.split('.range(from, from + 999)').length - 1 >= 2);
 ok('🔴 errored rows back off 6h like waits (11/17: 11 CIN7-400 rows starved TR-00799/00804/00812)', src.includes("c.state === 'error' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS"));
+ok('🔴 missing CIN7 creds fails the RUN before any row is marked (11/18 creds-less invocation stamped rows error)', runFn.indexOf('!process.env.CIN7_ACCOUNT_ID') > -1 && runFn.indexOf('!process.env.CIN7_ACCOUNT_ID') < runFn.indexOf('const mark = async'));
 ok('429 defers the tick instead of hammering the shared key', src.includes('instanceof Cin7RateLimitError) { res.deferred = true; break; }'));
 const vercel = JSON.parse(fs.readFileSync(path.join(__dirname, '../vercel.json'), 'utf8'));
 const cron = vercel.crons.find((c: any) => c.path === '/api/cron/cin7-closeout');

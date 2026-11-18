@@ -214,6 +214,13 @@ export interface CloseoutRunResult { considered: number; completed: string[]; al
 export async function runCin7Closeout(db: SupabaseClient, shToken: string, opts: { limit?: number; only?: string; dryRun?: boolean; notify?: (html: string) => Promise<unknown> } = {}): Promise<CloseoutRunResult> {
   const meter = newCin7Meter();
   const res: CloseoutRunResult = { considered: 0, completed: [], alreadyComplete: [], waiting: [], held: [], errors: [], cin7Calls: 0, deferred: false };
+  // 2026-11-18: some invocation without CIN7 creds ran each tick and stamped every candidate
+  // state='error' ("CIN7_ACCOUNT_ID and CIN7_API_KEY must be set"), which the 6h error backoff then
+  // made the healthy run skip. A deployment-config problem is the RUN's failure, never a row's.
+  if (!process.env.CIN7_ACCOUNT_ID || !process.env.CIN7_API_KEY) {
+    res.errors.push({ transfer: '*', error: 'CIN7_ACCOUNT_ID / CIN7_API_KEY missing in this deployment — no rows touched' });
+    return res;
+  }
   // Candidates = bridge rows whose transfer has at least one ACTIVE fba_shipments
   // row with labels. The handoff status is NOT the truth: TR-00699 shipped with
   // last_fba_handoff_status=work_order_failed (WO cancelled after a hand-built
