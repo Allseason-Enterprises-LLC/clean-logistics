@@ -22,6 +22,7 @@ import {
 } from './fba-label-completeness';
 
 export const SWEEP_MIN_IDLE_MS = 20 * 60_000;
+export const SWEEP_MAX_AGE_MS = 21 * 24 * 3600_000;
 export const SWEEP_MAX_ATTEMPTS = 3;
 
 export interface SweepRow {
@@ -151,6 +152,9 @@ export function productionSweepDeps(db: SupabaseClient, shipheroToken: string, o
         .select('id, cin7_transfer_number, cin7_lot, plan_id, status, amazon_shipment_ids, updated_at, prep_instructions')
         .eq('status', 'plan_created').not('plan_id', 'is', null)
         .lt('updated_at', new Date(Date.now() - SWEEP_MIN_IDLE_MS).toISOString())
+        // Recent transfers only: the floor must never get a "ready" post for a
+        // months-old shipment (first prod dry-run picked TR-00070 from May).
+        .gte('created_at', new Date(Date.now() - SWEEP_MAX_AGE_MS).toISOString())
         .order('updated_at', { ascending: true }).limit(25);
       if (error) throw new Error(`label sweep query: ${error.message}`);
       return (data ?? []) as SweepRow[];
@@ -171,7 +175,9 @@ export function productionSweepDeps(db: SupabaseClient, shipheroToken: string, o
       const r = await fetch('https://public-api.shiphero.com/graphql', { method: 'POST', headers: { Authorization: `Bearer ${shipheroToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: `{ order(id: "${id}") { data { fulfillment_status } } }` }) });
       const j: any = await r.json().catch(() => null);
       const st = j?.data?.order?.data?.fulfillment_status; if (!st) return null;
-      return { orderId: id, cancelled: /cancel/i.test(String(st)) };
+      // Fulfilled/shipped = the boxes already left; labels are moot. Treat as
+      // not-sweepable (same as cancelled) so nothing is relabelled or posted.
+      return { orderId: id, cancelled: /cancel|fulfilled|shipped/i.test(String(st)) };
     },
     check: (row, orderId) => checkLabelCompleteness(row.plan_id!, orderId, {
       amazonShipments: liveAmazonShipments,
