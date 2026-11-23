@@ -1,6 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { callAmazonSpApi } from './amazon-sp-api-client';
 import { extractTransferNumber } from './order-naming';
+import { checkLabelCompleteness, liveAmazonShipments, shipheroOrderAttachments, storedPdfPages, labelStoragePrefix } from './fba-label-completeness';
 
 const SHIPHERO_API = 'https://public-api.shiphero.com/graphql';
 const SUPABASE_BUCKET = 'shipment-labels';
@@ -43,6 +44,12 @@ export interface PostProcessInput {
   };
   expiration?: string;
   lot?: string;
+  /**
+   * Epoch ms by which this function must have returned (start + maxDuration).
+   * The shipment loop stops `reserveMs` before it and defers the rest to the
+   * label sweep instead of being killed mid-loop (TR-00889, 2026-11-20).
+   */
+  deadlineMs?: number;
 }
 
 export interface PostProcessResult {
@@ -70,6 +77,71 @@ export interface PostProcessResult {
   attachmentsSkipped: number;
   telegramSent: boolean;
   errors: string[];
+  /**
+   * Verified label completeness (lib/fba-label-completeness): true = every live
+   * Amazon shipment has its file on the order with pages == boxes×2; false = a
+   * verified gap; undefined = could not verify. Status + floor post follow THIS.
+   */
+  complete?: boolean;
+  /** FBA ids with no file on the order / wrong page count (when complete=false). */
+  missing?: string[];
+  /** Internal shipment ids not attempted because the deadline was near. */
+  deferred?: string[];
+}
+
+// ── Label-loop helpers (2026-11-23, TR-00694/726/728/729/731/889) ───────────
+
+/** Errors worth one retry: ShipHero credits, Amazon/S3 throttles, network. */
+export function isTransientLabelError(err: unknown): boolean {
+  const m = String((err as any)?.message ?? err ?? '');
+  if (/expected ~?\d+ pages/i.test(m)) return false; // under-labelled PDF: retrying fetches the same PDF
+  return /"code":\s*30|not enough credits|\b429\b|\b50[234]\b|throttl|aborted|ETIMEDOUT|ECONNRESET|fetch failed|socket hang up/i.test(m);
+}
+
+/**
+ * Run `fn` per shipment, sequentially. Stops BEFORE `deadlineMs - reserveMs`
+ * (remaining ids → deferred) so the caller still has time to record state.
+ * One retry on a transient error; permanent errors are recorded and the loop
+ * moves on (other destinations still get their labels).
+ */
+export async function runShipmentsWithDeadline(
+  ids: string[],
+  fn: (id: string) => Promise<void>,
+  opts: { deadlineMs?: number; now?: () => number; reserveMs?: number; retryDelayMs?: number } = {},
+): Promise<{ done: string[]; failed: Array<{ id: string; error: string }>; deferred: string[] }> {
+  const now = opts.now ?? Date.now;
+  const reserve = opts.reserveMs ?? 45_000;
+  const delay = opts.retryDelayMs ?? 8_000;
+  const done: string[] = []; const failed: Array<{ id: string; error: string }> = []; const deferred: string[] = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (opts.deadlineMs && now() > opts.deadlineMs - reserve) { deferred.push(...ids.slice(i)); break; }
+    const id = ids[i];
+    try { await fn(id); done.push(id); continue; }
+    catch (e: any) {
+      if (!isTransientLabelError(e) || (opts.deadlineMs && now() > opts.deadlineMs - reserve - delay)) {
+        failed.push({ id, error: String(e?.message || e).slice(0, 300) }); continue;
+      }
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      try { await fn(id); done.push(id); }
+      catch (e2: any) { failed.push({ id, error: String(e2?.message || e2).slice(0, 300) }); }
+    }
+  }
+  return { done, failed, deferred };
+}
+
+/**
+ * What the CALLER does with a verified completeness result. Single rule for
+ * auto-submit, relabel and the sweep: `labels_ready` + the floor's ready post
+ * only when complete; a partial or unknown result stays `plan_created` and
+ * the floor hears nothing (the sweep finishes it).
+ */
+export function decideLabelOutcome(
+  c: { complete?: boolean; diff?: { missingAttachment?: string[]; pageMismatch?: Array<{ fbaId: string }> }; error?: string },
+  ctx: { alreadyNotified: boolean },
+): { status: 'labels_ready' | 'plan_created'; postFloor: boolean; missing: string[]; unknown: boolean } {
+  if (c.complete === true) return { status: 'labels_ready', postFloor: !ctx.alreadyNotified, missing: [], unknown: false };
+  const missing = Array.from(new Set([...(c.diff?.missingAttachment ?? []), ...(c.diff?.pageMismatch ?? []).map((m) => m.fbaId)]));
+  return { status: 'plan_created', postFloor: false, missing, unknown: c.complete === undefined };
 }
 
 function getSupabase() {
@@ -845,13 +917,15 @@ export async function postProcessFbaShipment(
   let totalShippingCost = 0;
   let hasShippingCost = false;
 
-  for (const internalId of internalIds) {
-    try {
+  // Deadline-aware, retry-once loop (2026-11-23). Before: a plain for-loop
+  // whose catch swallowed the error and moved on, inside a 300s function that
+  // could be killed mid-loop — TR-00889 left 2 of 5 files unattached, silently.
+  const lotFolder = input.lot ? `/${input.lot.replace(/[^A-Za-z0-9_-]/g, '')}` : '';
+  const loop = await runShipmentsWithDeadline(internalIds, async (internalId) => {
       const det = await getShipmentDetails(planId, internalId);
       const slug = destinationSlug(det.destinationCity, det.destinationState);
       const filename = `${det.fbaId}-${slug}-${det.nBoxes}boxes.pdf`;
       // Per-lot subfolder keeps label PDFs from colliding across sibling lot shipments.
-      const lotFolder = input.lot ? `/${input.lot.replace(/[^A-Za-z0-9_-]/g, '')}` : '';
       const objectPath = `${input.cin7TransferNumber.replace(/^CIN7-/, '')}${lotFolder}/${filename}`;
 
       // Fetch + upload
@@ -860,7 +934,7 @@ export async function postProcessFbaShipment(
 
       // Attach to ShipHero
       const desc = `FBA Shipping Labels - ${det.fbaId} - ${det.destinationCity}, ${det.destinationState} - ${det.nBoxes} boxes (4x6 thermal)`;
-      const att = await attachToShipHero(shToken, shOrder.orderId, shOrder.accountId, publicUrl, desc, filename);
+      const att = await attachToShipHero(shToken, shOrder!.orderId, shOrder!.accountId, publicUrl, desc, filename);
       // Count only genuinely NEW attachments. Counting skips here made the
       // response report `attachmentsCreated: 5` on a re-run that actually
       // attached nothing — which reads exactly like the duplicate bug it was
@@ -881,10 +955,15 @@ export async function postProcessFbaShipment(
         totalShippingCost += det.shippingCost;
         hasShippingCost = true;
       }
-    } catch (err: any) {
-      console.error(`[fba-post-process] Failed processing ${internalId}:`, err?.message);
-      errors.push(`${internalId}: ${err?.message}`);
-    }
+  }, { deadlineMs: input.deadlineMs });
+  for (const f of loop.failed) {
+    console.error(`[fba-post-process] Failed processing ${f.id}: ${f.error}`);
+    errors.push(`${f.id}: ${f.error}`);
+  }
+  if (loop.deferred.length) {
+    result.deferred = loop.deferred;
+    console.warn(`[fba-post-process] ${input.cin7TransferNumber}: deadline near — deferred ${loop.deferred.length} shipment(s) to the label sweep: ${loop.deferred.join(', ')}`);
+    errors.push(`deferred (deadline): ${loop.deferred.join(', ')}`);
   }
 
   if (hasShippingCost) result.totalShippingCost = totalShippingCost;
@@ -914,6 +993,38 @@ export async function postProcessFbaShipment(
     await updatePackingNote(shToken, shOrder.orderId, note);
   } catch (err: any) {
     errors.push(`packing_note update: ${err?.message}`);
+  }
+
+  // Verify BEFORE telling anyone anything (2026-11-23). Amazon shipments vs
+  // files on the order vs PDF pages. The floor's "✅ Ready" goes out only when
+  // every box has its label; otherwise ONE ops alert and the sweep finishes it.
+  // An unverifiable check (read failure) says nothing — the sweep re-checks.
+  try {
+    const c = await checkLabelCompleteness(planId, shOrder.orderId, {
+      amazonShipments: liveAmazonShipments,
+      orderAttachments: (id) => shipheroOrderAttachments(shToken, id),
+      pdfPages: (fbaId) => storedPdfPages(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, labelStoragePrefix(input.cin7TransferNumber, input.lot), fbaId),
+    });
+    result.complete = c.complete;
+    const outcome = decideLabelOutcome(c, { alreadyNotified: false });
+    if (outcome.missing.length) result.missing = outcome.missing;
+    if (c.complete === undefined) errors.push(`label check inconclusive: ${c.error}`);
+  } catch (err: any) {
+    result.complete = undefined;
+    errors.push(`label check threw: ${err?.message || err}`);
+  }
+
+  if (result.complete !== true) {
+    // No post at all on a partial/unknown result: the floor gets exactly ONE
+    // message per transfer — the ready post, sent by whichever run (this one,
+    // relabel, or the 15-min label sweep) first VERIFIES completeness. The
+    // sweep raises the single loud alert if 3 recovery attempts still fail.
+    console.warn(
+      `[fba-post-process] ${input.cin7TransferNumber}: labels ${result.complete === false ? 'INCOMPLETE' : 'UNVERIFIED'}` +
+        (result.missing?.length ? ` — missing ${result.missing.join(', ')}` : '') +
+        ' — no floor post; label sweep will finish it',
+    );
+    return result;
   }
 
   // Send single consolidated Telegram message — ONCE per set of labels.

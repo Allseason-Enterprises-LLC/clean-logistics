@@ -18,10 +18,12 @@ import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
 import { lookupSkuMapping } from '../../lib/fba-orchestrator';
 import { getShipHeroProductData, getShipHeroToken } from '../../lib/shiphero-product-data';
 import { postProcessFbaShipment } from '../../lib/fba-post-process';
+import { recordLabelCheck } from '../../lib/fba-label-sweep';
 
 export const config = { maxDuration: 300 };
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const startedAt = Date.now();
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
 
   const auth = req.headers.authorization?.replace('Bearer ', '');
@@ -195,10 +197,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       },
       expiration: lotExp,
       lot: lotName,
+      deadlineMs: startedAt + 300_000,
     });
 
-    return res.status(result.errors.length > 0 ? 207 : 200).json({
+    // Status follows VERIFIED labels (2026-11-23): relabel used to recover the
+    // files and leave the row `plan_created` with labels_url NULL forever
+    // (TR-00564/554, TR-00889). Complete → labels_ready + labels_url; partial
+    // or unknown → record label_check for the sweep, status untouched.
+    try {
+      if (result.complete === true) {
+        await supabase.from('fba_shipments').update({
+          status: 'labels_ready',
+          labels_url: result.labels?.[0]?.supabaseUrl ?? row.labels_url ?? null,
+          updated_at: new Date().toISOString(),
+        }).eq('id', row.id).in('status', ['plan_created', 'labels_ready']);
+      } else {
+        await recordLabelCheck(supabase, row.id, { complete: result.complete, missing: result.missing ?? [], deferred: result.deferred ?? [], source: 'relabel' });
+      }
+    } catch (stErr: any) {
+      console.warn(`[relabel] status update failed (non-fatal): ${stErr?.message}`);
+    }
+
+    return res.status(result.errors.length > 0 || result.complete !== true ? 207 : 200).json({
       ok: true,
+      complete: result.complete,
+      missing: result.missing ?? [],
+      deferred: result.deferred ?? [],
       cin7_transfer_number: row.cin7_transfer_number,
       plan_id: planId,
       labels: result.labels.map((l) => ({

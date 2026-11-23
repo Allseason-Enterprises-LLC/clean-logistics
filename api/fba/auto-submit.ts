@@ -4,6 +4,7 @@ import { getShipHeroProductData, getShipHeroToken, getLotBreakdown } from '../..
 import { allocateFefoByLot, sanitizeLotName, mergeSameSkuItems, findShortfalls, type LotAllocation } from '../../lib/lot-allocation';
 import { lookupSkuMapping, createFbaInboundShipment } from '../../lib/fba-orchestrator';
 import { postProcessFbaShipment, sendTelegramMarkdown, sendTelegram } from '../../lib/fba-post-process';
+import { recordLabelCheck } from '../../lib/fba-label-sweep';
 import { readTransferCoverage, recordCoverage, describeCoverage, type Coverage } from '../../lib/fba-coverage';
 import { PartneredUnavailableError } from '../../lib/fba-inbound';
 import { callAmazonSpApi } from '../../lib/amazon-sp-api-client';
@@ -604,6 +605,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         postProcess = await postProcessFbaShipment({
           cin7TransferNumber: cin7_transfer_number,
           shipheroOrderNumberOverride: `${cin7_transfer_number}-${lotSuffix}`,
+          // Stop the label loop before the 300s kill; the sweep finishes it.
+          deadlineMs: startedAt + 300_000,
           fbaResult: {
             planId: fbaResult.planId || fbaResult.plan_id,
             shipmentIds,
@@ -632,17 +635,29 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         });
         console.log(`[fba-auto] post-process done: ${postProcess.attachmentsCreated} attachments, telegram=${postProcess.telegramSent}, errors=${postProcess.errors.length}`);
 
-        // Update fba_shipments status now that labels are attached and Telegram fired
+        // Status follows VERIFIED labels, not "post-process returned"
+        // (TR-00726/728 went labels_ready with files missing). Partial or
+        // unverified → stays plan_created + label_check; the label sweep in
+        // the reconciler finishes it and flips the status.
         if (fbaRecordId) {
           try {
-            await supabase
-              .from('fba_shipments')
-              .update({
-                status: 'labels_ready',
-                labels_url: postProcess.labels?.[0]?.supabaseUrl ?? null,
-                updated_at: new Date().toISOString(),
-              })
-              .eq('id', fbaRecordId);
+            if (postProcess.complete === true) {
+              await supabase
+                .from('fba_shipments')
+                .update({
+                  status: 'labels_ready',
+                  labels_url: postProcess.labels?.[0]?.supabaseUrl ?? null,
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('id', fbaRecordId);
+            } else {
+              await recordLabelCheck(supabase, fbaRecordId, {
+                complete: postProcess.complete,
+                missing: postProcess.missing ?? [],
+                deferred: postProcess.deferred ?? [],
+                source: 'auto-submit',
+              });
+            }
           } catch (updErr: any) {
             console.warn(`[fba-auto] fba_shipments status update failed: ${updErr?.message}`);
           }
