@@ -42,6 +42,8 @@ export interface CloseoutFacts {
   shipheroFulfilled: boolean;
   shipheroShippedBySku: Record<string, number>;
   shipheroShipDate: string | null;      // ISO
+  /** What physically left, per ShipHero shipped_line_item_lots (summed per sku+lot). Authoritative for CIN7 lines. */
+  shipheroLots?: Array<{ sku: string; lot: string; expiry: string | null; qty: number }>;
   coverageWhole: boolean | null;        // request_payload.coverage.whole, null if never computed
   lots: CloseoutLot[];                  // active fba_shipments rows
 }
@@ -95,18 +97,28 @@ export function decideCloseout(f: CloseoutFacts): CloseoutDecision {
   for (const line of f.cin7Lines) {
     const named = [...String(line.comments ?? '').matchAll(/\blot\s*#?\s*([A-Za-z0-9]{5,})/gi)].map((m) => m[1].toUpperCase());
     if (!named.length) continue;
-    const shippedLots = f.lots.filter((l) => l.sku === line.sku).map((l) => l.lot.toUpperCase());
+    const shippedLots = [...new Set([
+      ...f.lots.filter((l) => l.sku === line.sku).map((l) => String(l.lot).toUpperCase()),
+      ...(f.shipheroLots ?? []).filter((l) => l.sku === line.sku).map((l) => l.lot.toUpperCase()),
+    ])];
     if (!named.some((n) => shippedLots.includes(n))) {
       return { action: 'hold', reason: `${line.sku}: CIN7 line names lot ${named.join('/')} but shipped lot(s) ${shippedLots.join('/')} — confirm which is right before completing` };
     }
   }
   if (!f.shipheroShipDate) return { action: 'hold', reason: 'ShipHero ship date unknown' };
   const productId = (sku: string) => f.cin7Lines.find((l) => l.sku === sku)?.productId;
-  return {
-    action: 'complete',
-    completionDate: f.shipheroShipDate.slice(0, 10) + 'T00:00:00',
-    lines: f.lots.map((l) => ({ sku: l.sku, qty: l.units, lot: l.lot, expiry: l.expiry!, productId: productId(l.sku) })),
-  };
+  // 2026-11-23 (TR-00829): CIN7 lines must carry the lots that PHYSICALLY shipped (ShipHero), not the
+  // lot the Amazon labels were planned on. Labels said 4,080 @ 2609096A; the floor shipped 2,100 @
+  // 2609096A + 1,980 @ 2610081A; CIN7 only holds 2,100 of 2609096A → 400 "cannot transfer 4080".
+  // Use ShipHero's per-lot split when it is complete (sums to CIN7 ordered per SKU, every lot has an expiry).
+  const sh = f.shipheroLots ?? [];
+  const shBySku = new Map<string, number>();
+  for (const l of sh) shBySku.set(l.sku, (shBySku.get(l.sku) ?? 0) + l.qty);
+  const shComplete = sh.length > 0 && [...orderedBySku].every(([sku, o]) => shBySku.get(sku) === o) && sh.every((l) => l.lot && l.expiry);
+  const lines = shComplete
+    ? sh.map((l) => ({ sku: l.sku, qty: l.qty, lot: l.lot, expiry: l.expiry!, productId: productId(l.sku) }))
+    : f.lots.map((l) => ({ sku: l.sku, qty: l.units, lot: l.lot, expiry: l.expiry!, productId: productId(l.sku) }));
+  return { action: 'complete', completionDate: f.shipheroShipDate.slice(0, 10) + 'T00:00:00', lines };
 }
 
 // ───────────────────────── I/O ─────────────────────────
@@ -150,13 +162,23 @@ export async function gatherCloseoutFacts(db: SupabaseClient, shToken: string, b
   const cin7Lines = (order.Lines ?? []).map((l: any) => ({ sku: l.SKU, qty: Number(l.TransferQuantity ?? l.Quantity ?? 0), productId: l.ProductID, comments: l.Comments ?? null }));
 
   let shipheroFulfilled = false; let shipheroShipDate: string | null = null; const shipheroShippedBySku: Record<string, number> = {};
+  const shipheroLotMap = new Map<string, { sku: string; lot: string; expiry: string | null; qty: number }>();
   if (bridgeRow.shiphero_order_id) {
-    const q = `{ order(id:"${bridgeRow.shiphero_order_id}"){ data { fulfillment_status shipments{ created_date } line_items{ edges{ node{ sku quantity quantity_shipped } } } } } }`;
+    const q = `{ order(id:"${bridgeRow.shiphero_order_id}"){ data { fulfillment_status shipments{ created_date } line_items{ edges{ node{ sku quantity quantity_shipped shipped_line_item_lots{ lot_name quantity lot_expiration_date } } } } } } }`;
     const r = await fetch('https://public-api.shiphero.com/graphql', { method: 'POST', headers: { Authorization: `Bearer ${shToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ query: q }) });
     const o: any = ((await r.json()) as any)?.data?.order?.data;
     if (o) {
       shipheroFulfilled = String(o.fulfillment_status).toLowerCase() === 'fulfilled';
-      for (const e of o.line_items?.edges ?? []) shipheroShippedBySku[e.node.sku] = (shipheroShippedBySku[e.node.sku] ?? 0) + Number(e.node.quantity_shipped ?? 0);
+      for (const e of o.line_items?.edges ?? []) {
+        shipheroShippedBySku[e.node.sku] = (shipheroShippedBySku[e.node.sku] ?? 0) + Number(e.node.quantity_shipped ?? 0);
+        for (const sl of e.node.shipped_line_item_lots ?? []) {
+          if (!sl?.lot_name) continue;
+          const k = `${e.node.sku}|${sl.lot_name}`;
+          const prev = shipheroLotMap.get(k);
+          if (prev) prev.qty += Number(sl.quantity || 0);
+          else shipheroLotMap.set(k, { sku: e.node.sku, lot: String(sl.lot_name), expiry: sl.lot_expiration_date ? String(sl.lot_expiration_date).slice(0, 10) : null, qty: Number(sl.quantity || 0) });
+        }
+      }
       const dates = (o.shipments ?? []).map((s: any) => s.created_date).filter(Boolean).sort();
       shipheroShipDate = dates.length ? dates[dates.length - 1] : null;
     }
@@ -186,6 +208,7 @@ export async function gatherCloseoutFacts(db: SupabaseClient, shToken: string, b
     cin7CompletionDate: cin7?.CompletionDate ?? null,
     cin7Lines,
     shipheroFulfilled, shipheroShippedBySku, shipheroShipDate,
+    shipheroLots: [...shipheroLotMap.values()],
     coverageWhole: bridgeRow.request_payload?.coverage?.whole ?? null,
     lots,
   };

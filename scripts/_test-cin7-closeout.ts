@@ -46,6 +46,17 @@ const two = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 500, produc
   lots: [{ sku: SKU, lot: 'A1', expiry: '2027-01-31', units: 300, amazonStatus: 'IN_TRANSIT' }, { sku: SKU, lot: 'B2', expiry: '2028-01-31', units: 200, amazonStatus: 'SHIPPED' }] });
 ok('two lots → two CIN7 lines, each with its own BatchSN/Expiry', two.action === 'complete' && two.lines.length === 2 && two.lines.map((l) => l.lot).join() === 'A1,B2' && two.lines.reduce((s, l) => s + l.qty, 0) === 500);
 
+// TR-00829: labels planned on one lot, floor shipped two → CIN7 lines follow ShipHero
+const PF = 'CN-CAP-PHYTOFRESH-60CT';
+const split = decideCloseout({ ...base(), cin7Lines: [{ sku: PF, qty: 4080, productId: 'p9', comments: 'lot 2609096A 2340 exp 09/30/2028 + lot 2610081A 1740 exp 10/31/2028' }], shipheroShippedBySku: { [PF]: 4080 },
+  lots: [{ sku: PF, lot: '2609096A', expiry: '2028-09-30', units: 4080, amazonStatus: 'IN_TRANSIT' }],
+  shipheroLots: [{ sku: PF, lot: '2609096A', expiry: '2028-09-30', qty: 2100 }, { sku: PF, lot: '2610081A', expiry: '2028-10-31', qty: 1980 }] });
+ok('🔴 CIN7 lines use ShipHero shipped lots (TR-00829: 2100@2609096A + 1980@2610081A, not 4080@label lot)', split.action === 'complete' && split.lines.length === 2 && split.lines.find((l) => l.lot === '2610081A')?.qty === 1980 && split.lines.find((l) => l.lot === '2609096A')?.qty === 2100 && split.lines.find((l) => l.lot === '2610081A')?.expiry === '2028-10-31');
+const partialSh = decideCloseout({ ...base(), shipheroLots: [{ sku: SKU, lot: '0426354', expiry: '2028-05-31', qty: 150 }] });
+ok('ShipHero lot split that does not sum to ordered → falls back to label lots', partialSh.action === 'complete' && partialSh.lines[0].qty === 200);
+const mm = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 200, productId: 'p1', comments: 'lot 0426355' }], shipheroLots: [{ sku: SKU, lot: '0426354', expiry: '2028-05-31', qty: 200 }] });
+ok('comment names a lot neither labels nor ShipHero shipped → still holds (TR-00821)', mm.action === 'hold');
+
 const src = fs.readFileSync(path.join(__dirname, '../lib/cin7-closeout.ts'), 'utf8');
 ok('🔴 holds NEVER post to the channel (log only — eleven 🗂 posts in one tick on 11/11)', !src.includes('await opts.notify') && src.includes("console.log(`[cin7-closeout] hold"));
 ok('waiting rows are re-checked every 6h, not every tick (shared CIN7 budget)', src.includes("c.state === 'wait' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS"));
