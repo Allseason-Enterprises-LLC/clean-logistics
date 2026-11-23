@@ -93,6 +93,8 @@ export interface GatherDeps {
    *  on a DIFFERENT transfer. Injected (DB). Optional. */
   hasPriorShipmentRow?: (cin7Sku: string) => Promise<boolean>;
   getProductData?: typeof getShipHeroProductData;
+  /** Back-off between product-read attempts (ms). Default 15s; tests pass 0. */
+  retryDelayMs?: number;
   /** Lot-tracked stock by lot. Called twice: bulk-only and including pickable;
    *  the difference is what sits in DTC pick bins. Fail-open (undefined). */
   getLots?: typeof getLotBreakdown;
@@ -113,9 +115,26 @@ export async function defaultFnskuForMsku(msku: string): Promise<string | null> 
 export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quantity: number): Promise<PreflightFacts> {
   const facts: PreflightFacts = { cin7Sku: sku, quantity, casePack: null, productNote: null, lotNumber: null, expirationDate: null, amazonMsku: null };
 
-  // ShipHero — fail closed.
-  try {
-    const p = await (deps.getProductData ?? getShipHeroProductData)(deps.shipheroToken, sku);
+  // ShipHero — a FAILED read is UNKNOWN, never MISSING (2026-11-06).
+  // Before: the catch below left casePack/lotNumber null and runPreflight read
+  // null as "missing" → three false "Product Data Needed" WOs (178406/178407/
+  // 182426) on products whose data was complete; ShipHero had returned code:30
+  // "not enough credits". Now: retry once after a back-off; if it still fails,
+  // flag shipheroReadFailed so preflight raises SHIPHERO_READ_FAILED (retry
+  // next tick, no WO, no post) instead of four MISSING_* blockers.
+  const getProduct = deps.getProductData ?? getShipHeroProductData;
+  const delayMs = deps.retryDelayMs ?? 15000;
+  let p: Awaited<ReturnType<typeof getShipHeroProductData>> | null = null;
+  let lastErr: any = null;
+  for (let attempt = 1; attempt <= 2 && !p; attempt++) {
+    try { p = await getProduct(deps.shipheroToken, sku); }
+    catch (e: any) {
+      lastErr = e;
+      console.warn(`[preflight] ShipHero product read failed for ${sku} (attempt ${attempt}/2): ${e?.message || e}`);
+      if (attempt < 2 && delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  if (p) {
     facts.productNote = (p as any).productNote ?? null;
     facts.isKit = p.isKit;
     // ProductData.casePack is null when the note parse found NO usable
@@ -130,8 +149,10 @@ export async function gatherPreflightFacts(deps: GatherDeps, sku: string, quanti
     facts.shipheroBarcode = p.barcode ?? null;
     facts.lotNumber = p.lotNumber ?? null;
     facts.expirationDate = p.expirationDate ?? null;
-  } catch (e: any) {
-    console.warn(`[preflight] ShipHero product read failed for ${sku} — treating as missing: ${e?.message || e}`);
+  } else {
+    facts.shipheroReadFailed = true;
+    facts.shipheroReadError = String(lastErr?.message || lastErr || 'unknown').slice(0, 300);
+    console.warn(`[preflight] ShipHero product read FAILED for ${sku} — data UNKNOWN (not missing); will re-check next tick, no work order`);
   }
 
   // Stock position — bulk (non-pickable) is what FBA plans against. Fail-open:

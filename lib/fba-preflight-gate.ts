@@ -37,8 +37,9 @@ export interface PreflightGateResult {
   result: PreflightResult;
   workOrder?: WorkOrderState;
   marketingNotified?: boolean;
-  /** 'floor' | 'marketing' | null — which hold the row is under. */
-  hold: 'floor' | 'marketing' | null;
+  /** 'floor' | 'marketing' | 'retry' | null — which hold the row is under.
+   *  'retry' = transient ShipHero read failure: gated this tick, nothing written. */
+  hold: 'floor' | 'marketing' | 'retry' | null;
 }
 
 const esc = (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -69,8 +70,20 @@ export async function applyPreflightGate(
     blockers,
     floor: blockers.filter((b) => b.owner === 'floor'),
     marketing: blockers.filter((b) => b.owner === 'marketing'),
+    retry: blockers.filter((b) => b.owner === 'retry'),
   };
   if (merged.ok) return { gated: false, result: merged, hold: null };
+
+  // ── Transient read failure (2026-11-06): the data is UNKNOWN. Gate this tick
+  //    (never fire on unread data) but act on NOTHING — no work order, no
+  //    channel post, no park, no hold write. The row stays a candidate and the
+  //    next tick re-reads. Floor/marketing blockers derived from data we DID
+  //    read wait for a clean read too: never act on a partial picture.
+  //    (WOs 178406/178407/182426 were all ShipHero code:30 misread as missing.)
+  if (merged.retry && merged.retry.length > 0) {
+    console.warn(`[preflight-gate] ${transfer.transferNumber}: ${merged.retry.map((b) => b.summary).join('; ')} — no action this tick`);
+    return { gated: true, result: merged, hold: 'retry' };
+  }
 
   const nowIso = (deps.now ?? (() => new Date()))().toISOString();
   const primary = results.find((x) => !x.r.ok) ?? results[0];

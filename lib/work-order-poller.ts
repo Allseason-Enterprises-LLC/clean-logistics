@@ -48,7 +48,7 @@ export interface PollerDeps {
    * 2026-10-03: TR-00508/00509/00510/00516/00484/00489 all got the ✅ promise
    * and then nothing, for 1–2 days. Optional for tests; omit = legacy message.
    */
-  preflight?: (row: { id: string; cin7_transfer_number: string; request_payload: any }) => Promise<{ gated: boolean; hold: 'floor' | 'marketing' | null; blockers: Array<{ code: string; summary: string }>; workOrderIds?: string[] } | null>;
+  preflight?: (row: { id: string; cin7_transfer_number: string; request_payload: any }) => Promise<{ gated: boolean; hold: 'floor' | 'marketing' | 'retry' | null; blockers: Array<{ code: string; summary: string }>; workOrderIds?: string[] } | null>;
   now?: () => Date;
 }
 
@@ -161,6 +161,10 @@ export async function pollWorkOrders(deps: PollerDeps): Promise<PollResult> {
           }
           if (!pf || !pf.gated) {
             await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). FBA labels will post here automatically within ~15 minutes.`);
+          } else if (pf.hold === 'retry') {
+            // ShipHero read failed — data UNKNOWN, not missing. Do not tell the
+            // floor something is still needed; the reconciler re-checks next tick.
+            await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). FBA labels will post here automatically once the system re-checks (usually within ~15–30 minutes). <b>Warehouse: no action.</b>`);
           } else if (pf.hold === 'marketing') {
             // The gate already posted the ⏸ notice tagging marketing with the steps.
             await deps.sendTelegram(`✅ <b>${label}</b>: work order ${woIds} is complete (${spec}). ⏸ The FBA shipment is <b>on hold for an Amazon listing fix</b> (${esc(pf.blockers.map((b) => b.summary).join('; '))}) — see the notice above. <b>Warehouse: no action.</b> Labels post automatically once the listing is ready.`);

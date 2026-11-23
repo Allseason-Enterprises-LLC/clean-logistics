@@ -25,9 +25,10 @@
  * No I/O. The gate (kit-work-order-gate / sync) does the fetching and acting.
  */
 
-export type BlockerOwner = 'floor' | 'marketing';
+export type BlockerOwner = 'floor' | 'marketing' | 'retry';
 
 export type BlockerCode =
+  | 'SHIPHERO_READ_FAILED'   // the product read itself failed (rate limit / outage) → data UNKNOWN; re-check next tick, never a WO
   | 'MISSING_CASE_PACK'      // product_note lacks "Quantity per Case"
   | 'MISSING_BOX_DIMS'       // product_note lacks "Box Size: L x W x H"
   | 'MISSING_BOX_WEIGHT'     // product_note lacks "Box Weight"
@@ -89,6 +90,10 @@ export interface PreflightFacts {
   amazonUpc?: string | null;
   /** Kit SKUs are handled by the kit gate; preflight still checks their data. */
   isKit?: boolean;
+  /** The ShipHero product read FAILED (after retry). Every ShipHero field above
+   *  is then UNKNOWN, not missing — preflight must not emit MISSING_* for it. */
+  shipheroReadFailed?: boolean;
+  shipheroReadError?: string;
 }
 
 /** Digits-only compare; EAN-13 with a leading 0 equals the 12-digit UPC-A. */
@@ -105,6 +110,8 @@ export interface PreflightResult {
   floor: Blocker[];
   /** Blockers MARKETING fixes → become ONE channel notice. */
   marketing: Blocker[];
+  /** Transient read failures → nobody acts; the next tick re-checks. Never a WO or a post. */
+  retry?: Blocker[];
 }
 
 const SH_NOTE_FORMAT = [
@@ -119,11 +126,22 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
   const sku = f.cin7Sku;
 
   // ── ShipHero data (floor) — fail CLOSED ────────────────────────────────
+  // …but only on data we actually READ. A failed read is UNKNOWN: raise one
+  // retry blocker (no WO, no post) and skip every MISSING_* check — emitting
+  // them is how 178406/178407/182426 told the floor to re-enter complete data.
+  const readFailed = f.shipheroReadFailed === true;
+  if (readFailed) {
+    blockers.push({
+      code: 'SHIPHERO_READ_FAILED', owner: 'retry',
+      summary: `ShipHero product read failed for ${sku} — data unknown, re-checking next tick`,
+      checklist: [String(f.shipheroReadError || 'ShipHero read error').slice(0, 200)],
+    });
+  }
   const cp = f.casePack ?? null;
   const noteHint = f.productNote
     ? `Current note reads: "${String(f.productNote).replace(/\s+/g, ' ').trim().slice(0, 120)}".`
     : 'The product note is empty.';
-  if (!cp || !(cp.caseQuantity > 0)) {
+  if (!readFailed && (!cp || !(cp.caseQuantity > 0))) {
     blockers.push({
       code: 'MISSING_CASE_PACK', owner: 'floor',
       summary: `ShipHero has no case quantity for ${sku}`,
@@ -134,7 +152,7 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
       ],
     });
   }
-  if (!cp || !(cp.boxLength > 0 && cp.boxWidth > 0 && cp.boxHeight > 0)) {
+  if (!readFailed && (!cp || !(cp.boxLength > 0 && cp.boxWidth > 0 && cp.boxHeight > 0))) {
     blockers.push({
       code: 'MISSING_BOX_DIMS', owner: 'floor',
       summary: `ShipHero has no case dimensions for ${sku}`,
@@ -146,7 +164,7 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
       ],
     });
   }
-  if (!cp || !(cp.boxWeightLbs > 0)) {
+  if (!readFailed && (!cp || !(cp.boxWeightLbs > 0))) {
     blockers.push({
       code: 'MISSING_BOX_WEIGHT', owner: 'floor',
       summary: `ShipHero has no case weight for ${sku}`,
@@ -158,7 +176,9 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
       ],
     });
   }
-  if (!f.lotNumber) {
+  if (readFailed) {
+    // lot/expiry unknown — covered by SHIPHERO_READ_FAILED above
+  } else if (!f.lotNumber) {
     blockers.push({
       code: 'MISSING_LOT', owner: 'floor',
       summary: `ShipHero has no lot for ${sku}`,
@@ -236,7 +256,7 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
   //    are already preconfigured with the correct UPC or FNSKU barcode, but
   //    sometimes not." So the floor VERIFIES one unit and branches — the WO is
   //    a verification, not a blind "apply labels".
-  if (f.amazonMsku && f.inboundReady === true) {
+  if (f.amazonMsku && f.inboundReady === true && !readFailed) {
     const wantsFnsku = f.labelOwnerConstraint === 'SELLER_ONLY';
     const upcMatch = barcodesMatch(f.shipheroBarcode, f.amazonUpc);
     const required = wantsFnsku
@@ -302,7 +322,8 @@ export function runPreflight(f: PreflightFacts): PreflightResult {
 
   const floor = blockers.filter((b) => b.owner === 'floor');
   const marketing = blockers.filter((b) => b.owner === 'marketing');
-  return { ok: blockers.length === 0, blockers, floor, marketing };
+  const retry = blockers.filter((b) => b.owner === 'retry');
+  return { ok: blockers.length === 0, blockers, floor, marketing, retry };
 }
 
 /** The ShipHero note format, for messages that teach it. */

@@ -942,8 +942,8 @@ export async function reconcileFbaHandoffs(
         if (pf && pf.gated) {
           result.skipped.push({
             transfer: row.cin7_transfer_number,
-            reason: pf.hold === 'floor' ? 'awaiting_work_order' : 'awaiting_listing',
-            detail: `preflight: ${pf.result.blockers.map((b) => b.code).join('+')}` + (pf.workOrder ? ` — work order ${pf.workOrder.ids.join(',')}` : ' — marketing notified, no floor action'),
+            reason: pf.hold === 'retry' ? 'shiphero_read_failed' : pf.hold === 'floor' ? 'awaiting_work_order' : 'awaiting_listing',
+            detail: `preflight: ${pf.result.blockers.map((b) => b.code).join('+')}` + (pf.hold === 'retry' ? ' — ShipHero read failed, re-checking next tick (no work order)' : pf.workOrder ? ` — work order ${pf.workOrder.ids.join(',')}` : ' — marketing notified, no floor action'),
           });
           continue;
         }
