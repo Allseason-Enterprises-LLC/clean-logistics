@@ -57,6 +57,11 @@ ok('ShipHero lot split that does not sum to ordered → falls back to label lots
 const mm = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 200, productId: 'p1', comments: 'lot 0426355' }], shipheroLots: [{ sku: SKU, lot: '0426354', expiry: '2028-05-31', qty: 200 }] });
 ok('comment names a lot neither labels nor ShipHero shipped → still holds (TR-00821)', mm.action === 'hold');
 
+const conf = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 200, productId: 'p1', comments: 'lot 0426355' }], lotsConfirmed: ['0426354'] });
+ok('human-confirmed shipped lot clears the lot-name hold (TR-00821)', conf.action === 'complete' && conf.lines[0].lot === '0426354');
+const badConf = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 200, productId: 'p1', comments: 'lot 0426355' }], lotsConfirmed: ['0426355'] });
+ok('🔴 confirmation naming a lot we did NOT ship does not clear the hold', badConf.action === 'hold');
+
 const src = fs.readFileSync(path.join(__dirname, '../lib/cin7-closeout.ts'), 'utf8');
 ok('🔴 holds NEVER post to the channel (log only — eleven 🗂 posts in one tick on 11/11)', !src.includes('await opts.notify') && src.includes("console.log(`[cin7-closeout] hold"));
 ok('waiting rows are re-checked every 6h, not every tick (shared CIN7 budget)', src.includes("c.state === 'wait' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS"));

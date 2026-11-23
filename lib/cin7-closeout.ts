@@ -44,6 +44,8 @@ export interface CloseoutFacts {
   shipheroShipDate: string | null;      // ISO
   /** What physically left, per ShipHero shipped_line_item_lots (summed per sku+lot). Authoritative for CIN7 lines. */
   shipheroLots?: Array<{ sku: string; lot: string; expiry: string | null; qty: number }>;
+  /** Human lot confirmation recorded on the bridge row (request_payload.cin7_closeout_lot_confirmed.lots). */
+  lotsConfirmed?: string[] | null;
   coverageWhole: boolean | null;        // request_payload.coverage.whole, null if never computed
   lots: CloseoutLot[];                  // active fba_shipments rows
 }
@@ -101,7 +103,11 @@ export function decideCloseout(f: CloseoutFacts): CloseoutDecision {
       ...f.lots.filter((l) => l.sku === line.sku).map((l) => String(l.lot).toUpperCase()),
       ...(f.shipheroLots ?? []).filter((l) => l.sku === line.sku).map((l) => l.lot.toUpperCase()),
     ])];
-    if (!named.some((n) => shippedLots.includes(n))) {
+    // A person confirmed which lot physically shipped (TR-00821, Ryan 11/23: "shipped lot 0426352").
+    // Only accepted when every confirmed lot is one we actually shipped — never an arbitrary lot.
+    const conf = (f.lotsConfirmed ?? []).map((x) => String(x).toUpperCase());
+    const confirmedOk = conf.length > 0 && shippedLots.every((s) => conf.includes(s));
+    if (!confirmedOk && !named.some((n) => shippedLots.includes(n))) {
       return { action: 'hold', reason: `${line.sku}: CIN7 line names lot ${named.join('/')} but shipped lot(s) ${shippedLots.join('/')} — confirm which is right before completing` };
     }
   }
@@ -209,6 +215,7 @@ export async function gatherCloseoutFacts(db: SupabaseClient, shToken: string, b
     cin7Lines,
     shipheroFulfilled, shipheroShippedBySku, shipheroShipDate,
     shipheroLots: [...shipheroLotMap.values()],
+    lotsConfirmed: bridgeRow.request_payload?.cin7_closeout_lot_confirmed?.lots ?? null,
     coverageWhole: bridgeRow.request_payload?.coverage?.whole ?? null,
     lots,
   };
