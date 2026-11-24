@@ -97,7 +97,10 @@ export function decideCloseout(f: CloseoutFacts): CloseoutDecision {
   // Lot sanity: CIN7 line comments often name the lot ("lot 0426355"). If a lot is named and does
   // NOT match any shipped lot for that SKU, hold — TR-00699 (0426355 vs 0426354) is exactly this.
   for (const line of f.cin7Lines) {
-    const named = [...String(line.comments ?? '').matchAll(/\blot\s*#?\s*([A-Za-z0-9]{5,})/gi)].map((m) => m[1].toUpperCase());
+    // Hyphens are part of lot names (TN061526-N19). The old [A-Za-z0-9]{5,} stopped at the '-' and
+    // held TR-00843 on "TN061526 vs TN061526-N19" — a mismatch that did not exist (2026-11-24).
+    const named = [...String(line.comments ?? '').matchAll(/\blot\s*#?\s*([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/gi)]
+      .map((m) => m[1].toUpperCase()).filter((s) => s.length >= 5);
     if (!named.length) continue;
     const shippedLots = [...new Set([
       ...f.lots.filter((l) => l.sku === line.sku).map((l) => String(l.lot).toUpperCase()),

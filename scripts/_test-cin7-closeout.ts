@@ -62,6 +62,14 @@ ok('human-confirmed shipped lot clears the lot-name hold (TR-00821)', conf.actio
 const badConf = decideCloseout({ ...base(), cin7Lines: [{ sku: SKU, qty: 200, productId: 'p1', comments: 'lot 0426355' }], lotsConfirmed: ['0426355'] });
 ok('🔴 confirmation naming a lot we did NOT ship does not clear the hold', badConf.action === 'hold');
 
+const MS = 'CN-DRP-MENSSUPPOR-2OZ';
+const hy = decideCloseout({ ...base(), cin7Lines: [{ sku: MS, qty: 1710, productId: 'p7', comments: 'pick from A-aisle bins only, do not allocate from B bins, lot TN061526-N19, expires 06/30/2028' }], shipheroShippedBySku: { [MS]: 1710 },
+  lots: [{ sku: MS, lot: 'TN061526-N19', expiry: '2028-06-30', units: 1710, amazonStatus: 'IN_TRANSIT' }] });
+ok('🔴 hyphenated lot in the CIN7 comment matches (TR-00843: TN061526-N19, not TN061526)', hy.action === 'complete' && hy.lines[0].lot === 'TN061526-N19');
+const hyBad = decideCloseout({ ...base(), cin7Lines: [{ sku: MS, qty: 1710, productId: 'p7', comments: 'lot TN082526-N19' }], shipheroShippedBySku: { [MS]: 1710 },
+  lots: [{ sku: MS, lot: 'TN061526-N19', expiry: '2028-06-30', units: 1710, amazonStatus: 'IN_TRANSIT' }] });
+ok('a genuinely different hyphenated lot still holds', hyBad.action === 'hold');
+
 const src = fs.readFileSync(path.join(__dirname, '../lib/cin7-closeout.ts'), 'utf8');
 ok('🔴 holds NEVER post to the channel (log only — eleven 🗂 posts in one tick on 11/11)', !src.includes('await opts.notify') && src.includes("console.log(`[cin7-closeout] hold"));
 ok('waiting rows are re-checked every 6h, not every tick (shared CIN7 budget)', src.includes("c.state === 'wait' && !opts.only && Date.now() - Date.parse(c.at) < WAIT_RECHECK_MS"));
