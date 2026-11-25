@@ -290,6 +290,8 @@ export async function runCin7Closeout(db: SupabaseClient, shToken: string, opts:
   const candidates = (data ?? []).filter((r: any) => {
     if (!labelledTrs.has(r.cin7_transfer_number)) return false;
     if (!/amazon|fba/i.test(String(r.cin7_destination || ''))) return false;
+    // TikTok FBT transfers are closed by the tiktok-fbt-bridge (TikTok receipt date). Never both writers on one TR.
+    if (/tiktok/i.test(String(r.cin7_destination || ''))) return false;
     const c = r.request_payload?.cin7_closeout;
     if (!c) return true;
     if (c.state === 'completed' || c.state === 'already_complete') return false;

@@ -88,6 +88,7 @@ ok('429 defers the tick instead of hammering the shared key', src.includes('inst
 const vercel = JSON.parse(fs.readFileSync(path.join(__dirname, '../vercel.json'), 'utf8'));
 const cron = vercel.crons.find((c: any) => c.path === '/api/cron/cin7-closeout');
 ok('cron scheduled off the sync minutes (:10/:30/:50)', !!cron && cron.schedule === '10,30,50 * * * *');
+ok('TikTok destinations excluded (tiktok-fbt-bridge owns them; never two writers on one TR)', src.includes("if (/tiktok/i.test(String(r.cin7_destination || ''))) return false;"));
 
 console.log(`\\n${fails === 0 ? 'ALL PASS' : fails + ' FAILURE(S)'}`);
 if (fails) process.exitCode = 1;
